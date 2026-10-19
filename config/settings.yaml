@@ -1,0 +1,24 @@
+# Runtime configuration for the engine, risk guard and demo strategy.
+engine:
+  symbol: BTCUSDT
+  tick_size: "0.50"
+  center: "30000"
+  stale_after_ns: 1000000000
+  risk:
+    max_order_quantity: "10"
+    max_order_notional: "250000"
+    max_position_notional: "1000000"
+    max_daily_loss: "25000"
+    max_price_deviation: "500"
+    max_open_orders: 64
+
+strategy:
+  name: inventory_market_maker
+  half_spread_ticks: 2
+  order_quantity: "0.05"
+  max_inventory: "1.0"
+  skew_ticks: 1
+
+backtest:
+  event_limit: 100000
+  record_fills: true

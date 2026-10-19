@@ -1,0 +1,5 @@
+add_executable(hft_tests test_core.cpp)
+find_package(Threads REQUIRED)
+target_link_libraries(hft_tests PRIVATE hft_core Threads::Threads)
+add_test(NAME hft_tests COMMAND hft_tests)
+set_tests_properties(hft_tests PROPERTIES TIMEOUT 60)

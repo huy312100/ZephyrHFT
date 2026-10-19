@@ -1,0 +1,19 @@
+# Build directories
+build/
+cmake-build-*/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+
+# Compiled libraries / binaries
+*.so
+*.dylib
+*.exe
+
+# OS files
+.DS_Store
+Thumbs.db
