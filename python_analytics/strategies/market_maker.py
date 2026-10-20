@@ -6,12 +6,15 @@ raw fixed-point integers; no floating point touches prices or sizes.
 """
 from __future__ import annotations
 
+import math
 import time
 from typing import Optional
 
 from ..native import hft_native
 from ..utils.config import StrategySettings
 from .base import Quote, Strategy
+from .config import MarketConfig, MarketType
+from .indicators import MicroPriceCalculator
 
 
 class InventoryMarketMaker(Strategy):
@@ -150,3 +153,266 @@ def _quantity(text: str) -> int:
     if value is None:
         raise ValueError(f"invalid quantity: {text!r}")
     return value.raw()
+
+
+# Fixed-point scale shared by Price/Quantity/Notional (8 decimal digits).
+_FIXED_SCALE = hft_native.Price.from_int(1).raw()
+
+
+class AvellanedaStoikovStrategy(Strategy):
+    """Avellaneda-Stoikov inventory-aware market maker.
+
+    Quotes are derived from an indifference (reservation) price that is pushed
+    away from the micro-price by the current inventory, and an optimal spread
+    that grows with risk aversion ``gamma`` and shrinks with book liquidity
+    ``k``.
+
+    Reservation price : ``R = S - q * gamma * sigma**2 * (T - t)``
+    Optimal half-spread: ``delta = (1 / gamma) * ln(1 + gamma / k)``
+    Raw quotes         : ``bid = R - delta / 2``, ``ask = R + delta / 2``
+
+    The native ``TradingEngine`` owns the ``L2Book``, order manager and risk
+    guard; the strategy reads book/position state and queries the engine's risk
+    limits before generating orders. The engine re-checks every submission and
+    remains authoritative.
+    """
+
+    name = "avellaneda_stoikov"
+
+    def __init__(self, config: MarketConfig) -> None:
+        self._config = config
+        self._calculator = MicroPriceCalculator()
+        self._bid_id: Optional[int] = None
+        self._ask_id: Optional[int] = None
+        self._last_quote: Optional[Quote] = None
+        self._quotes_sent = 0
+        self._rejections = 0
+        self._start_monotonic = time.monotonic()
+        self._last_micro: Optional[float] = None
+        self._variance_ema = config.sigma ** 2
+        self._vol_samples = 0
+
+    # ------------------------------------------------------------------ maths
+    def reservation_price(self, micro_price: float, inventory: float,
+                          time_remaining: float,
+                          sigma: Optional[float] = None) -> float:
+        """Indifference price ``R = S - q * gamma * sigma**2 * (T - t)``."""
+        volatility = self._config.sigma if sigma is None else float(sigma)
+        return micro_price - inventory * self._config.gamma * (
+            volatility ** 2
+        ) * time_remaining
+
+    def optimal_half_spread(self) -> float:
+        """``delta = (1 / gamma) * ln(1 + gamma / k)``."""
+        gamma = self._config.gamma
+        return (1.0 / gamma) * math.log1p(gamma / self._config.k)
+
+    def raw_quotes(self, micro_price: float, inventory: float,
+                   time_remaining: float,
+                   sigma: Optional[float] = None) -> tuple[float, float]:
+        """Unrounded ``(bid, ask)`` around the reservation price."""
+        reservation = self.reservation_price(
+            micro_price, inventory, time_remaining, sigma=sigma
+        )
+        half = self.optimal_half_spread()
+        return reservation - half / 2.0, reservation + half / 2.0
+
+    def adjusted_quotes(self, micro_price: float, inventory: float,
+                        time_remaining: float,
+                        sigma: Optional[float] = None) -> tuple[float, float]:
+        """Raw quotes with market-specific adapter rules applied."""
+        bid, ask = self.raw_quotes(micro_price, inventory, time_remaining, sigma=sigma)
+        if self._config.market_type in (MarketType.STOCK, MarketType.COMMODITIES):
+            bid = self.round_to_tick(bid)
+            ask = self.round_to_tick(ask)
+        return bid, ask
+
+    def round_to_tick(self, price: float) -> float:
+        """Rounds a quote to the nearest ``tick_size`` (round half away from 0)."""
+        tick = self._config.tick_size
+        if tick <= 0.0:
+            return price
+        steps = price / tick
+        if steps >= 0.0:
+            return math.floor(steps + 0.5) * tick
+        return math.ceil(steps - 0.5) * tick
+
+    def in_session(self, seconds_since_midnight: float) -> bool:
+        """Whether the market is open for a session-bound venue."""
+        return (self._config.session_start
+                <= seconds_since_midnight
+                < self._config.session_end)
+
+    # ------------------------------------------------------------- risk / io
+    def _risk_adjusted_quantities(
+        self,
+        engine: "hft_native.TradingEngine",
+        bid: float,
+        ask: float,
+        quantity: float,
+        inventory: float,
+    ) -> tuple[float, float]:
+        """Scales quotes against the native risk limits before submission."""
+        limits = engine.risk_limits()
+        max_order_notional = float(limits.max_order_notional)
+        max_order_quantity = float(limits.max_order_quantity)
+
+        bid_qty = quantity
+        ask_qty = quantity
+
+        # Inventory guard: beyond the configured cap only quote the reducing
+        # side, mirroring the C++ RiskGuard's worst-case exposure logic.
+        if abs(inventory) >= self._config.inventory_limit:
+            if inventory > 0.0:
+                bid_qty = 0.0  # long -> sell only
+            else:
+                ask_qty = 0.0  # short -> buy only
+
+        # Per-order notional cap (first-pass mirror; the engine re-checks).
+        if bid_qty > 0.0 and bid > 0.0:
+            bid_qty = min(bid_qty, max_order_notional / bid)
+        if ask_qty > 0.0 and ask > 0.0:
+            ask_qty = min(ask_qty, max_order_notional / ask)
+
+        bid_qty = min(bid_qty, max_order_quantity)
+        ask_qty = min(ask_qty, max_order_quantity)
+
+        return max(0.0, bid_qty), max(0.0, ask_qty)
+
+    def _time_remaining(self) -> float:
+        elapsed = time.monotonic() - self._start_monotonic
+        return max(0.0, self._config.time_horizon - elapsed)
+
+    def _observe_micro(self, micro_price: float) -> None:
+        """Updates the dynamic micro-volatility estimate for crypto venues."""
+        if micro_price <= 0.0:
+            return
+        if self._last_micro is None or self._last_micro <= 0.0:
+            self._last_micro = micro_price
+            return
+        ret = (micro_price - self._last_micro) / self._last_micro
+        self._last_micro = micro_price
+        self._variance_ema = 0.95 * self._variance_ema + 0.05 * (ret ** 2)
+        self._vol_samples += 1
+
+    def _effective_sigma(self) -> float:
+        if self._config.market_type == MarketType.CRYPTO and self._vol_samples >= 10:
+            return math.sqrt(self._variance_ema)
+        return self._config.sigma
+
+    @staticmethod
+    def _seconds_since_midnight() -> float:
+        now = time.localtime()
+        return now.tm_hour * 3600.0 + now.tm_min * 60.0 + now.tm_sec
+
+    @staticmethod
+    def _to_raw(value: float) -> int:
+        return int(round(value * _FIXED_SCALE))
+
+    def quote(self, engine: "hft_native.TradingEngine") -> Optional[Quote]:
+        bbo = engine.bbo()
+        if not bbo.is_valid():
+            return None
+
+        best_bid = float(bbo.bid_price)
+        best_ask = float(bbo.ask_price)
+        micro = self._calculator.micro_price(
+            best_bid, float(bbo.bid_quantity), best_ask, float(bbo.ask_quantity)
+        )
+        if micro <= 0.0:
+            return None
+        self._observe_micro(micro)
+
+        inventory = float(engine.position().net_quantity)
+        time_remaining = self._time_remaining()
+        bid, ask = self.adjusted_quotes(
+            micro, inventory, time_remaining, sigma=self._effective_sigma()
+        )
+
+        # Session-bound venues stop quoting outside market hours.
+        if self._config.market_type == MarketType.STOCK and not self.in_session(
+            self._seconds_since_midnight()
+        ):
+            return None
+
+        # Post-only quotes must rest behind the touch; never cross the book.
+        tick = self._config.tick_size
+        if bid >= best_ask:
+            bid = best_ask - tick
+        if ask <= best_bid:
+            ask = best_bid + tick
+        if not (0.0 < bid < ask):
+            return None
+
+        bid_qty, ask_qty = self._risk_adjusted_quantities(
+            engine, bid, ask, self._config.order_quantity, inventory
+        )
+        if bid_qty <= 0.0 and ask_qty <= 0.0:
+            return None
+
+        return Quote(
+            self._to_raw(bid) if bid_qty > 0.0 else 0,
+            self._to_raw(bid_qty) if bid_qty > 0.0 else 0,
+            self._to_raw(ask) if ask_qty > 0.0 else 0,
+            self._to_raw(ask_qty) if ask_qty > 0.0 else 0,
+        )
+
+    # ------------------------------------------------------------ event loop
+    def on_depth(self, engine: "hft_native.TradingEngine",
+                 depth: "hft_native.DepthUpdate") -> None:
+        self.on_timer(engine, time.monotonic_ns())
+
+    def on_timer(self, engine: "hft_native.TradingEngine", now_ns: int) -> None:
+        quote = self.quote(engine)
+        if quote is None:
+            self.cancel_all(engine)
+            return
+        if quote == self._last_quote:
+            return
+
+        self.cancel_all(engine)
+        self._last_quote = quote
+        if quote.bid_quantity_raw > 0:
+            self._bid_id = self._submit(
+                engine, hft_native.Side.BUY, quote.bid_price_raw,
+                quote.bid_quantity_raw, now_ns,
+            )
+        if quote.ask_quantity_raw > 0:
+            self._ask_id = self._submit(
+                engine, hft_native.Side.SELL, quote.ask_price_raw,
+                quote.ask_quantity_raw, now_ns,
+            )
+
+    def _submit(self, engine: "hft_native.TradingEngine",
+                side: "hft_native.Side", price_raw: int, quantity_raw: int,
+                now_ns: int) -> Optional[int]:
+        request = hft_native.OrderRequest()
+        request.side = side
+        request.type = hft_native.OrderType.POST_ONLY
+        request.price = hft_native.Price.from_raw(price_raw)
+        request.quantity = hft_native.Quantity.from_raw(quantity_raw)
+        request.timestamp = now_ns
+        ack = engine.submit(request)
+        self._quotes_sent += 1
+        if not ack.accepted():
+            self._rejections += 1
+            return None
+        return ack.order_id
+
+    def cancel_all(self, engine: "hft_native.TradingEngine") -> None:
+        if self._bid_id is not None:
+            engine.cancel(self._bid_id)
+            self._bid_id = None
+        if self._ask_id is not None:
+            engine.cancel(self._ask_id)
+            self._ask_id = None
+        self._last_quote = None
+
+    def snapshot(self) -> dict:
+        return {
+            "quotes_sent": self._quotes_sent,
+            "rejections": self._rejections,
+            "bid_live": int(self._bid_id is not None),
+            "ask_live": int(self._ask_id is not None),
+            "market_type": str(self._config.market_type.value),
+        }

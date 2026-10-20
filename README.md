@@ -26,6 +26,15 @@ used at the orchestration/analytics boundary.
 - **Allocation-free JSON and WebSocket frame parsing** for exchange feeds.
 - **Python API** for building engines, submitting orders, replaying NDJSON and
   running an inventory-aware market-making example.
+- **Avellaneda-Stoikov market maker** with reservation-price inventory skew,
+  optimal spread and market-specific adapters (crypto/stock/commodities).
+- **Local paper-trading simulator** with an asynchronous market-data feed
+  (WebSocket / NDJSON), a maker matching engine, configurable fees/rebates and
+  mark-to-market PnL.
+- **Parameter optimizer** (grid search over `gamma`, `sigma`, `k`,
+  `time_horizon`) scoring Sharpe, Sortino, drawdown and net PnL.
+- **Latency benchmark** (`scripts/run_benchmark.py`) measuring tick-to-quote
+  microseconds through the C++ `RiskGuard`.
 
 ## Repository layout
 
@@ -39,9 +48,13 @@ used at the orchestration/analytics boundary.
 │   └── CMakeLists.txt
 ├── python_analytics/
 │   ├── native/             # extension loader + engine factory
-│   ├── strategies/         # strategy interface + market maker
+│   ├── strategies/         # strategy interface, A-S maker, optimizer
+│   ├── simulator/          # paper matching engine + async market-data feed
 │   ├── backtesting/        # replay pipeline and metrics
 │   └── utils/              # YAML config and logging
+├── scripts/
+│   ├── run_paper_trading.py  # 60s live/mock paper-trading dashboard
+│   └── run_benchmark.py      # tick-to-quote latency benchmark
 ├── config/settings.yaml    # engine, risk and strategy settings
 ├── data/sample_events.ndjson
 ├── tests/python/           # pytest integration tests
@@ -142,14 +155,16 @@ for prices. Invalid YAML raises `ConfigError` with the offending section.
 # C++ (after CMake build)
 ctest --test-dir build --output-on-failure
 
-# Python
-python -m pytest
+# Python (all modules: bindings, strategies, simulator, optimizer)
+python3 -m pytest -v
 ```
 
 The C++ suite covers fixed-point parsing, SPSC concurrency, L2/L3 semantics,
 risk rejections, latency buckets, JSON/WebSocket parsing, average-cost PnL,
-IOC/FOK handling and the full engine flow. Python tests exercise the bindings,
-strategy quoting and replay pipeline.
+IOC/FOK handling and the full engine flow. Python tests exercise the bindings
+(`test_bindings.py`), the Avellaneda-Stoikov strategy (`test_strategy.py`), the
+paper engine and feed (`test_paper_engine.py`) and the parameter optimizer
+(`test_optimizer.py`).
 
 ### CMake / CTest not on `PATH`
 
@@ -169,6 +184,143 @@ The wheel also ships `ctest` under its `cmake/data/bin` directory; add that
 directory to `PATH` if you prefer invoking `ctest` directly, or run
 `./build/tests/hft_tests` as shown above.
 
+## Local Paper Trading & Simulation Guide
+
+The repository ships a self-contained paper-trading loop that streams depth
+data into the C++ `L2Book`, matches the Avellaneda-Stoikov quotes locally and
+tracks PnL in real time.
+
+### Live / mock simulation (60 seconds)
+
+```bash
+# Deterministic random-walk mock feed (no network required)
+python3 scripts/run_paper_trading.py --source mock --duration 60
+
+# Replay the offline NDJSON sample on a loop
+python3 scripts/run_paper_trading.py --offline --duration 60
+
+# Live Binance futures partial-depth stream (falls back to NDJSON offline)
+python3 scripts/run_paper_trading.py --duration 60
+```
+
+Useful flags: `--duration`, `--interval` (dashboard cadence), `--gamma`,
+`--sigma`, `--k`, `--order-quantity`, `--inventory-limit`, `--maker-fee-bps`
+(default `-1` = 0.01% rebate), `--taker-fee-bps` (default `5` = 0.05%).
+Press `Ctrl-C` to stop cleanly: the loop cancels open orders and prints a
+summary (total trades, win rate, Sharpe approximation, final PnL, max
+drawdown).
+
+The WebSocket source is `wss://stream.binance.com:9443/ws/btcusdt@depth20@100ms`;
+if the `websockets` package is missing or the connection drops, the feed falls
+back to `data/sample_events.ndjson` (looped) so the simulation keeps running.
+
+### Latency benchmark
+
+```bash
+python3 scripts/run_benchmark.py --ticks 50000
+```
+
+Measures the tick-to-quote hot path in microseconds (p50/p99/p99.9): JSON
+parse → C++ `L2Book` apply → Avellaneda-Stoikov quote generation → C++
+`RiskGuard` validation. GC is disabled during the loop to eliminate collection
+pauses.
+
+### Parameter optimisation
+
+```python
+from python_analytics.strategies.optimizer import grid_search
+
+result = grid_search(
+    {"gamma": [0.05, 0.1, 0.5], "sigma": [0.01, 0.02], "k": [1.0, 1.5],
+     "time_horizon": [30.0, 60.0]},
+    open("data/sample_events.ndjson"),
+    metric="sharpe",
+)
+print(result.best_params, result.best_score)
+for row in result.grid:
+    print(row)
+```
+
+`grid_search` replays the NDJSON lines through `PaperMatchingEngine`, scoring
+each parameter combination on net PnL, Sharpe, Sortino and maximum drawdown.
+
+## Architecture
+
+- **C++20 core (`cpp_engine/`)** — header-only `L2Book`, `OrderManager`,
+  `RiskGuard`, `TradingEngine`, lock-free SPSC queues, allocation-free JSON and
+  WebSocket parsing. Exposed to Python via `pybind11` as `hft_native`.
+- **Strategy layer (`python_analytics/strategies/`)** — `MarketConfig`,
+  `MicroPriceCalculator`, `AvellanedaStoikovStrategy`, and the `optimizer`
+  grid-search utility. Owns all pricing mathematics.
+- **Simulator (`python_analytics/simulator/`)** — `PaperMatchingEngine`
+  (maker matching, inventory, cash, fees, PnL) and `MarketDataFeed`
+  (WebSocket / NDJSON / synthetic). `PaperMatchingEngine` implements the same
+  duck-typed surface as `TradingEngine`, so the strategy quotes against it
+  unchanged.
+- **Backtesting (`python_analytics/backtesting/`)** — NDJSON replay plus
+  Sharpe/drawdown metric helpers.
+- **Scripts (`scripts/`)** — the paper-trading runner and latency benchmark.
+
+## Mathematical model
+
+### Avellaneda-Stoikov market making
+
+- Micro-price (volume-weighted mid):
+  `S = (AskVol * Bid + BidVol * Ask) / (BidVol + AskVol)`.
+- Reservation (indifference) price:
+  `R = S - q * gamma * sigma^2 * (T - t)`, where `q` is inventory,
+  `gamma` risk aversion, `sigma` volatility and `(T - t)` the remaining horizon.
+- Optimal half-spread: `delta = (1 / gamma) * ln(1 + gamma / k)`.
+- Raw quotes: `bid = R - delta / 2`, `ask = R + delta / 2`.
+- `STOCK`/`COMMODITIES` quotes are rounded to `tick_size` and session-gated;
+  `CRYPTO` quotes continuously with a dynamic EMA micro-volatility estimate.
+
+### Order Flow Imbalance (OFI)
+
+Following Cont, Kukanov & Stoikov (2014), OFI measures top-of-book pressure
+across consecutive ticks:
+
+- `OFI_bid = +B_t` if the bid price ticked up, `-B_{t-1}` if it ticked down,
+  else `B_t - B_{t-1}`.
+- `OFI_ask = +A_t` if the ask ticked down, `-A_{t-1}` if it ticked up, else
+  `A_t - A_{t-1}`.
+- `OFI = OFI_bid - OFI_ask`.
+
+## RiskGuard safety boundaries
+
+Every order passes through the C++ `RiskGuard` before matching. Enforced limits
+(configured in `config/settings.yaml`):
+
+- `max_order_quantity` / `max_order_notional` — per-order size caps.
+- `max_position_notional` — worst-case exposure (net + resting orders).
+- `max_daily_loss` — realised + unrealised PnL floor.
+- `max_price_deviation` — distance from the mid the order may rest at.
+- `max_open_orders` — live order-count cap.
+- `post-only` crossing is rejected; market orders are repriced to the touch for
+  notional checks.
+
+The Python strategy mirrors these limits (reads `engine.risk_limits()`) and
+scales down or pauses quoting before submission; the C++ guard remains
+authoritative.
+
+## Troubleshooting
+
+- **`ModuleNotFoundError: No module named 'python_analytics'`** — run scripts
+  from the repository root (`python3 scripts/...`); the scripts bootstrap
+  `sys.path` themselves.
+- **`No module named 'hft_native'`** — build the extension first
+  (`cmake -S cpp_engine -B build ... && cmake --build build`), and ensure the
+  interpreter matches the `.so` tag (e.g. `cpython-39-darwin.so` needs 3.9).
+- **Empty book / no fills in `--source mock`** — the ladder is centered on
+  `settings.engine.center`; pass `--center` matching your asset's price range.
+- **No WebSocket data** — install `websockets` (`pip install websockets`) or run
+  `--offline` / `--source mock`; a missing client falls back to NDJSON.
+- **`--offline` shows an empty book** — confirm `data/sample_events.ndjson`
+  exists and its prices are within ±4096 ticks of the configured center.
+- **Order/position rejections** — inspect the `RejectReason` on the ack
+  (`NOTIONAL_LIMIT`, `POSITION_LIMIT`, `PRICE_BAND`, ...) and relax the
+  corresponding `engine.risk.*` value in `config/settings.yaml`.
+
 ## Design notes
 
 - **Single writer per stage.** The feed thread owns `publish_depth`/`publish_trade`;
@@ -186,13 +338,16 @@ directory to `PATH` if you prefer invoking `ctest` directly, or run
 
 ## Limitations
 
-- This repository ships **no exchange WebSocket client**. `publish_depth` and
-  `publish_trade` are the adapter boundary; connect your own feed or replay
-  NDJSON files.
-- Market orders are simulated against the top of book only; there is no
-  matching engine for resting strategy orders.
-- Fees, rebates and exchange acknowledgements are not modelled; `Fill.fee`
-  stays zero and positions use average-cost accounting.
+- The **C++ engine** ships no exchange gateway; `publish_depth`/`publish_trade`
+  are the adapter boundary. The Python `MarketDataFeed` provides a WebSocket
+  client (Binance partial-depth) with an offline NDJSON fallback.
+- The C++ `TradingEngine` only simulates market/taker orders at the touch; it
+  does not match resting maker quotes. The Python `PaperMatchingEngine`
+  provides maker matching, fees/rebates and mark-to-market PnL for paper
+  trading and backtesting.
+- Fees are modelled only in `PaperMatchingEngine` (configurable maker rebate /
+  taker fee). The native `Fill.fee` remains zero because the C++ engine does
+  not model fees.
 - Feed sequence gaps are not repaired and there is no snapshot bootstrap:
   `first_update_id`/`final_update_id` are parsed for diagnostics, but the
   operator must reconnect or resynchronise after a gap.

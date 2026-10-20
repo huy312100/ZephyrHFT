@@ -1,19 +1,39 @@
-# Build directories
+# ==========================================
+# VS Code / IDEs
+# ==========================================
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# ==========================================
+# C++ Build Artifacts
+# ==========================================
 build/
-cmake-build-*/
-
-# Python
-__pycache__/
-*.pyc
-*.pyo
-*.pyd
-.pytest_cache/
-
-# Compiled libraries / binaries
+bin/
+obj/
+*.o
+*.obj
 *.so
 *.dylib
+*.dll
 *.exe
 
-# OS files
-.DS_Store
-Thumbs.db
+# ==========================================
+# Python & Virtual Environments
+# ==========================================
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+venv/
+.venv/
+*.egg-info/
+
+# ==========================================
+# Data & Logs
+# ==========================================
+*.log
+*.ndjson
+data/
