@@ -1,9 +1,14 @@
 // SPDX-License-Identifier: MIT
 // Self-contained unit tests for the C++ HFT core (no external framework).
 #include <atomic>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 #include <memory>
+#include <stdexcept>
+#include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -12,7 +17,9 @@
 #include "order_manager.hpp"
 #include "orderbook.hpp"
 #include "ring_buffer.hpp"
+#include "risk/kill_switch.hpp"
 #include "risk_guard.hpp"
+#include "risk_manager.hpp"
 #include "types.hpp"
 #include "ws_parser.hpp"
 
@@ -708,6 +715,517 @@ void test_engine() {
     CHECK(!engine->bbo().is_valid());
 }
 
+// ---------------------------------------------------------------------------
+// RiskManager
+// ---------------------------------------------------------------------------
+struct RejectProbe {
+    int count = 0;
+    hft::RiskStatus last = hft::RiskStatus::APPROVED;
+    std::size_t symbol_length = 0;
+};
+
+void probe_hook(void* context, hft::RiskStatus status,
+                std::string_view symbol) noexcept {
+    auto* probe = static_cast<RejectProbe*>(context);
+    ++probe->count;
+    probe->last = status;
+    probe->symbol_length = symbol.size();
+}
+
+hft::RiskManagerConfig base_risk_config() {
+    hft::RiskManagerConfig config;
+    config.enabled = true;
+    config.max_position = 10.0;
+    config.max_order_size = 5.0;
+    config.max_price_deviation_pct = 0.01;  // 1% band
+    config.order_rate_limit = 0.0;          // tests opt in to rate limiting
+    config.order_burst = 0.0;
+    return config;
+}
+
+void test_token_bucket() {
+    const hft::Nanos t0 = 5'000'000'000;
+
+    hft::TokenBucket bucket(10.0, 10.0);  // 10 orders/s, burst of 10
+    CHECK(bucket.enabled());
+    CHECK(bucket.rate_per_sec() == 10.0);
+    CHECK(bucket.burst() == 10.0);
+
+    // The burst is admitted back to back...
+    for (int i = 0; i < 10; ++i) {
+        CHECK(bucket.try_acquire(t0));
+    }
+    // ...and the eleventh order at the same instant is refused.
+    CHECK(!bucket.try_acquire(t0));
+    CHECK(std::fabs(bucket.level(t0)) < 1e-9);
+
+    // One interval later exactly one token is available again.
+    CHECK(bucket.try_acquire(t0 + 100'000'000));
+    CHECK(!bucket.try_acquire(t0 + 100'000'000));
+
+    // Long idleness refills to capacity, never beyond it.
+    CHECK(std::fabs(bucket.level(t0 + 5'000'000'000) - 10.0) < 1e-9);
+
+    // A rate of zero disables the limiter entirely.
+    hft::TokenBucket off(0.0, 0.0);
+    CHECK(!off.enabled());
+    for (int i = 0; i < 1'000; ++i) {
+        CHECK(off.try_acquire(t0));
+    }
+
+    // reset() restarts the window.
+    hft::TokenBucket restarted(1.0, 2.0);
+    CHECK(restarted.try_acquire(t0));
+    CHECK(restarted.try_acquire(t0));
+    CHECK(!restarted.try_acquire(t0 + 500'000'000));
+    restarted.reset(t0 + 500'000'000);
+    CHECK(restarted.try_acquire(t0 + 500'000'000));
+}
+
+void test_risk_manager_guards() {
+    hft::RiskManager risk(base_risk_config());
+    const hft::Nanos t0 = 1'000'000'000;
+    const double mid = 30'000.0;
+    const std::string_view symbol = "BTCUSDT";
+
+    auto check = [&](double price, double quantity, hft::Side side,
+                     double position, double market_mid) {
+        return risk.validate_order_at(t0, symbol, price, quantity, side, position,
+                                      market_mid);
+    };
+
+    // ---- happy path ------------------------------------------------------
+    CHECK(check(30'000.0, 1.0, hft::Side::Buy, 0.0, mid) ==
+          hft::RiskStatus::APPROVED);
+    // A sell that reduces an existing long is always inside the position cap.
+    CHECK(check(30'000.0, 4.0, hft::Side::Sell, 9.0, mid) ==
+          hft::RiskStatus::APPROVED);
+
+    // ---- max order size --------------------------------------------------
+    CHECK(check(30'000.0, 5.0, hft::Side::Buy, 0.0, mid) ==
+          hft::RiskStatus::APPROVED);  // boundary is inclusive
+    CHECK(check(30'000.0, 5.0001, hft::Side::Buy, 0.0, mid) ==
+          hft::RiskStatus::REJECTED_MAX_ORDER_SIZE);
+
+    // ---- position limit --------------------------------------------------
+    CHECK(check(30'000.0, 1.0, hft::Side::Buy, 9.0, mid) ==
+          hft::RiskStatus::APPROVED);  // 9 + 1 == 10, exactly at the cap
+    CHECK(check(30'000.0, 1.0, hft::Side::Buy, 9.5, mid) ==
+          hft::RiskStatus::REJECTED_POSITION_LIMIT);
+    CHECK(check(30'000.0, 1.0, hft::Side::Sell, -9.5, mid) ==
+          hft::RiskStatus::REJECTED_POSITION_LIMIT);  // short side too
+    CHECK(check(30'000.0, 4.0, hft::Side::Sell, 1.0, mid) ==
+          hft::RiskStatus::APPROVED);  // 1 - 4 == -3, flips through flat
+    CHECK(check(30'000.0, 15.0, hft::Side::Sell, 1.0, mid) ==
+          hft::RiskStatus::REJECTED_MAX_ORDER_SIZE);  // size guard fires first
+
+    // ---- fat finger ------------------------------------------------------
+    CHECK(check(30'300.0, 1.0, hft::Side::Buy, 0.0, mid) ==
+          hft::RiskStatus::APPROVED);  // exactly +1% is inside the band
+    CHECK(check(30'301.0, 1.0, hft::Side::Buy, 0.0, mid) ==
+          hft::RiskStatus::REJECTED_FAT_FINGER);
+    CHECK(check(29'699.0, 1.0, hft::Side::Sell, 0.0, mid) ==
+          hft::RiskStatus::REJECTED_FAT_FINGER);
+    // No usable reference price: fail closed rather than guess.
+    CHECK(check(30'000.0, 1.0, hft::Side::Buy, 0.0, 0.0) ==
+          hft::RiskStatus::REJECTED_FAT_FINGER);
+
+    // ---- invalid input: NaN must never slip through ----------------------
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    const double inf = std::numeric_limits<double>::infinity();
+    CHECK(check(0.0, 1.0, hft::Side::Buy, 0.0, mid) ==
+          hft::RiskStatus::REJECTED_INVALID_ORDER);
+    CHECK(check(-1.0, 1.0, hft::Side::Buy, 0.0, mid) ==
+          hft::RiskStatus::REJECTED_INVALID_ORDER);
+    CHECK(check(30'000.0, 0.0, hft::Side::Buy, 0.0, mid) ==
+          hft::RiskStatus::REJECTED_INVALID_ORDER);
+    CHECK(check(30'000.0, -1.0, hft::Side::Buy, 0.0, mid) ==
+          hft::RiskStatus::REJECTED_INVALID_ORDER);
+    CHECK(check(nan, 1.0, hft::Side::Buy, 0.0, mid) ==
+          hft::RiskStatus::REJECTED_INVALID_ORDER);
+    CHECK(check(30'000.0, nan, hft::Side::Buy, 0.0, mid) ==
+          hft::RiskStatus::REJECTED_INVALID_ORDER);
+    CHECK(check(inf, 1.0, hft::Side::Buy, 0.0, mid) ==
+          hft::RiskStatus::REJECTED_INVALID_ORDER);
+    CHECK(check(30'000.0, 1.0, hft::Side::Buy, nan, mid) ==
+          hft::RiskStatus::REJECTED_INVALID_ORDER);
+}
+
+void test_risk_manager_telemetry() {
+    hft::RiskManager risk(base_risk_config());
+    const hft::Nanos t0 = 1'000'000'000;
+    const std::string_view symbol = "BTCUSDT";
+    const double mid = 30'000.0;
+
+    CHECK(std::string_view(hft::risk_status_name(hft::RiskStatus::APPROVED)) ==
+          "APPROVED");
+    CHECK(std::string_view(
+              hft::risk_status_name(hft::RiskStatus::REJECTED_RATE_LIMIT)) ==
+          "REJECTED_RATE_LIMIT");
+    CHECK(hft::is_approved(hft::RiskStatus::APPROVED));
+    CHECK(!hft::is_approved(hft::RiskStatus::REJECTED_FAT_FINGER));
+    CHECK(hft::to_reject_reason(hft::RiskStatus::REJECTED_RATE_LIMIT) ==
+          hft::RejectReason::RateLimit);
+    CHECK(hft::to_reject_reason(hft::RiskStatus::REJECTED_FAT_FINGER) ==
+          hft::RejectReason::PriceBand);
+    CHECK(hft::to_reject_reason(hft::RiskStatus::REJECTED_POSITION_LIMIT) ==
+          hft::RejectReason::PositionLimit);
+    CHECK(hft::to_reject_reason(hft::RiskStatus::REJECTED_MAX_ORDER_SIZE) ==
+          hft::RejectReason::InvalidQuantity);
+
+    // The hook fires on rejection only, and sees the caller's symbol.
+    RejectProbe probe;
+    risk.set_reject_hook(&probe_hook, &probe);
+    (void)risk.validate_order_at(t0, symbol, 45'000.0, 1.0, hft::Side::Buy, 0.0,
+                                 mid);
+    CHECK(probe.count == 1);
+    CHECK(probe.last == hft::RiskStatus::REJECTED_FAT_FINGER);
+    CHECK(probe.symbol_length == symbol.size());
+
+    risk.reset(t0);
+    CHECK(risk.validate_order_at(t0, symbol, 30'000.0, 1.0, hft::Side::Buy, 0.0,
+                                 mid) == hft::RiskStatus::APPROVED);
+    CHECK(probe.count == 1);  // approvals never fire the hook
+    const hft::RiskManagerStats stats = risk.stats(t0);
+    CHECK(stats.evaluated == 1);
+    CHECK(stats.approved == 1);
+    CHECK(stats.rejected == 0);
+    CHECK(stats.count(hft::RiskStatus::APPROVED) == 1);
+
+    // Live tuning takes effect immediately and is readable back.
+    risk.set_max_order_size(2.0);
+    CHECK(risk.max_order_size() == 2.0);
+    CHECK(risk.config().max_order_size == 2.0);
+    CHECK(risk.validate_order_at(t0, symbol, 30'000.0, 3.0, hft::Side::Buy, 0.0,
+                                 mid) == hft::RiskStatus::REJECTED_MAX_ORDER_SIZE);
+    // A non-finite limit disables that guard instead of poisoning every check.
+    risk.set_max_order_size(std::numeric_limits<double>::quiet_NaN());
+    CHECK(risk.max_order_size() == 0.0);
+    CHECK(risk.validate_order_at(t0, symbol, 30'000.0, 3.0, hft::Side::Buy, 0.0,
+                                 mid) == hft::RiskStatus::APPROVED);
+
+    // A dormant manager approves everything and records nothing.
+    hft::RiskManager dormant(hft::RiskManagerConfig::disabled());
+    CHECK(!dormant.enabled());
+    CHECK(dormant.validate_order_at(t0, symbol, 1.0, 1.0e6, hft::Side::Buy, 1.0e9,
+                                    0.0) == hft::RiskStatus::APPROVED);
+    CHECK(dormant.stats(t0).evaluated == 0);
+}
+
+void test_risk_manager_rate_limit() {
+    hft::RiskManagerConfig config = base_risk_config();
+    config.max_position = 0.0;           // isolate the limiter
+    config.max_order_size = 0.0;
+    config.max_price_deviation_pct = 0.0;
+    config.order_rate_limit = 50.0;
+    config.order_burst = 50.0;
+    hft::RiskManager risk(config);
+    const hft::Nanos t0 = 1'000'000'000;
+    const std::string_view symbol = "BTCUSDT";
+
+    auto submit = [&](hft::Nanos now) {
+        return risk.validate_order_at(now, symbol, 30'000.0, 1.0, hft::Side::Buy,
+                                      0.0, 30'000.0);
+    };
+
+    // Exactly `burst` orders pass at one instant; the 51st does not.
+    int approved = 0;
+    for (int i = 0; i < 50; ++i) {
+        if (submit(t0) == hft::RiskStatus::APPROVED) {
+            ++approved;
+        }
+    }
+    CHECK(approved == 50);
+    CHECK(submit(t0) == hft::RiskStatus::REJECTED_RATE_LIMIT);
+
+    // 50 orders/s means one token every 20 ms, no more.
+    CHECK(submit(t0 + 20'000'000) == hft::RiskStatus::APPROVED);
+    CHECK(submit(t0 + 20'000'000) == hft::RiskStatus::REJECTED_RATE_LIMIT);
+    CHECK(submit(t0 + 39'999'999) == hft::RiskStatus::REJECTED_RATE_LIMIT);
+    CHECK(submit(t0 + 40'000'000) == hft::RiskStatus::APPROVED);
+
+    // Sustained throughput over five seconds matches the configured rate.
+    risk.reset(t0);
+    std::size_t admitted = 0;
+    for (hft::Nanos now = t0; now < t0 + 5'000'000'000; now += 500'000) {
+        if (submit(now) == hft::RiskStatus::APPROVED) {
+            ++admitted;
+        }
+    }
+    CHECK(admitted >= 290 && admitted <= 300);  // 50 burst + 5 s * 50/s
+
+    // An order refused by another guard must not burn exchange budget: only
+    // orders that would actually be sent count against the API limit.
+    hft::RiskManagerConfig mixed = config;
+    mixed.max_order_size = 1.0;
+    mixed.order_rate_limit = 1.0;
+    mixed.order_burst = 1.0;
+    hft::RiskManager gated(mixed);
+    const hft::Nanos t1 = 2'000'000'000;
+    CHECK(gated.validate_order_at(t1, symbol, 30'000.0, 50.0, hft::Side::Buy, 0.0,
+                                  30'000.0) == hft::RiskStatus::REJECTED_MAX_ORDER_SIZE);
+    CHECK(gated.validate_order_at(t1, symbol, 30'000.0, 1.0, hft::Side::Buy, 0.0,
+                                  30'000.0) == hft::RiskStatus::APPROVED);
+    CHECK(gated.validate_order_at(t1, symbol, 30'000.0, 1.0, hft::Side::Buy, 0.0,
+                                  30'000.0) == hft::RiskStatus::REJECTED_RATE_LIMIT);
+}
+
+void test_risk_manager_concurrent_burst() {
+    hft::RiskManagerConfig config = base_risk_config();
+    config.max_position = 0.0;
+    config.max_order_size = 0.0;
+    config.max_price_deviation_pct = 0.0;
+    config.order_rate_limit = 1'000.0;
+    config.order_burst = 50.0;
+    hft::RiskManager risk(config);
+    const hft::Nanos t0 = 7'000'000'000;
+    risk.reset(t0);
+
+    // Four threads hammering one bucket at the same instant must be admitted
+    // exactly `burst` times: the CAS loop is the only arbiter, so a torn or
+    // double-applied refill shows up here as an off-by-N immediately.
+    constexpr int kThreads = 4;
+    constexpr int kAttempts = 5'000;
+    std::atomic<int> admitted{0};
+    std::vector<std::thread> workers;
+    workers.reserve(kThreads);
+    for (int thread = 0; thread < kThreads; ++thread) {
+        workers.emplace_back([&risk, &admitted] {
+            for (int i = 0; i < kAttempts; ++i) {
+                if (risk.validate_order_at(t0, "BTCUSDT", 30'000.0, 0.25,
+                                           hft::Side::Buy, 0.0,
+                                           30'000.0) == hft::RiskStatus::APPROVED) {
+                    admitted.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+        });
+    }
+    for (auto& worker : workers) {
+        worker.join();
+    }
+    CHECK(admitted.load() == 50);
+
+    const hft::RiskManagerStats stats = risk.stats(t0);
+    CHECK(stats.evaluated ==
+          static_cast<std::uint64_t>(kThreads) * kAttempts);
+    CHECK(stats.approved == 50);
+    CHECK(stats.count(hft::RiskStatus::REJECTED_RATE_LIMIT) ==
+          stats.evaluated - 50);
+}
+
+void test_risk_manager_in_engine() {
+    hft::EngineConfig config;
+    config.tick_size = hft::Price::from_double(0.5);
+    config.center = hft::Price::from_int(30'000);
+    config.risk_manager = base_risk_config();  // 5-unit order cap, 1% band
+    hft::TradingEngine engine(config);
+    CHECK(engine.risk_manager().enabled());
+
+    hft::DepthUpdate depth;
+    depth.exchange_ts = 1'000;
+    depth.bids[0] = {P("29999.5"), Q("50")};
+    depth.asks[0] = {P("30000.5"), Q("50")};
+    depth.bid_count = 1;
+    depth.ask_count = 1;
+    engine.apply_depth(depth);
+
+    // Passive bid one tick behind the touch: inside every limit.
+    hft::OrderRequest passive;
+    passive.side = hft::Side::Buy;
+    passive.type = hft::OrderType::Limit;
+    passive.price = P("29999.0");
+
+    hft::OrderRequest oversized = passive;
+    oversized.client_id = 2;
+    oversized.quantity = Q("6");
+    const hft::OrderAck too_big = engine.submit(oversized);
+    CHECK(!too_big.accepted());
+    CHECK(too_big.reason == hft::RejectReason::InvalidQuantity);
+    CHECK(engine.metrics().orders_rejected == 1);
+
+    hft::OrderRequest mispriced = passive;
+    mispriced.client_id = 3;
+    mispriced.quantity = Q("1");
+    mispriced.price = P("31000");  // 3.3% away from a 30 000 mid
+    const hft::OrderAck fat = engine.submit(mispriced);
+    CHECK(!fat.accepted());
+    CHECK(fat.reason == hft::RejectReason::PriceBand);
+
+    hft::OrderRequest good = passive;
+    good.client_id = 4;
+    good.quantity = Q("1");
+    const hft::OrderAck accepted = engine.submit(good);
+    CHECK(accepted.accepted());
+    CHECK(accepted.order_id != 0);
+
+    const hft::RiskManagerStats stats = engine.risk_stats();
+    CHECK(stats.evaluated == 3);
+    CHECK(stats.approved == 1);
+    CHECK(stats.rejected == 2);
+
+    // The gate is dormant by default so replay keeps its previous behaviour.
+    hft::TradingEngine plain{hft::EngineConfig{}};
+    CHECK(!plain.risk_manager().enabled());
+    CHECK(!plain.risk_manager_config().enabled);
+}
+
+void test_kill_switch_basic() {
+    hft::KillSwitch kill;
+    CHECK(!kill.is_tripped());
+    CHECK(kill.get_state() == hft::SystemState::NORMAL);
+    CHECK(kill.check_order_allowed());
+    CHECK(kill.get_stats().trip_count == 0);
+    CHECK(kill.get_stats().last_trip_reason.empty());
+    CHECK(hft::system_state_name(hft::SystemState::RECOVERING) == "RECOVERING");
+
+    kill.trip("manual: ops halt");
+    CHECK(kill.is_tripped());
+    CHECK(kill.get_state() == hft::SystemState::TRIGGERED);
+    CHECK(!kill.check_order_allowed());
+
+    const hft::KillSwitchStats tripped = kill.get_stats();
+    CHECK(tripped.trip_count == 1);
+    CHECK(tripped.last_trip_reason == "manual: ops halt");
+    CHECK(tripped.last_trip_timestamp_ns > 0);
+    CHECK(tripped.blocked_orders == 1);
+    CHECK(tripped.state == hft::SystemState::TRIGGERED);
+
+    // Recovery keeps blocking until an operator explicitly clears the halt.
+    CHECK(kill.begin_recovery());
+    CHECK(kill.get_state() == hft::SystemState::RECOVERING);
+    CHECK(!kill.check_order_allowed());
+    CHECK(!kill.begin_recovery());
+
+    kill.reset();
+    CHECK(kill.get_state() == hft::SystemState::NORMAL);
+    CHECK(kill.check_order_allowed());
+    const hft::KillSwitchStats reset = kill.get_stats();
+    CHECK(reset.reset_count == 1);
+    CHECK(reset.trip_count == 1);
+    CHECK(reset.last_trip_reason == "manual: ops halt");
+    CHECK(reset.consecutive_rejects == 0);
+
+    // An empty reason still leaves a usable audit trail.
+    hft::KillSwitch bare;
+    bare.trip("");
+    CHECK(bare.get_stats().last_trip_reason == "unspecified");
+}
+
+void test_kill_switch_guards() {
+    hft::KillSwitchConfig config;
+    config.max_drawdown_limit = 1'000.0;
+    config.max_consecutive_rejects = 3;
+    hft::KillSwitch kill(config);
+
+    CHECK(!kill.check_drawdown(999.99));
+    CHECK(!kill.is_tripped());
+    CHECK(kill.check_drawdown(1'000.0));
+    CHECK(kill.is_tripped());
+    CHECK(kill.get_stats().last_trip_reason.find("drawdown=") == 0);
+    CHECK(!kill.check_drawdown(5'000.0));  // no second transition
+
+    kill.reset();
+    CHECK(!kill.record_order_rejected());
+    CHECK(!kill.record_order_rejected());
+    kill.record_order_accepted();  // streak resets
+    CHECK(kill.get_stats().consecutive_rejects == 0);
+    CHECK(!kill.record_order_rejected());
+    CHECK(!kill.record_order_rejected());
+    CHECK(kill.record_order_rejected());
+    CHECK(kill.get_state() == hft::SystemState::TRIGGERED);
+    CHECK(kill.get_stats().consecutive_rejects == 0);
+
+    // NaN must fail closed rather than slip through the comparison.
+    hft::KillSwitch nan_guard(config);
+    CHECK(nan_guard.check_drawdown(std::nan("")));
+    CHECK(nan_guard.is_tripped());
+
+    // A disabled switch keeps the automation inert but still stops on demand.
+    hft::KillSwitchConfig disarmed;
+    disarmed.enabled = false;
+    disarmed.max_drawdown_limit = 1.0;
+    disarmed.max_consecutive_rejects = 1;
+    hft::KillSwitch manual_only(disarmed);
+    CHECK(!manual_only.enabled());
+    CHECK(!manual_only.check_drawdown(1e9));
+    CHECK(!manual_only.record_order_rejected());
+    CHECK(!manual_only.is_tripped());
+    manual_only.trip("operator override");
+    CHECK(manual_only.is_tripped());
+    CHECK(!manual_only.check_order_allowed());
+
+    // Zero thresholds disable the guards without touching the state machine.
+    hft::KillSwitchConfig off;
+    hft::KillSwitch dormant(off);
+    CHECK(!dormant.check_drawdown(1e12));
+    CHECK(!dormant.record_order_rejected());
+    CHECK(!dormant.is_tripped());
+}
+
+void test_kill_switch_hooks_and_threads() {
+    hft::KillSwitch kill;
+    int cancels = 0;
+    int flattens = 0;
+    int logs = 0;
+    std::string logged_reason;
+    std::string logged_state;
+
+    kill.set_cancel_all_hook([&cancels] { ++cancels; });
+    kill.set_flatten_hook([&flattens] { ++flattens; });
+    kill.set_trip_hook([&](hft::SystemState state, std::string_view reason) {
+        ++logs;
+        logged_reason.assign(reason);
+        logged_state.assign(hft::system_state_name(state));
+    });
+
+    kill.trip("halt");
+    CHECK(cancels == 1);
+    CHECK(flattens == 1);
+    CHECK(logs == 1);
+    CHECK(logged_reason == "halt");
+    CHECK(logged_state == "TRIGGERED");
+
+    kill.clear_hooks();
+    kill.trip("halt again");
+    CHECK(cancels == 1);
+    CHECK(logs == 1);
+
+    // A throwing remediation hook must never unwind the trip itself.
+    hft::KillSwitch guarded;
+    guarded.set_cancel_all_hook([] { throw std::runtime_error("cancel failed"); });
+    guarded.set_flatten_hook([] { throw std::runtime_error("flatten failed"); });
+    guarded.trip("halt");
+    CHECK(guarded.is_tripped());
+    CHECK(guarded.get_stats().trip_count == 1);
+
+    // Concurrent trips must all be counted and converge on TRIGGERED.
+    hft::KillSwitch concurrent;
+    constexpr int kThreads = 4;
+    constexpr int kTrips = 250;
+    std::atomic<int> torn{0};
+    std::vector<std::thread> workers;
+    workers.reserve(kThreads);
+    for (int thread = 0; thread < kThreads; ++thread) {
+        workers.emplace_back([&concurrent, &torn] {
+            for (int i = 0; i < kTrips; ++i) {
+                concurrent.trip("burst");
+                if (!concurrent.is_tripped()) {
+                    torn.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+        });
+    }
+    for (auto& worker : workers) {
+        worker.join();
+    }
+    CHECK(torn.load() == 0);
+    CHECK(concurrent.get_state() == hft::SystemState::TRIGGERED);
+    CHECK(concurrent.get_stats().trip_count ==
+          static_cast<std::uint64_t>(kThreads) * kTrips);
+    concurrent.reset();
+    CHECK(concurrent.check_order_allowed());
+}
+
 }  // namespace
 
 int main() {
@@ -727,6 +1245,15 @@ int main() {
     test_position_accounting();
     test_time_in_force();
     test_engine();
+    test_token_bucket();
+    test_risk_manager_guards();
+    test_risk_manager_telemetry();
+    test_risk_manager_rate_limit();
+    test_risk_manager_concurrent_burst();
+    test_risk_manager_in_engine();
+    test_kill_switch_basic();
+    test_kill_switch_guards();
+    test_kill_switch_hooks_and_threads();
     if (g_failures != 0) {
         std::fprintf(stderr, "%d test assertion(s) failed\n", g_failures);
         return 1;

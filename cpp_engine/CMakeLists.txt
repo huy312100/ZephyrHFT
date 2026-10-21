@@ -20,6 +20,7 @@ option(HFT_ENABLE_NATIVE "Tune code generation for the build host" ON)
 option(HFT_ENABLE_LTO "Enable link-time optimisation" ON)
 
 add_library(hft_core STATIC
+    src/risk/kill_switch.cpp
     src/ws_parser.cpp
 )
 add_library(hft::core ALIAS hft_core)

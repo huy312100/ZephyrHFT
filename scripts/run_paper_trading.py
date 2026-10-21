@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import sys
 import time
 from datetime import datetime
@@ -20,6 +21,7 @@ from typing import List, Optional
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from python_analytics.native import hft_native
+from python_analytics.native.factory import build_risk_manager
 from python_analytics.simulator.paper_engine import (
     MarketDataFeed,
     PaperMatchingEngine,
@@ -59,6 +61,11 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--maker-fee-bps", type=float, default=-1.0)
     parser.add_argument("--taker-fee-bps", type=float, default=5.0)
     parser.add_argument("--initial-cash", type=float, default=0.0)
+    parser.add_argument("--self-trade-prevention", default="cancel_resting",
+                        choices=("none", "cancel_resting", "reject"),
+                        help="treatment of a quote crossing our own resting quote")
+    parser.add_argument("--trades-out", default=None,
+                        help="optional path to dump the trade history as JSON")
     parser.add_argument("--log-level", default="INFO")
     return parser.parse_args(argv)
 
@@ -107,6 +114,8 @@ def render_dashboard(engine: PaperMatchingEngine,
         f"  Reservation   : {reservation:,.6f}",
         f"  Position (q)  : {engine.inventory:+,.6f}",
         f"  Active Quotes : bid {_fmt_order(engine.active_bid)} | ask {_fmt_order(engine.active_ask)}",
+        f"  Trades        : {len(engine.trades_history)} executed"
+        f" | self-match prevented {engine.self_trade_prevented}",
         f"  Cumulative PnL: {engine.total_pnl:+,.6f} "
         f"(realized {engine.realized_pnl:+,.6f}, unrealized {engine.unrealized_pnl:+,.6f})",
         "-" * 78,
@@ -127,10 +136,31 @@ def render_summary(engine: PaperMatchingEngine, elapsed: float) -> None:
     print(f"  Final PnL       : {summary['total_pnl']:+,.6f}")
     print(f"    realized      : {summary['realized_pnl']:+,.6f}")
     print(f"    unrealized    : {summary['unrealized_pnl']:+,.6f}")
-    print(f"  Max Drawdown    : {summary['max_drawdown'] * 100:.2f}%")
+    print(f"  Max Drawdown    : {summary['max_drawdown'] * 100:.2f}%"
+          f"  ({summary['max_drawdown_abs']:,.6f} absolute)")
     print(f"  Total Fees      : {summary['total_fees']:+,.6f}")
     print(f"  Final Position  : {summary['inventory']:+,.6f}")
     print(f"  Cash Balance    : {summary['cash']:+,.6f}")
+    print(f"  Self-Match Stop : {summary['self_trade_prevented']}")
+    risk = engine.risk_manager()
+    if risk is not None:
+        stats = risk.stats()
+        print(f"  Pre-Trade Guard : {stats.rejected} rejected / {stats.evaluated} checked"
+              f"  (tokens left: {stats.tokens_available:.1f})")
+
+    recent = engine.trades_history[-10:]
+    if recent:
+        print("-" * 78)
+        print("  RECENT TRADES  (timestamp, side, price, size, realized PnL)")
+        print("-" * 78)
+        for trade in recent:
+            if trade["exchange_ts"] > 0:
+                stamp = datetime.fromtimestamp(
+                    trade["timestamp"]).strftime("%H:%M:%S.%f")[:-3]
+            else:
+                stamp = f"{trade['timestamp']:.3f}"
+            print(f"  {stamp}  {trade['side']:<4}  {trade['price']:>12,.6f}"
+                  f"  {trade['size']:>10,.6f}  {trade['realized_pnl']:+10,.6f}")
     print("=" * 78)
 
 
@@ -149,6 +179,11 @@ async def run(args: argparse.Namespace) -> None:
         maker_fee=args.maker_fee_bps / 10_000.0,
         taker_fee=args.taker_fee_bps / 10_000.0,
         initial_cash=args.initial_cash,
+        self_trade_prevention=args.self_trade_prevention,
+        risk_manager=(
+            build_risk_manager(settings) if settings.engine.pretrade.enabled else None
+        ),
+        symbol=settings.engine.symbol,
     )
     config = build_market_config(args, tick_size)
     strategy = AvellanedaStoikovStrategy(config)
@@ -190,6 +225,12 @@ async def run(args: argparse.Namespace) -> None:
         strategy.cancel_all(engine)
         engine.cancel_all()
         render_summary(engine, time.monotonic() - started)
+        if args.trades_out:
+            out_path = Path(args.trades_out)
+            out_path.write_text(json.dumps(engine.trades_history, indent=2),
+                                encoding="utf-8")
+            print(f"  Trade history   : {len(engine.trades_history)} rows"
+                  f" -> {out_path}")
 
 
 def main(argv: Optional[List[str]] = None) -> int:

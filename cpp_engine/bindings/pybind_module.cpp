@@ -14,6 +14,8 @@
 #include "engine.hpp"
 #include "orderbook.hpp"
 #include "ring_buffer.hpp"
+#include "risk/kill_switch.hpp"
+#include "risk_manager.hpp"
 #include "types.hpp"
 #include "ws_parser.hpp"
 
@@ -129,10 +131,21 @@ PYBIND11_MODULE(hft_native, m) {
         .value("ORDER_POOL_EXHAUSTED", RejectReason::OrderPoolExhausted)
         .value("UNKNOWN_ORDER", RejectReason::UnknownOrder)
         .value("FILL_OR_KILL_UNAVAILABLE", RejectReason::FillOrKillUnavailable);
+    py::enum_<RiskStatus>(m, "RiskStatus")
+        .value("APPROVED", RiskStatus::APPROVED)
+        .value("REJECTED_POSITION_LIMIT", RiskStatus::REJECTED_POSITION_LIMIT)
+        .value("REJECTED_RATE_LIMIT", RiskStatus::REJECTED_RATE_LIMIT)
+        .value("REJECTED_FAT_FINGER", RiskStatus::REJECTED_FAT_FINGER)
+        .value("REJECTED_MAX_ORDER_SIZE", RiskStatus::REJECTED_MAX_ORDER_SIZE)
+        .value("REJECTED_INVALID_ORDER", RiskStatus::REJECTED_INVALID_ORDER);
     py::enum_<FeedMessageType>(m, "FeedMessageType")
         .value("UNKNOWN", FeedMessageType::Unknown)
         .value("DEPTH_UPDATE", FeedMessageType::DepthUpdate)
         .value("TRADE", FeedMessageType::Trade);
+    py::enum_<SystemState>(m, "SystemState")
+        .value("NORMAL", SystemState::NORMAL)
+        .value("TRIGGERED", SystemState::TRIGGERED)
+        .value("RECOVERING", SystemState::RECOVERING);
 
     bind_fixed<Price>(m, "Price");
     bind_fixed<Quantity>(m, "Quantity");
@@ -277,12 +290,170 @@ PYBIND11_MODULE(hft_native, m) {
         .def_readwrite("max_price_deviation", &RiskLimits::max_price_deviation)
         .def_readwrite("max_open_orders", &RiskLimits::max_open_orders);
 
+    // ---- pre-trade risk manager -----------------------------------------
+    py::class_<TokenBucket>(m, "TokenBucket")
+        .def("enabled", &TokenBucket::enabled)
+        .def("rate_per_sec", &TokenBucket::rate_per_sec)
+        .def("burst", &TokenBucket::burst)
+        .def("level", &TokenBucket::level, py::arg("now_ns"));
+
+    py::class_<RiskManagerConfig>(m, "RiskManagerConfig")
+        .def(py::init<>())
+        .def_readwrite("enabled", &RiskManagerConfig::enabled)
+        .def_readwrite("max_position", &RiskManagerConfig::max_position)
+        .def_readwrite("max_order_size", &RiskManagerConfig::max_order_size)
+        .def_readwrite("max_price_deviation_pct",
+                       &RiskManagerConfig::max_price_deviation_pct)
+        .def_readwrite("order_rate_limit", &RiskManagerConfig::order_rate_limit)
+        .def_readwrite("order_burst", &RiskManagerConfig::order_burst)
+        .def_static("disabled", &RiskManagerConfig::disabled)
+        .def("__repr__", [](const RiskManagerConfig& config) {
+            return "RiskManagerConfig(enabled=" + std::string(config.enabled ? "True" : "False") +
+                   ", max_position=" + std::to_string(config.max_position) +
+                   ", max_order_size=" + std::to_string(config.max_order_size) +
+                   ", max_price_deviation_pct=" +
+                   std::to_string(config.max_price_deviation_pct) +
+                   ", order_rate_limit=" + std::to_string(config.order_rate_limit) +
+                   ", order_burst=" + std::to_string(config.order_burst) + ")";
+        });
+
+    py::class_<RiskManagerStats>(m, "RiskManagerStats")
+        .def(py::init<>())
+        .def_readonly("evaluated", &RiskManagerStats::evaluated)
+        .def_readonly("approved", &RiskManagerStats::approved)
+        .def_readonly("rejected", &RiskManagerStats::rejected)
+        .def_readonly("by_status", &RiskManagerStats::by_status)
+        .def_readonly("tokens_available", &RiskManagerStats::tokens_available)
+        .def("count", &RiskManagerStats::count, py::arg("status"))
+        .def("__repr__", [](const RiskManagerStats& stats) {
+            return "RiskManagerStats(evaluated=" + std::to_string(stats.evaluated) +
+                   ", approved=" + std::to_string(stats.approved) +
+                   ", rejected=" + std::to_string(stats.rejected) +
+                   ", tokens=" + std::to_string(stats.tokens_available) + ")";
+        });
+
+    py::class_<RiskManager>(m, "RiskManager")
+        .def(py::init<>())
+        .def(py::init<const RiskManagerConfig&>(), py::arg("config"))
+        .def("configure", &RiskManager::configure, py::arg("config"))
+        .def("config", &RiskManager::config)
+        .def_property("enabled", &RiskManager::enabled, &RiskManager::set_enabled)
+        .def_property("max_position", &RiskManager::max_position,
+                      &RiskManager::set_max_position)
+        .def_property("max_order_size", &RiskManager::max_order_size,
+                      &RiskManager::set_max_order_size)
+        .def_property("max_price_deviation_pct",
+                      &RiskManager::max_price_deviation_pct,
+                      &RiskManager::set_max_price_deviation_pct)
+        .def("set_order_rate_limit", &RiskManager::set_order_rate_limit,
+             py::arg("rate_per_sec"), py::arg("burst") = 1.0)
+        .def("validate_order", &RiskManager::validate_order, py::arg("symbol"),
+             py::arg("price"), py::arg("quantity"), py::arg("side"),
+             py::arg("current_position"), py::arg("current_mid_price"))
+        .def("validate_order_at", &RiskManager::validate_order_at, py::arg("now_ns"),
+             py::arg("symbol"), py::arg("price"), py::arg("quantity"), py::arg("side"),
+             py::arg("current_position"), py::arg("current_mid_price"))
+        .def("tokens_available", [](const RiskManager& risk) {
+            return risk.tokens_available();
+        })
+        .def("tokens_available",
+             [](const RiskManager& risk, Nanos now_ns) {
+                 return risk.tokens_available(now_ns);
+             },
+             py::arg("now_ns"))
+        .def("stats", [](const RiskManager& risk) { return risk.stats(); })
+        .def("stats", [](const RiskManager& risk, Nanos now_ns) { return risk.stats(now_ns); },
+             py::arg("now_ns"))
+        .def("reset", &RiskManager::reset, py::arg("now_ns"))
+        .def("rate_limiter", &RiskManager::rate_limiter,
+             py::return_value_policy::reference_internal);
+
+    m.def("risk_status_name", &risk_status_name, py::arg("status"));
+    m.def("is_approved", &is_approved, py::arg("status"));
+
+    // ---- emergency kill switch -------------------------------------------
+    py::class_<KillSwitchConfig>(m, "KillSwitchConfig")
+        .def(py::init<>())
+        .def_readwrite("enabled", &KillSwitchConfig::enabled)
+        .def_readwrite("max_drawdown_limit", &KillSwitchConfig::max_drawdown_limit)
+        .def_readwrite("max_consecutive_rejects",
+                       &KillSwitchConfig::max_consecutive_rejects)
+        .def("__repr__", [](const KillSwitchConfig& config) {
+            return "KillSwitchConfig(enabled=" +
+                   std::string(config.enabled ? "True" : "False") +
+                   ", max_drawdown_limit=" + std::to_string(config.max_drawdown_limit) +
+                   ", max_consecutive_rejects=" +
+                   std::to_string(config.max_consecutive_rejects) + ")";
+        });
+
+    py::class_<KillSwitchStats>(m, "KillSwitchStats")
+        .def(py::init<>())
+        .def_readonly("trip_count", &KillSwitchStats::trip_count)
+        .def_readonly("last_trip_timestamp_ns", &KillSwitchStats::last_trip_timestamp_ns)
+        .def_readonly("last_trip_reason", &KillSwitchStats::last_trip_reason)
+        .def_readonly("state", &KillSwitchStats::state)
+        .def_readonly("consecutive_rejects", &KillSwitchStats::consecutive_rejects)
+        .def_readonly("blocked_orders", &KillSwitchStats::blocked_orders)
+        .def_readonly("reset_count", &KillSwitchStats::reset_count)
+        .def("__repr__", [](const KillSwitchStats& stats) {
+            return "KillSwitchStats(state=" +
+                   std::string(system_state_name(stats.state)) +
+                   ", trip_count=" + std::to_string(stats.trip_count) +
+                   ", last_trip_reason=" + stats.last_trip_reason + ")";
+        });
+
+    py::class_<KillSwitch>(m, "KillSwitch")
+        .def(py::init<>())
+        .def(py::init<const KillSwitchConfig&>(), py::arg("config"))
+        .def("is_tripped", &KillSwitch::is_tripped)
+        .def("get_state", &KillSwitch::get_state)
+        .def("check_order_allowed", &KillSwitch::check_order_allowed)
+        .def("trip", &KillSwitch::trip, py::arg("reason") = "manual")
+        .def("reset", &KillSwitch::reset)
+        .def("begin_recovery", &KillSwitch::begin_recovery)
+        .def("get_stats", &KillSwitch::get_stats)
+        .def("check_drawdown", &KillSwitch::check_drawdown, py::arg("drawdown"))
+        .def("record_order_rejected", &KillSwitch::record_order_rejected)
+        .def("record_order_accepted", &KillSwitch::record_order_accepted)
+        .def("config", &KillSwitch::config)
+        .def("set_config", &KillSwitch::set_config, py::arg("config"))
+        .def_property("enabled", &KillSwitch::enabled, &KillSwitch::set_enabled)
+        // Python callbacks acquire the GIL themselves: a trip can be raised
+        // from any C++/worker thread that does not hold it.
+        .def("set_trip_hook", [](KillSwitch& self, py::function callback) {
+            self.set_trip_hook([callback](SystemState state, std::string_view reason) {
+                py::gil_scoped_acquire gil;
+                callback(py::str(system_state_name(state)),
+                         py::str(reason.data(), reason.size()));
+            });
+        }, py::arg("callback"))
+        .def("set_cancel_all_hook", [](KillSwitch& self, py::function callback) {
+            self.set_cancel_all_hook([callback]() {
+                py::gil_scoped_acquire gil;
+                callback();
+            });
+        }, py::arg("callback"))
+        .def("set_flatten_hook", [](KillSwitch& self, py::function callback) {
+            self.set_flatten_hook([callback]() {
+                py::gil_scoped_acquire gil;
+                callback();
+            });
+        }, py::arg("callback"))
+        .def("clear_hooks", &KillSwitch::clear_hooks)
+        .def("__repr__", [](const KillSwitch& self) {
+            return "KillSwitch(state=" +
+                   std::string(system_state_name(self.get_state())) + ")";
+        });
+
+    m.def("system_state_name", &system_state_name, py::arg("state"));
+
     py::class_<EngineConfig>(m, "EngineConfig")
         .def(py::init<>())
         .def_readwrite("tick_size", &EngineConfig::tick_size)
         .def_readwrite("center", &EngineConfig::center)
         .def_readwrite("stale_after_ns", &EngineConfig::stale_after_ns)
-        .def_readwrite("risk", &EngineConfig::risk);
+        .def_readwrite("risk", &EngineConfig::risk)
+        .def_readwrite("risk_manager", &EngineConfig::risk_manager);
 
     py::class_<EngineMetrics>(m, "EngineMetrics")
         .def(py::init<>())
@@ -409,6 +580,14 @@ PYBIND11_MODULE(hft_native, m) {
         .def("set_risk_limits", &TradingEngine::set_risk_limits, py::arg("limits"))
         .def("risk_limits", &TradingEngine::risk_limits,
              py::return_value_policy::copy)
+        .def("set_risk_manager_config", &TradingEngine::set_risk_manager_config,
+             py::arg("config"))
+        .def("risk_manager_config", &TradingEngine::risk_manager_config)
+        .def("risk_manager",
+             static_cast<RiskManager& (TradingEngine::*)() noexcept>(
+                 &TradingEngine::risk_manager),
+             py::return_value_policy::reference_internal)
+        .def("risk_stats", &TradingEngine::risk_stats, py::arg("now") = 0)
         .def("is_stale", &TradingEngine::is_stale, py::arg("now_ns"))
         .def("config", &TradingEngine::config,
              py::return_value_policy::copy)

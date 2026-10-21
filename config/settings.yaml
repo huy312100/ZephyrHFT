@@ -11,6 +11,24 @@ engine:
     max_daily_loss: "25000"
     max_price_deviation: "500"
     max_open_orders: 64
+  # Order-flow / fat-finger guards (native RiskManager, token bucket rate limit).
+  # Enable for live and paper execution; leave off for deterministic replay.
+  pretrade:
+    enabled: false
+    max_position: "10"            # base units, signed net exposure cap
+    max_order_size: "1"           # base units per order
+    max_price_deviation_pct: "0.01"   # 1% band around the BBO mid
+    order_rate_limit: 50          # orders / second
+    order_burst: 20               # token bucket depth
+
+# Emergency kill switch (native KillSwitch). While TRIGGERED every order is
+# refused, resting orders are cancelled and the position is flattened through
+# the registered hooks. `enabled` arms only the automatic guards; a manual
+# trip always wins.
+kill_switch:
+  enabled: true
+  max_drawdown_limit: "25000"     # quote currency; 0 disables the drawdown guard
+  max_consecutive_rejects: 10     # trip after N rejects in a row; 0 disables
 
 strategy:
   name: inventory_market_maker

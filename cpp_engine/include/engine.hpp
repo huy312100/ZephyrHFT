@@ -20,6 +20,7 @@
 #include "orderbook.hpp"
 #include "ring_buffer.hpp"
 #include "risk_guard.hpp"
+#include "risk_manager.hpp"
 #include "types.hpp"
 
 namespace hft {
@@ -69,6 +70,10 @@ struct EngineConfig {
     Price center = Price::from_raw(3'000'000'000'000);
     Nanos stale_after_ns = 1'000'000'000;
     RiskLimits risk{};
+    // Disabled by default so replay and backtests keep their unthrottled,
+    // deterministic behaviour. Live deployments set `enabled = true` (the
+    // remaining fields are then the production defaults).
+    RiskManagerConfig risk_manager = RiskManagerConfig::disabled();
 };
 
 class TradingEngine {
@@ -79,7 +84,8 @@ public:
     explicit TradingEngine(const EngineConfig& config = {}) noexcept
         : config_(config),
           book_(config.tick_size, config.center),
-          risk_(config.risk) {
+          risk_(config.risk),
+          risk_manager_(config.risk_manager) {
         reset();
     }
     TradingEngine(const TradingEngine&) = delete;
@@ -95,6 +101,7 @@ public:
         last_trade_ = TradeTick{};
         mark_price_ = config_.center;
         metrics_ = EngineMetrics{};
+        risk_manager_.reset(now_ns());
     }
 
     // ---- feed ingestion -------------------------------------------------
@@ -188,6 +195,31 @@ public:
         }
         const Bbo current = book_.top();
         const bool is_market = request.type == OrderType::Market;
+
+        // Order-flow / fat-finger gate. It runs only when the book holds a
+        // coherent two-sided quote: there is no mid to band against otherwise,
+        // and `risk_.check()` below already reports BookUnavailable, which is
+        // the more precise diagnosis. The engine is single-book, so the gate is
+        // symbol-agnostic and the reject hook receives an empty symbol.
+        if (risk_manager_.enabled() && current.is_valid()) {
+            // Market orders carry no price; validate them at the touch, which
+            // is where they would actually execute.
+            const double reference =
+                is_market
+                    ? (request.side == Side::Buy ? current.ask_price
+                                                 : current.bid_price)
+                          .to_double()
+                    : request.price.to_double();
+            const RiskStatus risk_status = risk_manager_.validate_order(
+                std::string_view{}, reference, request.quantity.to_double(),
+                request.side, position_.net_quantity.to_double(),
+                current.mid().to_double());
+            if (!is_approved(risk_status)) {
+                ++metrics_.orders_rejected;
+                ack.reason = to_reject_reason(risk_status);
+                return ack;
+            }
+        }
         const bool crosses =
             is_market ||
             (request.type != OrderType::PostOnly &&
@@ -314,6 +346,22 @@ public:
     void set_risk_limits(const RiskLimits& limits) noexcept { risk_.set_limits(limits); }
     [[nodiscard]] const RiskLimits& risk_limits() const noexcept { return risk_.limits(); }
 
+    // Pre-trade guard for order-flow and fat-finger limits. Tunable at runtime
+    // from a control thread; all of its state is atomic.
+    void set_risk_manager_config(const RiskManagerConfig& config) noexcept {
+        risk_manager_.configure(config);
+    }
+    [[nodiscard]] RiskManagerConfig risk_manager_config() const noexcept {
+        return risk_manager_.config();
+    }
+    [[nodiscard]] RiskManager& risk_manager() noexcept { return risk_manager_; }
+    [[nodiscard]] const RiskManager& risk_manager() const noexcept {
+        return risk_manager_;
+    }
+    [[nodiscard]] RiskManagerStats risk_stats(Nanos now = 0) const noexcept {
+        return risk_manager_.stats(now);
+    }
+
     [[nodiscard]] bool is_stale(Nanos now) const noexcept {
         return metrics_.last_update_ts == 0 ||
                now > metrics_.last_update_ts + config_.stale_after_ns;
@@ -410,6 +458,7 @@ private:
     L2Book book_;
     DefaultOrderManager orders_{};
     RiskGuard risk_{};
+    RiskManager risk_manager_{};
     SpscRingBuffer<EngineEvent, kInboundCapacity> inbound_{};
     SpscRingBuffer<Fill, kFillCapacity> fills_{};
     LatencyHistogram latency_{};

@@ -45,6 +45,43 @@ def place(engine: PaperMatchingEngine, side: str, price: float,
     return engine.submit(request)
 
 
+def test_pretrade_risk_manager_rejects_orders() -> None:
+    config = hft_native.RiskManagerConfig()
+    config.enabled = True
+    config.max_position = 1.0
+    config.max_order_size = 0.5
+    config.max_price_deviation_pct = 0.01
+    config.order_rate_limit = 100.0
+    config.order_burst = 100.0
+    risk = hft_native.RiskManager(config)
+
+    book, engine = make_pair(risk_manager=risk, symbol="TESTUSDT")
+    set_bbo(book, 99.5, 5.0, 100.5, 5.0)  # mid == 100.0
+    assert engine.risk_manager() is risk
+
+    oversized = place(engine, "BUY", 99.5, 2.0)  # above max_order_size
+    assert not oversized.accepted()
+    assert oversized.reason == "REJECTED_MAX_ORDER_SIZE"
+    assert engine.active_bid is None
+
+    fat = place(engine, "BUY", 105.0, 0.1)  # 5% away from a 100.0 mid
+    assert not fat.accepted()
+    assert fat.reason == "REJECTED_FAT_FINGER"
+
+    # Rejected orders must not mutate engine state.
+    assert engine.inventory == 0.0
+    assert engine.active_bid is None and engine.active_ask is None
+
+    good = place(engine, "BUY", 99.5, 0.4)
+    assert good.accepted() and good.order_id > 0
+    assert engine.active_bid is not None
+
+    # The gate can be detached (or swapped) at runtime.
+    engine.set_risk_manager(None)
+    assert engine.risk_manager() is None
+    assert place(engine, "SELL", 100.5, 5.0).accepted()
+
+
 def test_bid_fills_when_market_ask_crosses() -> None:
     book, engine = make_pair()
     set_bbo(book, 99.0, 5.0, 100.0, 5.0)
@@ -147,6 +184,149 @@ def test_parse_depth_message_handles_both_formats() -> None:
 
     trade = '{"e":"trade","p":"100.0","q":"0.1","m":false}'
     assert parse_depth_message(trade) is None
+
+
+def set_bbo_at(book: "hft_native.L2Book", bid: float, bid_qty: float,
+               ask: float, ask_qty: float, exchange_ts: int,
+               sequence: int) -> None:
+    """Sets the touch together with a market timestamp/sequence."""
+    book.clear()
+    book.apply_level(hft_native.Side.BUY, hft_native.Price.from_string(str(bid)),
+                     hft_native.Quantity.from_string(str(bid_qty)), exchange_ts)
+    book.apply_level(hft_native.Side.SELL, hft_native.Price.from_string(str(ask)),
+                     hft_native.Quantity.from_string(str(ask_qty)), exchange_ts)
+    book.set_sequence(sequence, exchange_ts, exchange_ts)
+
+
+def test_trades_history_records_timestamp_side_price_size() -> None:
+    book, engine = make_pair()
+    exchange_ts = 1_700_000_123_456
+    set_bbo_at(book, 99.0, 5.0, 100.0, 5.0, exchange_ts, 11)
+
+    place(engine, "BUY", 100.0, 1.0)
+    engine.on_market_tick()
+
+    history = engine.trades_history
+    assert len(history) == 1
+    trade = history[0]
+    assert trade["timestamp"] == pytest.approx(exchange_ts / 1000.0)
+    assert trade["exchange_ts"] == exchange_ts
+    assert trade["sequence"] == 11
+    assert trade["side"] == "BUY"
+    assert trade["price"] == pytest.approx(100.0)
+    assert trade["size"] == pytest.approx(1.0)
+    # Bookkeeping mirrors the portfolio state after the fill.
+    assert trade["inventory"] == pytest.approx(1.0)
+    assert engine.last_market_ts == exchange_ts
+
+    # The history is a defensive copy: mutating it must not corrupt the engine.
+    history.clear()
+    assert len(engine.trades_history) == 1
+
+
+def test_no_fill_when_market_does_not_cross() -> None:
+    """Regression: a quiet market must produce zero trades, not phantom fills."""
+    book, engine = make_pair()
+    set_bbo(book, 99.0, 5.0, 100.0, 5.0)
+
+    place(engine, "BUY", 98.0, 1.0)
+    place(engine, "SELL", 101.0, 1.0)
+
+    for _ in range(10):
+        assert engine.on_market_tick() == []
+
+    assert engine.trades_history == []
+    assert engine.inventory == pytest.approx(0.0)
+    assert engine.active_bid is not None and engine.active_ask is not None
+
+
+def test_self_trade_prevention_cancels_resting_opposite() -> None:
+    """A quote that would cross our own resting quote retires the older one."""
+    book, engine = make_pair()  # default: cancel_resting
+    set_bbo(book, 99.0, 5.0, 100.0, 5.0)
+
+    bid_ack = place(engine, "BUY", 100.2, 1.0)
+    assert bid_ack.accepted()
+    ask_ack = place(engine, "SELL", 99.8, 1.0)  # 99.8 <= 100.2 -> self-cross
+
+    assert ask_ack.accepted()
+    assert engine.active_bid is None          # stale bid retired
+    assert engine.active_ask is not None
+    assert engine.self_trade_prevented == 1
+
+    # No fictitious round trip: the market never crossed the surviving ask.
+    assert engine.on_market_tick() == []
+    assert engine.trades_history == []
+
+
+def test_self_trade_prevention_reject_mode() -> None:
+    book, engine = make_pair(self_trade_prevention="reject")
+    set_bbo(book, 99.0, 5.0, 100.0, 5.0)
+
+    assert place(engine, "BUY", 100.2, 1.0).accepted()
+    rejected = place(engine, "SELL", 99.8, 1.0)
+
+    assert not rejected.accepted()
+    assert rejected.reason == "SELF_TRADE_PREVENTED"
+    assert engine.active_bid is not None      # original quote untouched
+    assert engine.active_ask is None
+    assert engine.self_trade_prevented == 1
+
+
+def test_self_trade_prevention_none_allows_crossed_pair() -> None:
+    book, engine = make_pair(self_trade_prevention="none")
+    set_bbo(book, 100.0, 5.0, 100.0, 5.0)
+
+    place(engine, "BUY", 100.2, 1.0)
+    place(engine, "SELL", 99.8, 1.0)
+
+    # Both quotes rest; without the guard a single tick would fill both.
+    assert engine.active_bid is not None and engine.active_ask is not None
+    assert engine.self_trade_prevented == 0
+
+
+def test_invalid_self_trade_prevention_mode_rejected() -> None:
+    with pytest.raises(ValueError):
+        make_pair(self_trade_prevention="sometimes")
+
+
+def test_partial_reduction_keeps_cost_basis() -> None:
+    """Reducing a position must not overwrite the remaining cost basis."""
+    book, engine = make_pair(initial_cash=100000.0)
+    set_bbo(book, 99.0, 5.0, 100.0, 5.0)
+
+    place(engine, "BUY", 100.0, 2.0)
+    engine.on_market_tick()
+    assert engine.inventory == pytest.approx(2.0)
+    assert engine.position().average_entry_price == pytest.approx(100.0)
+
+    # Sell half at a higher price: inventory shrinks, basis stays at 100.
+    set_bbo(book, 101.0, 5.0, 102.0, 5.0)
+    place(engine, "SELL", 101.0, 1.0)
+    engine.on_market_tick()
+
+    assert engine.inventory == pytest.approx(1.0)
+    assert engine.position().average_entry_price == pytest.approx(100.0)
+    assert engine.unrealized_pnl == pytest.approx((101.5 - 100.0) * 1.0)
+    # Core portfolio identity: equity == initial cash + total PnL.
+    assert engine.equity == pytest.approx(100000.0 + engine.total_pnl)
+
+
+def test_flip_through_zero_resets_cost_basis() -> None:
+    book, engine = make_pair(initial_cash=100000.0)
+    set_bbo(book, 99.0, 5.0, 100.0, 5.0)
+
+    place(engine, "BUY", 100.0, 1.0)
+    engine.on_market_tick()
+    assert engine.inventory == pytest.approx(1.0)
+
+    # Sell 2: closes the long and opens a 1.0 short at 101.
+    set_bbo(book, 101.0, 5.0, 102.0, 5.0)
+    place(engine, "SELL", 101.0, 2.0)
+    engine.on_market_tick()
+
+    assert engine.inventory == pytest.approx(-1.0)
+    assert engine.position().average_entry_price == pytest.approx(101.0)
 
 
 def test_market_data_feed_replays_ndjson(tmp_path) -> None:

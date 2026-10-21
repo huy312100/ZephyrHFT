@@ -30,12 +30,46 @@ class RiskSettings:
 
 
 @dataclass(frozen=True)
+class PreTradeSettings:
+    """Order-flow and fat-finger guards implemented by ``RiskManager``.
+
+    ``max_position`` and ``max_order_size`` are base-asset quantities,
+    ``max_price_deviation_pct`` is a fraction of mid (``"0.01"`` is 1%) and the
+    rate fields are orders per second / burst depth. Set ``enabled`` to false to
+    bypass the gate entirely (replay, backtests, and the default paper session).
+    """
+
+    enabled: bool = False
+    max_position: str = "10"
+    max_order_size: str = "1"
+    max_price_deviation_pct: str = "0.01"
+    order_rate_limit: int = 50
+    order_burst: int = 20
+
+
+@dataclass(frozen=True)
+class KillSwitchSettings:
+    """Emergency halt implemented by the native ``KillSwitch``.
+
+    ``max_drawdown_limit`` is an absolute drawdown in quote currency (``"0"``
+    disables the drawdown guard) and ``max_consecutive_rejects`` trips after N
+    rejected orders in a row (``0`` disables the streak guard). ``enabled``
+    only arms those automatic guards; a manual ``trip()`` always blocks.
+    """
+
+    enabled: bool = True
+    max_drawdown_limit: str = "25000"
+    max_consecutive_rejects: int = 10
+
+
+@dataclass(frozen=True)
 class EngineSettings:
     symbol: str = "BTCUSDT"
     tick_size: str = "0.50"
     center: str = "30000"
     stale_after_ns: int = 1_000_000_000
     risk: RiskSettings = field(default_factory=RiskSettings)
+    pretrade: PreTradeSettings = field(default_factory=PreTradeSettings)
 
 
 @dataclass(frozen=True)
@@ -58,6 +92,7 @@ class AppSettings:
     engine: EngineSettings = field(default_factory=EngineSettings)
     strategy: StrategySettings = field(default_factory=StrategySettings)
     backtest: BacktestSettings = field(default_factory=BacktestSettings)
+    kill_switch: KillSwitchSettings = field(default_factory=KillSwitchSettings)
 
 
 def _mapping(value: Any, section: str) -> Mapping[str, Any]:
@@ -90,6 +125,13 @@ def _positive_decimal(value: Any, section: str) -> str:
     text = _decimal(value, section)
     if Decimal(text) <= 0:
         raise ConfigError(f"'{section}' must be positive")
+    return text
+
+
+def _non_negative_decimal(value: Any, section: str) -> str:
+    text = _decimal(value, section)
+    if Decimal(text) < 0:
+        raise ConfigError(f"'{section}' must be >= 0")
     return text
 
 
@@ -134,6 +176,51 @@ def _build_risk(raw: Mapping[str, Any]) -> RiskSettings:
     )
 
 
+def _build_pretrade(raw: Mapping[str, Any]) -> PreTradeSettings:
+    defaults = PreTradeSettings()
+    return PreTradeSettings(
+        enabled=bool(raw.get("enabled", defaults.enabled)),
+        max_position=_positive_decimal(
+            raw.get("max_position", defaults.max_position),
+            "engine.pretrade.max_position",
+        ),
+        max_order_size=_positive_decimal(
+            raw.get("max_order_size", defaults.max_order_size),
+            "engine.pretrade.max_order_size",
+        ),
+        max_price_deviation_pct=_positive_decimal(
+            raw.get("max_price_deviation_pct", defaults.max_price_deviation_pct),
+            "engine.pretrade.max_price_deviation_pct",
+        ),
+        order_rate_limit=_int(
+            raw.get("order_rate_limit", defaults.order_rate_limit),
+            "engine.pretrade.order_rate_limit",
+            minimum=1,
+        ),
+        order_burst=_int(
+            raw.get("order_burst", defaults.order_burst),
+            "engine.pretrade.order_burst",
+            minimum=1,
+        ),
+    )
+
+
+def _build_kill_switch(raw: Mapping[str, Any]) -> KillSwitchSettings:
+    defaults = KillSwitchSettings()
+    return KillSwitchSettings(
+        enabled=bool(raw.get("enabled", defaults.enabled)),
+        max_drawdown_limit=_non_negative_decimal(
+            raw.get("max_drawdown_limit", defaults.max_drawdown_limit),
+            "kill_switch.max_drawdown_limit",
+        ),
+        max_consecutive_rejects=_int(
+            raw.get("max_consecutive_rejects", defaults.max_consecutive_rejects),
+            "kill_switch.max_consecutive_rejects",
+            minimum=0,
+        ),
+    )
+
+
 def load_settings(path: Optional[Path] = None) -> AppSettings:
     """Loads and validates a settings file, falling back to dataclass defaults."""
     config_path = Path(path) if path is not None else DEFAULT_CONFIG_PATH
@@ -148,8 +235,10 @@ def load_settings(path: Optional[Path] = None) -> AppSettings:
 
     engine_raw = _mapping(document.get("engine"), "engine")
     risk_raw = _mapping(engine_raw.get("risk"), "engine.risk")
+    pretrade_raw = _mapping(engine_raw.get("pretrade"), "engine.pretrade")
     strategy_raw = _mapping(document.get("strategy"), "strategy")
     backtest_raw = _mapping(document.get("backtest"), "backtest")
+    kill_switch_raw = _mapping(document.get("kill_switch"), "kill_switch")
 
     defaults = EngineSettings()
     engine = EngineSettings(
@@ -165,6 +254,7 @@ def load_settings(path: Optional[Path] = None) -> AppSettings:
             minimum=1,
         ),
         risk=_build_risk(risk_raw),
+        pretrade=_build_pretrade(pretrade_raw),
     )
 
     strategy_defaults = StrategySettings()
@@ -200,7 +290,8 @@ def load_settings(path: Optional[Path] = None) -> AppSettings:
             backtest_raw.get("record_fills", backtest_defaults.record_fills)
         ),
     )
-    return AppSettings(engine=engine, strategy=strategy, backtest=backtest)
+    return AppSettings(engine=engine, strategy=strategy, backtest=backtest,
+                       kill_switch=_build_kill_switch(kill_switch_raw))
 
 
 def as_dict(settings: AppSettings) -> Dict[str, Any]:
@@ -212,7 +303,9 @@ def as_dict(settings: AppSettings) -> Dict[str, Any]:
             "center": settings.engine.center,
             "stale_after_ns": settings.engine.stale_after_ns,
             "risk": settings.engine.risk.__dict__,
+            "pretrade": settings.engine.pretrade.__dict__,
         },
         "strategy": settings.strategy.__dict__,
         "backtest": settings.backtest.__dict__,
+        "kill_switch": settings.kill_switch.__dict__,
     }

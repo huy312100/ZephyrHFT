@@ -158,6 +158,9 @@ class PaperFill:
     is_maker: bool
     timestamp: float
     realized_pnl: float
+    # Market-data provenance for the tick that crossed this quote.
+    exchange_ts: int = 0
+    sequence: int = 0
 
 
 @dataclass
@@ -193,11 +196,24 @@ class PaperMatchingEngine:
         taker_fee: float = 0.0005,
         initial_cash: float = 0.0,
         risk_limits: Optional["hft_native.RiskLimits"] = None,
+        self_trade_prevention: str = "cancel_resting",
+        risk_manager: Optional["hft_native.RiskManager"] = None,
+        symbol: str = "",
     ) -> None:
+        if self_trade_prevention not in ("none", "cancel_resting", "reject"):
+            raise ValueError(
+                "self_trade_prevention must be 'none', 'cancel_resting' or 'reject'"
+            )
         self._book = book
         self._maker_fee = maker_fee
         self._taker_fee = taker_fee
         self._initial_cash = initial_cash
+        self._self_trade_prevention = self_trade_prevention
+        # Optional native pre-trade gate. When present every order is checked
+        # against position, order-size, fat-finger and order-rate limits before
+        # it is booked, mirroring what `TradingEngine::submit` does in C++.
+        self._risk_manager = risk_manager
+        self._symbol = symbol
         self._cash = initial_cash
         self._inventory = 0.0
         self._avg_entry_price = 0.0
@@ -210,7 +226,10 @@ class PaperMatchingEngine:
         self._active_ask: Optional[PaperOrder] = None
         self._next_order_id = 1
         self._fills: List[PaperFill] = []
+        self._trades_history: List[Dict[str, Any]] = []
         self._equity_curve: List[float] = []
+        self._self_trade_prevented = 0
+        self._last_market_ts = 0
 
     # ------------------------------------------------- strategy-facing facade
     def bbo(self) -> "hft_native.Bbo":
@@ -222,12 +241,59 @@ class PaperMatchingEngine:
     def risk_limits(self) -> "hft_native.RiskLimits":
         return self._risk_limits
 
+    def risk_manager(self) -> Optional["hft_native.RiskManager"]:
+        """The native pre-trade guard consulted by :meth:`submit`, if any."""
+        return self._risk_manager
+
+    def set_risk_manager(
+        self,
+        risk_manager: Optional["hft_native.RiskManager"],
+        symbol: Optional[str] = None,
+    ) -> None:
+        self._risk_manager = risk_manager
+        if symbol is not None:
+            self._symbol = symbol
+
     def submit(self, request: "hft_native.OrderRequest") -> PaperOrderAck:
         side = BUY if request.side == hft_native.Side.BUY else SELL
         price = float(request.price)
         quantity = float(request.quantity)
         if price <= 0.0 or quantity <= 0.0:
             return PaperOrderAck(0, False, "INVALID_ORDER")
+
+        # Native pre-trade gate: position, order size, fat-finger band and the
+        # token-bucket order rate limit. It runs before any state changes so a
+        # rejected order can never leave the book inconsistent.
+        if self._risk_manager is not None:
+            status = self._risk_manager.validate_order(
+                self._symbol,
+                price,
+                quantity,
+                hft_native.Side.BUY if side == BUY else hft_native.Side.SELL,
+                self._inventory,
+                self.mark_price(),
+            )
+            if not hft_native.is_approved(status):
+                return PaperOrderAck(0, False, hft_native.risk_status_name(status))
+
+        # Self-trade prevention: never rest a pair of crossing own quotes. A
+        # post-only order that would lift our own opposite quote is either
+        # rejected or replaces it, depending on the configured mode.
+        opposite = self._active_ask if side == BUY else self._active_bid
+        if opposite is not None and self._self_trade_prevention != "none":
+            if side == BUY:
+                crosses = price >= opposite.price
+            else:
+                crosses = price <= opposite.price
+            if crosses:
+                self._self_trade_prevented += 1
+                if self._self_trade_prevention == "reject":
+                    return PaperOrderAck(0, False, "SELF_TRADE_PREVENTED")
+                # cancel_resting: retire the stale opposite quote, keep the new one.
+                if side == BUY:
+                    self._active_ask = None
+                else:
+                    self._active_bid = None
 
         order_id = self._next_order_id
         self._next_order_id += 1
@@ -261,29 +327,72 @@ class PaperMatchingEngine:
         return self._last_mark
 
     def on_market_tick(self) -> List[PaperFill]:
-        """Matches active orders against the current top-of-book and marks PnL."""
-        fills: List[PaperFill] = []
-        bbo = self._book.top()
-        if bbo.is_valid():
-            market_bid = float(bbo.bid_price)
-            market_ask = float(bbo.ask_price)
-            market_bid_qty = float(bbo.bid_quantity)
-            market_ask_qty = float(bbo.ask_quantity)
-
-            if self._active_bid is not None and market_ask <= self._active_bid.price:
-                fill_qty = min(self._active_bid.remaining, market_ask_qty)
-                if fill_qty > 0.0:
-                    fills.append(self._execute(self._active_bid, fill_qty,
-                                               self._active_bid.price))
-            if self._active_ask is not None and market_bid >= self._active_ask.price:
-                fill_qty = min(self._active_ask.remaining, market_bid_qty)
-                if fill_qty > 0.0:
-                    fills.append(self._execute(self._active_ask, fill_qty,
-                                               self._active_ask.price))
-
-        self.mark_to_market(self.mark_price())
+        """Matches resting quotes against the touch and records the equity mark."""
+        fills = self.match_against_book()
         self._equity_curve.append(self.equity)
         return fills
+
+    def match_against_book(self) -> List[PaperFill]:
+        """Taker-cross matcher: external liquidity trades through our quotes.
+
+        A resting bid is filled when the market's best ask drops to or below
+        our bid price (``best_ask <= bid``); a resting ask is filled when the
+        market's best bid rises to or above our ask price (``best_bid >= ask``).
+        Fill size is capped by the visible size at the touch, so a thin book
+        yields a partial fill rather than inventing liquidity.
+        """
+        fills: List[PaperFill] = []
+        bbo = self._book.top()
+        if not bbo.is_valid():
+            self.mark_to_market(self._last_mark)
+            return fills
+
+        market_bid = float(bbo.bid_price)
+        market_ask = float(bbo.ask_price)
+        bid_size = float(bbo.bid_quantity)
+        ask_size = float(bbo.ask_quantity)
+
+        exchange_ts = int(getattr(bbo, "exchange_ts", 0) or 0)
+        if exchange_ts <= 0:
+            exchange_ts = int(self._book.last_update_ts() or 0)
+        sequence = int(getattr(bbo, "sequence", 0) or 0)
+        if exchange_ts > 0:
+            self._last_market_ts = exchange_ts
+
+        # Self-match guard: never let a crossed pair of our own quotes execute
+        # against the same tick, which would print a fictitious round trip.
+        self._uncross_own_quotes()
+
+        bid = self._active_bid
+        if bid is not None and market_ask <= bid.price:
+            fill_qty = min(bid.remaining, ask_size)
+            if fill_qty > 0.0:
+                fills.append(self._execute(bid, fill_qty, bid.price,
+                                           exchange_ts, sequence))
+
+        ask = self._active_ask
+        if ask is not None and market_bid >= ask.price:
+            fill_qty = min(ask.remaining, bid_size)
+            if fill_qty > 0.0:
+                fills.append(self._execute(ask, fill_qty, ask.price,
+                                           exchange_ts, sequence))
+
+        self.mark_to_market(self.mark_price())
+        return fills
+
+    def _uncross_own_quotes(self) -> None:
+        """Retires the older of two crossing own quotes (self-match guard)."""
+        bid, ask = self._active_bid, self._active_ask
+        if bid is None or ask is None or bid.price < ask.price:
+            return
+        if self._self_trade_prevention == "none":
+            return
+        if bid.order_id < ask.order_id:
+            self._active_bid = None
+        else:
+            self._active_ask = None
+        self._self_trade_prevented += 1
+        logger.debug("self-match guard: retired a crossed own quote")
 
     def execute_taker(self, side: str, quantity: float) -> Optional[PaperFill]:
         """Crosses the spread immediately as a taker (for fee/PnL modelling)."""
@@ -291,7 +400,12 @@ class PaperMatchingEngine:
         if not bbo.is_valid() or quantity <= 0.0:
             return None
         price = float(bbo.ask_price) if side == BUY else float(bbo.bid_price)
-        return self._record_fill(side, price, quantity, is_maker=False, order_id=0)
+        exchange_ts = int(getattr(bbo, "exchange_ts", 0) or 0)
+        if exchange_ts <= 0:
+            exchange_ts = int(self._book.last_update_ts() or 0)
+        sequence = int(getattr(bbo, "sequence", 0) or 0)
+        return self._record_fill(side, price, quantity, is_maker=False, order_id=0,
+                                 exchange_ts=exchange_ts, sequence=sequence)
 
     def mark_to_market(self, mark_price: float) -> None:
         self._last_mark = mark_price
@@ -301,11 +415,12 @@ class PaperMatchingEngine:
             self._unrealized_pnl = (mark_price - self._avg_entry_price) * self._inventory
 
     # ------------------------------------------------------------ internal
-    def _execute(self, order: PaperOrder, fill_qty: float,
-                 fill_price: float) -> PaperFill:
+    def _execute(self, order: PaperOrder, fill_qty: float, fill_price: float,
+                 exchange_ts: int = 0, sequence: int = 0) -> PaperFill:
         order.remaining -= fill_qty
         fill = self._record_fill(order.side, fill_price, fill_qty,
-                                 order.is_maker, order.order_id)
+                                 order.is_maker, order.order_id,
+                                 exchange_ts=exchange_ts, sequence=sequence)
         if order.remaining <= 1e-12:
             if order.side == BUY:
                 self._active_bid = None
@@ -314,7 +429,8 @@ class PaperMatchingEngine:
         return fill
 
     def _record_fill(self, side: str, price: float, quantity: float,
-                     is_maker: bool, order_id: int) -> PaperFill:
+                     is_maker: bool, order_id: int, *,
+                     exchange_ts: int = 0, sequence: int = 0) -> PaperFill:
         fee_rate = self._maker_fee if is_maker else self._taker_fee
         notional = price * quantity
         fee = notional * fee_rate  # negative => rebate received
@@ -339,20 +455,29 @@ class PaperMatchingEngine:
         realized_delta -= fee
 
         new_inventory = existing + signed_qty
-        if existing == 0.0 or (existing > 0.0) == (signed_qty > 0.0):
+        if existing == 0.0:
+            self._avg_entry_price = price
+        elif (existing > 0.0) == (signed_qty > 0.0):
+            # Adding to the position: volume-weighted average entry.
             total = abs(existing) + quantity
             self._avg_entry_price = (
                 (abs(existing) * self._avg_entry_price + quantity * price) / total
                 if total > 0.0 else 0.0
             )
-        elif new_inventory == 0.0:
+        elif abs(new_inventory) <= 1e-12:
+            # Flat: no residual cost basis.
             self._avg_entry_price = 0.0
-        else:
+        elif (new_inventory > 0.0) != (existing > 0.0):
+            # Flipped through zero: the residual was opened at this price.
             self._avg_entry_price = price
+        # else: partial reduction only - the remainder keeps its original basis.
 
         self._inventory = new_inventory
         self._realized_pnl += realized_delta
 
+        # Prefer the exchange event time (epoch milliseconds) so the trade log
+        # aligns with the market data; fall back to wall-clock seconds.
+        timestamp = (exchange_ts / 1000.0) if exchange_ts > 0 else time.time()
         fill = PaperFill(
             order_id=order_id,
             side=side,
@@ -360,10 +485,27 @@ class PaperMatchingEngine:
             quantity=quantity,
             fee=fee,
             is_maker=is_maker,
-            timestamp=time.monotonic(),
+            timestamp=timestamp,
             realized_pnl=realized_delta,
+            exchange_ts=exchange_ts,
+            sequence=sequence,
         )
         self._fills.append(fill)
+        self._trades_history.append({
+            "timestamp": timestamp,
+            "exchange_ts": exchange_ts,
+            "sequence": sequence,
+            "side": side,
+            "price": price,
+            "size": quantity,
+            "quantity": quantity,
+            "order_id": order_id,
+            "is_maker": is_maker,
+            "fee": fee,
+            "realized_pnl": realized_delta,
+            "inventory": self._inventory,
+            "cash": self._cash,
+        })
         return fill
 
     # ------------------------------------------------------------ accessors
@@ -400,6 +542,21 @@ class PaperMatchingEngine:
         return list(self._equity_curve)
 
     @property
+    def trades_history(self) -> List[Dict[str, Any]]:
+        """Chronological execution log: ``timestamp``, ``side``, ``price``, ``size``."""
+        return list(self._trades_history)
+
+    @property
+    def self_trade_prevented(self) -> int:
+        """Count of quotes refused/retired by self-trade prevention."""
+        return self._self_trade_prevented
+
+    @property
+    def last_market_ts(self) -> int:
+        """Exchange timestamp (epoch ms) of the tick that last drove matching."""
+        return self._last_market_ts
+
+    @property
     def active_bid(self) -> Optional[PaperOrder]:
         return self._active_bid
 
@@ -423,7 +580,9 @@ class PaperMatchingEngine:
             "win_rate": (wins / len(trades)) if trades else 0.0,
             "sharpe": sharpe_ratio(returns),
             "max_drawdown": max_drawdown(curve),
+            "max_drawdown_abs": self._absolute_drawdown(curve),
             "total_fees": sum(fill.fee for fill in trades),
+            "self_trade_prevented": self._self_trade_prevented,
         }
 
     @staticmethod
@@ -433,6 +592,20 @@ class PaperMatchingEngine:
             if curve[index - 1] > 0.0:
                 out.append((curve[index] - curve[index - 1]) / curve[index - 1])
         return out
+
+    @staticmethod
+    def _absolute_drawdown(curve: List[float]) -> float:
+        """Peak-to-trough decline in currency units.
+
+        The percentage variant divides by the running peak, which explodes when
+        equity starts at zero (``--initial-cash 0``); this figure stays readable.
+        """
+        peak = float("-inf")
+        worst = 0.0
+        for value in curve:
+            peak = max(peak, value)
+            worst = max(worst, peak - value)
+        return worst
 
 
 class MarketDataFeed:
@@ -510,8 +683,10 @@ class MarketDataFeed:
                         stripped = line.strip()
                         if stripped:
                             await self._handle_message(stripped)
-                        if self._replay_delay > 0.0:
-                            await asyncio.sleep(self._replay_delay)
+                        # Always yield: `sleep(0)` keeps the loop cooperative when
+                        # replaying with zero delay, otherwise the duration timer
+                        # and dashboard tasks are starved forever.
+                        await asyncio.sleep(max(0.0, self._replay_delay))
             except OSError as exc:
                 logger.error("cannot read feed file %s: %s", path, exc)
                 return
@@ -525,8 +700,8 @@ class MarketDataFeed:
             if self._stopped:
                 break
             await self._handle_message(message)
-            if self._replay_delay > 0.0:
-                await asyncio.sleep(self._replay_delay)
+            # Always yield so the event loop can run the duration timer.
+            await asyncio.sleep(max(0.0, self._replay_delay))
 
     async def _fallback_or_mock(self) -> None:
         fallback = self._fallback or self._default_fallback()

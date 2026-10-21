@@ -29,7 +29,8 @@ used at the orchestration/analytics boundary.
 - **Avellaneda-Stoikov market maker** with reservation-price inventory skew,
   optimal spread and market-specific adapters (crypto/stock/commodities).
 - **Local paper-trading simulator** with an asynchronous market-data feed
-  (WebSocket / NDJSON), a maker matching engine, configurable fees/rebates and
+  (WebSocket / NDJSON), a taker-cross maker matching engine with self-trade
+  prevention, a `trades_history` execution log, configurable fees/rebates and
   mark-to-market PnL.
 - **Parameter optimizer** (grid search over `gamma`, `sigma`, `k`,
   `time_horizon`) scoring Sharpe, Sortino, drawdown and net PnL.
@@ -143,6 +144,10 @@ print(ack.accepted(), engine.position().net_quantity)
   that are not on the grid are rejected by the book.
 - `engine.stale_after_ns`: threshold used by `TradingEngine.is_stale()`.
 - `engine.risk.*`: pre-trade limits applied by `RiskGuard`.
+- `engine.pretrade.*`: `RiskManager` order-flow guards (size, position,
+  fat-finger band, token-bucket rate limit); disabled by default.
+- `kill_switch.*`: `KillSwitch` emergency halt (automatic drawdown / reject
+  streaks plus a manual `trip()`); the guards are off when a limit is `0`.
 - `strategy.*`: quote width, size, inventory cap and skew.
 - `backtest.*`: replay limits and fill recording.
 
@@ -205,7 +210,8 @@ python3 scripts/run_paper_trading.py --duration 60
 
 Useful flags: `--duration`, `--interval` (dashboard cadence), `--gamma`,
 `--sigma`, `--k`, `--order-quantity`, `--inventory-limit`, `--maker-fee-bps`
-(default `-1` = 0.01% rebate), `--taker-fee-bps` (default `5` = 0.05%).
+(default `-1` = 0.01% rebate), `--taker-fee-bps` (default `5` = 0.05%),
+`--self-trade-prevention` and `--trades-out` (see below).
 Press `Ctrl-C` to stop cleanly: the loop cancels open orders and prints a
 summary (total trades, win rate, Sharpe approximation, final PnL, max
 drawdown).
@@ -213,6 +219,43 @@ drawdown).
 The WebSocket source is `wss://stream.binance.com:9443/ws/btcusdt@depth20@100ms`;
 if the `websockets` package is missing or the connection drops, the feed falls
 back to `data/sample_events.ndjson` (looped) so the simulation keeps running.
+
+### Matching semantics (taker cross)
+
+Resting maker quotes fill when external market liquidity trades through them
+on a depth tick:
+
+| Resting quote | Fill condition | Fill side |
+| --- | --- | --- |
+| Bid at `bid_price` | `market_best_ask <= bid_price` | `BUY` |
+| Ask at `ask_price` | `market_best_bid >= ask_price` | `SELL` |
+
+Fill size is capped by the visible quantity at the touch, so a thin book
+produces a partial fill instead of inventing liquidity. Each execution updates
+inventory, cash (including maker rebates / taker fees), the volume-weighted
+cost basis and realised PnL, then appends a row to
+`PaperMatchingEngine.trades_history`:
+
+```python
+engine.trades_history[-1]
+# {'timestamp': 1700000000.5, 'exchange_ts': 1700000000500, 'sequence': 42,
+#  'side': 'BUY', 'price': 29999.5, 'size': 0.05, 'quantity': 0.05,
+#  'order_id': 7, 'is_maker': True, 'fee': -0.0015, 'realized_pnl': 0.0015,
+#  'inventory': 0.05, 'cash': -1499.9985}
+```
+
+`timestamp` is the exchange event time in seconds, taken from the depth tick
+that crossed the quote, and falls back to wall-clock time when the feed carries
+no timestamp. `size` mirrors `quantity` for reporting convenience. The property
+returns a defensive copy, and `--trades-out trades.json` writes the full log to
+disk.
+
+**Self-trade prevention.** A post-only quote that would cross the bot's own
+resting opposite quote never rests. `--self-trade-prevention` selects
+`cancel_resting` (default: retire the stale quote), `reject` (refuse the new
+quote with reason `SELF_TRADE_PREVENTED`) or `none`. This stops a single tick
+from printing a fictitious round trip against ourselves, and the count is
+reported as `Self-Match Stop` in the summary.
 
 ### Latency benchmark
 
@@ -303,6 +346,99 @@ The Python strategy mirrors these limits (reads `engine.risk_limits()`) and
 scales down or pauses quoting before submission; the C++ guard remains
 authoritative.
 
+## RiskManager order-flow guards
+
+`RiskManager` sits in front of matching and catches the failure modes
+`RiskGuard` is price-oriented about but cannot express: bursts of orders,
+runaway sizes, and fat-finger quotes far from the mid. It is cache-line
+aligned, uses relaxed atomics for live tuning and a lock-free token bucket
+(ahead-of-time "TAT" accounting, no mutex, no syscall).
+
+| Guard | Config key | Rejection |
+| --- | --- | --- |
+| non-finite / non-positive price or quantity | — | `REJECTED_INVALID_ORDER` |
+| per-order base quantity | `max_order_size` | `REJECTED_MAX_ORDER_SIZE` |
+| resulting net position | `max_position` | `REJECTED_POSITION_LIMIT` |
+| distance from BBO mid | `max_price_deviation_pct` | `REJECTED_FAT_FINGER` |
+| orders per second / burst | `order_rate_limit`, `order_burst` | `REJECTED_RATE_LIMIT` |
+
+Checks run in that order and the rate limiter is evaluated last, so a token is
+only consumed by an order that would otherwise be accepted — rejected orders
+never eat rate budget. A non-usable mid (empty book) fails **closed**, and
+`max_price_deviation_pct = 0` disables the band.
+
+```python
+from python_analytics.native import hft_native
+
+config = hft_native.RiskManagerConfig()
+config.max_position = 5.0        # base units, signed net
+config.max_order_size = 0.5
+config.max_price_deviation_pct = 0.005   # 50 bps
+config.order_rate_limit = 25.0
+config.order_burst = 10.0
+risk = hft_native.RiskManager(config)
+
+status = risk.validate_order("BTCUSDT", 30_000.0, 0.4, hft_native.Side.BUY, 0.0, 30_001.0)
+hft_native.risk_status_name(status)      # 'APPROVED'
+stats = risk.stats()                     # evaluated / approved / rejected / by_status
+```
+
+`hft_native.is_approved(status)` classifies any status, `engine.risk_stats()`
+exposes the same snapshot from `TradingEngine`, and `risk.validate_order_at(now_ns, ...)`
+takes an explicit timestamp so replay and tests are deterministic. Enable the
+gate through `engine.risk_manager` (native) or `risk_manager=...` on
+`PaperMatchingEngine`; `config.engine.pretrade` feeds both, and is off by
+default so replays stay byte-identical.
+
+The native default (`RiskManagerConfig{}`) is fully armed, so a standalone
+`hft_native.RiskManager()` rejects oversized orders out of the box; use
+`hft_native.RiskManagerConfig.disabled()` for a pass-through gate.
+
+## Emergency kill switch
+
+`KillSwitch` is the halt button: one acquire load of an 8-bit atomic decides
+whether an order may leave the process, so the check costs nothing measurable
+on the hot path. State moves `NORMAL -> TRIGGERED -> RECOVERING -> NORMAL`;
+both non-normal states block orders, so a half-flattened book never re-quotes.
+
+| Trigger | API | Config |
+| --- | --- | --- |
+| operator halt | `trip(reason)` | — (always wins, even when disabled) |
+| drawdown breach | `check_drawdown(x)` | `max_drawdown_limit` |
+| reject streak | `record_order_rejected()` / `record_order_accepted()` | `max_consecutive_rejects` |
+| clear the halt | `reset()` | — |
+
+`trip()` allocates nothing (the reason is copied into a fixed 192-byte buffer)
+and is a single atomic RMW, so concurrent trips from a control thread and a
+strategy thread cannot tear the state. It then runs the registered hooks in
+`cancel_all -> flatten -> log` order; hook exceptions are swallowed so a broken
+remediation callback can never undo the halt.
+
+```python
+from python_analytics.native import hft_native
+from python_analytics.native.factory import build_kill_switch
+from python_analytics.utils import load_settings
+
+switch = build_kill_switch(load_settings())   # armed from kill_switch.* in YAML
+switch.set_cancel_all_hook(lambda: print("cancel all"))
+switch.set_flatten_hook(lambda: print("flatten"))
+switch.set_trip_hook(lambda state, reason: print(f"{state}: {reason}"))
+
+switch.check_order_allowed()                  # True
+switch.trip("ops: FTX headline")
+switch.get_state()                            # SystemState.TRIGGERED
+switch.check_order_allowed()                  # False
+stats = switch.get_stats()                    # trip_count / reason / timestamp / blocked_orders
+switch.begin_recovery()                       # still blocking, cancels in flight
+switch.reset()                                # NORMAL, order flow resumes
+```
+
+`max_drawdown_limit` is an absolute drawdown in quote currency and both
+automatic guards are inert when their limit is `0`; `kill_switch.enabled`
+disables only that automation. A manual `trip()` always stops trading.
+`KillSwitch` is standalone today — attach it to `PaperMatchingEngine` (or a
+live order router) through the cancel/flatten hooks.
+
 ## Troubleshooting
 
 - **`ModuleNotFoundError: No module named 'python_analytics'`** — run scripts
@@ -313,6 +449,15 @@ authoritative.
   interpreter matches the `.so` tag (e.g. `cpython-39-darwin.so` needs 3.9).
 - **Empty book / no fills in `--source mock`** — the ladder is centered on
   `settings.engine.center`; pass `--center` matching your asset's price range.
+- **`Total Trades: 0`** — matching only fires when the market trades through a
+  resting quote, so a feed whose price never moves cannot fill anything. Use
+  `--source mock`, or an NDJSON file with a moving price (the bundled
+  `data/sample_events.ndjson` contains 800 moving ticks). Check that the feed
+  is actually advancing: `--offline --duration 5` should report thousands of
+  trades with the default centre of 30000.
+- **`SELF_TRADE_PREVENTED` ack reason** — the new quote would have crossed our
+  own resting opposite quote. Use `--self-trade-prevention cancel_resting`
+  (default) or cancel both sides before re-quoting, as the strategies do.
 - **No WebSocket data** — install `websockets` (`pip install websockets`) or run
   `--offline` / `--source mock`; a missing client falls back to NDJSON.
 - **`--offline` shows an empty book** — confirm `data/sample_events.ndjson`
@@ -335,6 +480,14 @@ authoritative.
   Convert at configuration/display boundaries only.
 - **Risk before matching.** Every order passes through `RiskGuard` and the
   order manager before any fill is simulated.
+- **Portfolio identity.** `equity == initial_cash + realized + unrealized` holds
+  after every tick: a fill updates cash, inventory and the cost basis together,
+  and a partial reduction keeps the remaining position's basis (only a flip
+  through zero resets it).
+- **Taker cross, never self-match.** Resting quotes fill only against external
+  top-of-book liquidity, and self-trade prevention keeps a crossed pair of our
+  own quotes from ever resting, so the simulator cannot print PnL against
+  itself.
 
 ## Limitations
 
@@ -344,7 +497,9 @@ authoritative.
 - The C++ `TradingEngine` only simulates market/taker orders at the touch; it
   does not match resting maker quotes. The Python `PaperMatchingEngine`
   provides maker matching, fees/rebates and mark-to-market PnL for paper
-  trading and backtesting.
+  trading and backtesting: a resting quote fills when the opposite side of the
+  touch crosses it, capped by the visible size at that price (partial fills),
+  with the execution logged to `trades_history`.
 - Fees are modelled only in `PaperMatchingEngine` (configurable maker rebate /
   taker fee). The native `Fill.fee` remains zero because the C++ engine does
   not model fees.
