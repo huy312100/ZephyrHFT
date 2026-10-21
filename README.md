@@ -36,6 +36,10 @@ used at the orchestration/analytics boundary.
   `time_horizon`) scoring Sharpe, Sortino, drawdown and net PnL.
 - **Latency benchmark** (`scripts/run_benchmark.py`) measuring tick-to-quote
   microseconds through the C++ `RiskGuard`.
+- **Real-time L2 capture** (`scripts/ingest_l2.py`): asyncio WebSocket client
+  that stamps every frame with `time.time_ns()`, reports venue-to-host latency
+  percentiles and archives the raw payloads as gzip NDJSON roll files with
+  backoff reconnection and graceful shutdown.
 
 ## Repository layout
 
@@ -55,9 +59,11 @@ used at the orchestration/analytics boundary.
 │   └── utils/              # YAML config and logging
 ├── scripts/
 │   ├── run_paper_trading.py  # 60s live/mock paper-trading dashboard
+│   ├── ingest_l2.py          # real-time L2 capture -> gzip NDJSON roll files
 │   └── run_benchmark.py      # tick-to-quote latency benchmark
-├── config/settings.yaml    # engine, risk and strategy settings
+├── config/settings.yaml    # engine, risk, strategy and ingestion settings
 ├── data/sample_events.ndjson
+├── data/raw_l2/            # capture output (created on demand, git-ignored)
 ├── tests/python/           # pytest integration tests
 └── main.py                 # demo / replay CLI
 ```
@@ -148,6 +154,9 @@ print(ack.accepted(), engine.position().net_quantity)
   fat-finger band, token-bucket rate limit); disabled by default.
 - `kill_switch.*`: `KillSwitch` emergency halt (automatic drawdown / reject
   streaks plus a manual `trip()`); the guards are off when a limit is `0`.
+- `data_ingestion.*`: real-time L2 capture (`exchange`, `symbol`,
+  `stream_type`, `storage_path`, `compression`, roll-file rotation, telemetry
+  cadence and reconnect backoff) used by `scripts/ingest_l2.py`.
 - `strategy.*`: quote width, size, inventory cap and skew.
 - `backtest.*`: replay limits and fill recording.
 
@@ -188,6 +197,91 @@ python3 -m cmake --build build --target test
 The wheel also ships `ctest` under its `cmake/data/bin` directory; add that
 directory to `PATH` if you prefer invoking `ctest` directly, or run
 `./build/tests/hft_tests` as shown above.
+
+## Real-time L2 ingestion (Phase 1)
+
+`scripts/ingest_l2.py` is the capture front end: it subscribes to an exchange
+depth stream over WebSocket and writes the raw frames to gzip-compressed NDJSON
+roll files that later stages (feature building, replay, backtests) consume.
+
+```bash
+# Capture for 30 s into data/raw_l2 using config/settings.yaml
+python3 scripts/ingest_l2.py --duration 30
+
+# Measure latency only, write nothing
+python3 scripts/ingest_l2.py --dry-run --duration 10
+
+# Push the offline sample through the exact capture path (no network)
+python3 scripts/ingest_l2.py --replay data/sample_events.ndjson --output-dir /tmp/raw_l2
+```
+
+Useful flags: `--symbol`, `--stream` (`depth@100ms`, `depth@500ms`,
+`depth20@100ms`), `--url` (endpoint override), `--output-dir`, `--compression`
+(`gzip`/`none`), `--max-file-mb`, `--rotate-seconds`, `--flush-interval-ms`,
+`--telemetry-interval`, `--latency-warn-ms`, `--duration` and `--log-level`.
+`--dry-run` skips storage; `--replay` feeds an existing NDJSON archive through
+the same code path instead of the socket.
+
+### What a run does
+
+| Stage | Behaviour |
+| --- | --- |
+| Connect | `wss://fstream.binance.com/ws/<symbol>@<stream_type>`; the endpoint comes from `data_ingestion.exchange` (see `EXCHANGE_ENDPOINTS`) or `ws_base_url` |
+| Timestamp | `time.time_ns()` the moment the frame leaves the socket |
+| Latency | `recv_ns - E*1_000_000` (falls back to `T`); p50/p95/p99/max per interval + breach counter |
+| Archive | one `bytearray` append per frame; gzip and disk writes happen on a worker thread |
+| Rotate | at `max_file_mb` or `rotate_seconds`, whichever comes first |
+| Reconnect | capped exponential backoff with jitter, reset after a healthy session |
+| Shutdown | `SIGINT`/`SIGTERM` close the socket, drain the buffer and write the gzip trailer |
+
+### Output layout
+
+```text
+data/raw_l2/
+└── binance_futures_btcusdt_depth_100ms_20261021T171011Z_00001.ndjson.gz
+```
+
+The name carries exchange, symbol, stream, UTC start time and a sequence number,
+so roll files sort chronologically and never collide. Every frame the venue
+sends is written verbatim (one JSON object per line), including frames without
+an event timestamp — those are counted as `no_timestamp` so a hole in the
+capture is always attributable.
+
+```python
+import gzip, json
+
+with gzip.open("data/raw_l2/binance_futures_btcusdt_depth_100ms_..._00001.ndjson.gz",
+               "rt", encoding="utf-8") as handle:
+    for line in handle:
+        update = json.loads(line)  # {"e": "depthUpdate", "E": 1700000000000, ...}
+```
+
+### Telemetry
+
+One INFO line per `data_ingestion.telemetry_interval_s` (plus a `FINAL` line at
+exit and a summary table):
+
+```text
+telemetry frames=812 rate=9.9/s lat_ms(p50=12.31 p95=18.04 p99=41.22 max=41.22) lat_breaches=0 files=1 rec=800 buf=12 out=0.02MiB ratio=0.12
+```
+
+`lat_ms` is the rolling window; `lat_breaches` counts samples above
+`latency_warn_ms` (also logged as a `WARNING`, at most once per second).
+`clock_skew` counts negative latencies, i.e. the venue clock ahead of ours —
+worth checking `ntpd`/`chronyd` when it is non-zero.
+
+### Guarantees and limits
+
+- The receive loop performs **no I/O**: a slow disk grows the in-memory buffer
+  (a `WARNING` at 64 MiB) but never drops a frame.
+- A hard crash can lose at most one `flush_interval_ms` window; a clean shutdown
+  always leaves a readable gzip archive.
+- A roll file being written has no gzip trailer yet, so it only reads cleanly
+  after rotation or shutdown (`zcat` reports "unexpected end of file" before
+  that, which is expected).
+- Latency is only as accurate as the host clock: sync with NTP/PTP before
+  drawing conclusions about the venue.
+- One symbol/stream per process — run one process per subscription.
 
 ## Local Paper Trading & Simulation Guide
 
@@ -460,6 +554,17 @@ live order router) through the cancel/flatten hooks.
   (default) or cancel both sides before re-quoting, as the strategies do.
 - **No WebSocket data** — install `websockets` (`pip install websockets`) or run
   `--offline` / `--source mock`; a missing client falls back to NDJSON.
+- **`ingest_l2.py` exits with "the 'websockets' package is required"** — the
+  capture client has no offline fallback by design: install the dependency, or
+  use `--replay <archive>` to exercise the pipeline without a socket.
+- **`zcat`/`gzip` reports "unexpected end of file" on a roll file** — the file is
+  still open; gzip archives only become complete when the writer rotates them
+  (`max_file_mb`/`rotate_seconds`) or the process shuts down cleanly.
+- **`ingest_l2.py` writes nothing** — check `--dry-run`, and that
+  `data_ingestion.enabled` is `true`; `--output-dir` overrides `storage_path`.
+- **Latency looks negative** — the venue clock is ahead of the host clock
+  (`clock_skew` counter in telemetry); sync with NTP/PTP before trusting
+  latency numbers.
 - **`--offline` shows an empty book** — confirm `data/sample_events.ndjson`
   exists and its prices are within ±4096 ticks of the configured center.
 - **Order/position rejections** — inspect the `RejectReason` on the ack
@@ -488,6 +593,9 @@ live order router) through the cancel/flatten hooks.
   top-of-book liquidity, and self-trade prevention keeps a crossed pair of our
   own quotes from ever resting, so the simulator cannot print PnL against
   itself.
+- **Capture stays off the receive path.** `ingest_l2.py` appends each frame to an
+  in-memory buffer and compresses/writes it on a worker thread, so gzip and disk
+  I/O never add jitter to the timestamps used for latency measurement.
 
 ## Limitations
 
@@ -507,6 +615,9 @@ live order router) through the cancel/flatten hooks.
   `first_update_id`/`final_update_id` are parsed for diagnostics, but the
   operator must reconnect or resynchronise after a gap.
 - There is no persistence, account reconciliation or exchange order gateway.
+- L2 capture is **raw**: `ingest_l2.py` archives exchange payloads but does not
+  normalise them into `L2Book` updates or repair sequence gaps, there is no
+  snapshot bootstrap, and one process handles one symbol/stream.
 - The included market maker is an educational example, not a profitable or
   production-ready strategy.
 

@@ -30,6 +30,27 @@ kill_switch:
   max_drawdown_limit: "25000"     # quote currency; 0 disables the drawdown guard
   max_consecutive_rejects: 10     # trip after N rejects in a row; 0 disables
 
+# Phase 1 real-time L2 ingestion (`scripts/ingest_l2.py`).
+# Subscribes to an exchange depth stream and persists the raw frames as
+# gzip-compressed NDJSON roll files under `storage_path` (created on demand).
+data_ingestion:
+  enabled: true
+  exchange: binance_futures        # keys of EXCHANGE_ENDPOINTS in utils/config.py
+  symbol: btcusdt                  # lowercase, as required by the stream name
+  stream_type: depth@100ms         # e.g. depth@100ms, depth@500ms, depth20@100ms
+  storage_path: data/raw_l2        # relative to the repository root
+  compression: gzip                # gzip | none
+  compression_level: 1             # 1 = fastest (ingest path), 9 = smallest
+  flush_interval_ms: 250           # max time a record waits in the write buffer
+  max_file_mb: 256                 # rotate the roll file at this size (0 = never)
+  rotate_seconds: 900              # ... or after this many seconds (0 = never)
+  telemetry_interval_s: 10.0       # latency / throughput summary cadence
+  latency_warn_ms: 250.0           # WARNING when feed latency exceeds this
+  reconnect_base_delay_s: 0.5      # exponential backoff: 0.5, 1, 2, 4 ... capped
+  reconnect_max_delay_s: 30.0
+  max_reconnect_attempts: 0        # 0 = retry forever
+  ws_base_url: ""                  # optional override of the exchange endpoint
+
 strategy:
   name: inventory_market_maker
   half_spread_ticks: 2

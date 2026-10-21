@@ -2,6 +2,7 @@
 from .config import (
     AppSettings,
     BacktestSettings,
+    DataIngestionSettings,
     EngineSettings,
     KillSwitchSettings,
     RiskSettings,
@@ -13,6 +14,7 @@ from .logging import configure_logging
 __all__ = [
     "AppSettings",
     "BacktestSettings",
+    "DataIngestionSettings",
     "EngineSettings",
     "KillSwitchSettings",
     "RiskSettings",
