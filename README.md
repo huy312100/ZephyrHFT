@@ -204,6 +204,9 @@ directory to `PATH` if you prefer invoking `ctest` directly, or run
 depth stream over WebSocket and writes the raw frames to gzip-compressed NDJSON
 roll files that later stages (feature building, replay, backtests) consume.
 
+> Full architecture, data schema, capacity numbers and the Phase 2 handoff:
+> [`docs/phase1_roadmap.md`](docs/phase1_roadmap.md).
+
 ```bash
 # Capture for 30 s into data/raw_l2 using config/settings.yaml
 python3 scripts/ingest_l2.py --duration 30
