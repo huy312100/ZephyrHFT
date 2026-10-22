@@ -13,9 +13,13 @@
 #include <vector>
 
 #include "engine.hpp"
+#include "ingest.hpp"
 #include "latency_histogram.hpp"
+#include "matching.hpp"
 #include "order_manager.hpp"
 #include "orderbook.hpp"
+#include "paper_account.hpp"
+#include "paper_engine.hpp"
 #include "ring_buffer.hpp"
 #include "risk/kill_switch.hpp"
 #include "risk_guard.hpp"
@@ -1226,6 +1230,118 @@ void test_kill_switch_hooks_and_threads() {
     CHECK(concurrent.check_order_allowed());
 }
 
+void test_paper_account() {
+    hft::paper_account account;
+    account.reset(N("100000"), -10, 0);
+    (void)account.apply_fill(P("30000"), Q("2"), hft::Side::Buy, false);
+    CHECK(account.cash() == N("40000"));
+    CHECK(account.net_quantity() == Q("2"));
+    CHECK(account.average_entry_price() == P("30000"));
+    (void)account.apply_fill(P("30100"), Q("1"), hft::Side::Sell, false);
+    CHECK(account.cash() == N("70100"));
+    CHECK(account.realized_pnl() == N("100"));
+    CHECK(account.net_quantity() == Q("1"));
+    (void)account.apply_fill(P("30050"), Q("1"), hft::Side::Sell, true);
+    CHECK(account.cash() == N("100180.05"));
+    CHECK(account.fees_paid() == N("-30.05"));
+    CHECK(account.realized_pnl() == N("180.05"));
+    CHECK(account.net_quantity() == Q("0"));
+    CHECK(account.average_entry_price() == P("0"));
+    CHECK(account.fill_count() == 3);
+    CHECK(account.maker_fills() == 1);
+    CHECK(account.taker_fills() == 2);
+    CHECK(account.equity() == N("100180.05"));
+}
+
+void test_matching_slippage() {
+    hft::L2Book book{P("0.5"), P("30000")};
+    CHECK(book.apply_level(hft::Side::Sell, P("30000.5"), Q("2"), 1));
+    CHECK(book.apply_level(hft::Side::Sell, P("30001.0"), Q("3"), 1));
+    CHECK(book.apply_level(hft::Side::Sell, P("30001.5"), Q("10"), 1));
+    CHECK(book.apply_level(hft::Side::Buy, P("30000.0"), Q("5"), 1));
+    const hft::match_result match = hft::match_taker(book, hft::Side::Buy, Q("4"));
+    CHECK(match.filled == Q("4"));
+    CHECK(match.remaining == Q("0"));
+    CHECK(match.leg_count == 2);
+    CHECK(match.touch_price == P("30000.5"));
+    CHECK(match.average_price == P("30000.75"));
+    CHECK(match.slippage == N("1"));
+}
+
+void test_paper_engine_taker() {
+    hft::paper_engine engine{P("0.5"), P("30000"), 0, 5, N("100000")};
+    hft::DepthUpdate depth;
+    depth.exchange_ts = 1000;
+    depth.bids[0] = {P("30000.0"), Q("10")};
+    depth.asks[0] = {P("30000.5"), Q("2")};
+    depth.asks[1] = {P("30001.0"), Q("3")};
+    depth.bid_count = 1;
+    depth.ask_count = 2;
+    depth.first_update_id = 1;
+    depth.final_update_id = 2;
+    engine.process_update(depth);
+    CHECK(engine.bbo().is_valid());
+
+    hft::OrderRequest request;
+    request.side = hft::Side::Buy;
+    request.type = hft::OrderType::Market;
+    request.quantity = Q("4");
+    const hft::paper_ack ack = engine.submit(request);
+    CHECK(ack.accepted());
+    CHECK(ack.filled == Q("4"));
+    CHECK(ack.average_price == P("30000.75"));
+    CHECK(ack.slippage == N("1"));
+    CHECK(engine.account().net_quantity() == Q("4"));
+    CHECK(engine.account().average_entry_price() == P("30000.75"));
+    CHECK(engine.account().cash() == N("-20063.0015"));
+    CHECK(engine.metrics().fills == 2);
+    CHECK(engine.metrics().slippage_total == N("1"));
+
+    hft::Fill fill;
+    CHECK(engine.drain_fill(fill));
+    CHECK(fill.price == P("30000.5"));
+    CHECK(fill.quantity == Q("2"));
+    CHECK(fill.is_maker == 0);
+    CHECK(engine.drain_fill(fill));
+    CHECK(fill.price == P("30001.0"));
+    CHECK(fill.quantity == Q("2"));
+    CHECK(!engine.drain_fill(fill));
+}
+
+void test_paper_engine_gap_detection() {
+    hft::paper_engine engine{P("0.5"), P("30000")};
+    hft::DepthUpdate first;
+    first.exchange_ts = 1;
+    first.bids[0] = {P("30000"), Q("1")};
+    first.asks[0] = {P("30001"), Q("1")};
+    first.bid_count = 1;
+    first.ask_count = 1;
+    first.final_update_id = 10;
+    engine.process_update(first);
+    CHECK(engine.metrics().gap_events == 0);
+
+    hft::DepthUpdate second = first;
+    second.final_update_id = 11;
+    second.prev_final_update_id = 9;
+    engine.process_update(second);
+    CHECK(engine.metrics().gap_events == 1);
+}
+
+void test_ingest_lines() {
+    hft::paper_engine engine{P("0.5"), P("30000")};
+    std::vector<std::string> lines;
+    lines.push_back(
+        R"({"e":"depthUpdate","E":1000,"U":1,"u":2,"pu":0,"b":[["30000.00","1"]],"a":[["30001.00","1"]]})");
+    lines.push_back(
+        R"({"e":"depthUpdate","E":1100,"U":3,"u":4,"pu":2,"b":[["30000.00","2"]],"a":[["30001.00","1"]]})");
+    lines.push_back("not json");
+    const hft::ingest_stats stats = hft::ingest_lines(engine, lines);
+    CHECK(stats.lines == 3);
+    CHECK(stats.depth_events == 2);
+    CHECK(stats.malformed == 1);
+    CHECK(stats.gaps == 0);
+}
+
 }  // namespace
 
 int main() {
@@ -1254,6 +1370,11 @@ int main() {
     test_kill_switch_basic();
     test_kill_switch_guards();
     test_kill_switch_hooks_and_threads();
+    test_paper_account();
+    test_matching_slippage();
+    test_paper_engine_taker();
+    test_paper_engine_gap_detection();
+    test_ingest_lines();
     if (g_failures != 0) {
         std::fprintf(stderr, "%d test assertion(s) failed\n", g_failures);
         return 1;

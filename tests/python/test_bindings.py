@@ -31,7 +31,7 @@ TRADE_JSON = (
 
 
 def test_fixed_point_and_buffers() -> None:
-    assert hft_native.__version__ == "0.1.0"
+    assert hft_native.__version__ == "0.2.0"
     price = hft_native.Price.from_string("29999.50")
     assert price is not None and str(price) == "29999.50000000"
     assert hft_native.ring_buffer_smoke(20_000)

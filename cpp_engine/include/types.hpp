@@ -396,6 +396,7 @@ struct DepthUpdate {
     Nanos recv_ts{0};
     std::uint64_t first_update_id{0};
     std::uint64_t final_update_id{0};
+    std::uint64_t prev_final_update_id{0};
     std::array<LevelDelta, kMaxDepthLevels> bids{};
     std::array<LevelDelta, kMaxDepthLevels> asks{};
     std::uint32_t bid_count{0};

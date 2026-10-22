@@ -12,7 +12,11 @@
 #include <vector>
 
 #include "engine.hpp"
+#include "ingest.hpp"
+#include "matching.hpp"
 #include "orderbook.hpp"
+#include "paper_account.hpp"
+#include "paper_engine.hpp"
 #include "ring_buffer.hpp"
 #include "risk/kill_switch.hpp"
 #include "risk_manager.hpp"
@@ -98,7 +102,7 @@ std::vector<std::pair<std::string, std::string>> level_pairs(
 }  // namespace
 
 PYBIND11_MODULE(hft_native, m) {
-    m.doc() = "Zero-allocation C++20 core for the hybrid crypto HFT stack";
+    m.doc() = "Zero-allocation C++23 core for the hybrid crypto HFT stack";
 
     py::enum_<Side>(m, "Side").value("BUY", Side::Buy).value("SELL", Side::Sell);
     py::enum_<OrderType>(m, "OrderType")
@@ -210,11 +214,13 @@ PYBIND11_MODULE(hft_native, m) {
         .def(py::init([](const std::vector<std::pair<std::string, std::string>>& bids,
                          const std::vector<std::pair<std::string, std::string>>& asks,
                          std::uint64_t exchange_ts, std::uint64_t first_update_id,
-                         std::uint64_t final_update_id) {
+                         std::uint64_t final_update_id,
+                         std::uint64_t prev_final_update_id) {
                  DepthUpdate update;
                  update.exchange_ts = exchange_ts;
                  update.first_update_id = first_update_id;
                  update.final_update_id = final_update_id;
+                 update.prev_final_update_id = prev_final_update_id;
                  update.bid_count = fill_levels(bids, update.bids.data());
                  update.ask_count = fill_levels(asks, update.asks.data());
                  return update;
@@ -222,7 +228,7 @@ PYBIND11_MODULE(hft_native, m) {
              py::arg("bids") = std::vector<std::pair<std::string, std::string>>{},
              py::arg("asks") = std::vector<std::pair<std::string, std::string>>{},
              py::arg("exchange_ts") = 0, py::arg("first_update_id") = 0,
-             py::arg("final_update_id") = 0)
+             py::arg("final_update_id") = 0, py::arg("prev_final_update_id") = 0)
         .def_property_readonly("bids", [](const DepthUpdate& update) {
             return level_pairs(update.bids, update.bid_count);
         })
@@ -232,7 +238,8 @@ PYBIND11_MODULE(hft_native, m) {
         .def_readwrite("exchange_ts", &DepthUpdate::exchange_ts)
         .def_readwrite("recv_ts", &DepthUpdate::recv_ts)
         .def_readwrite("first_update_id", &DepthUpdate::first_update_id)
-        .def_readwrite("final_update_id", &DepthUpdate::final_update_id);
+        .def_readwrite("final_update_id", &DepthUpdate::final_update_id)
+        .def_readwrite("prev_final_update_id", &DepthUpdate::prev_final_update_id);
 
     py::class_<OrderRequest>(m, "OrderRequest")
         .def(py::init<>())
@@ -659,7 +666,133 @@ PYBIND11_MODULE(hft_native, m) {
                               sizeof(DepthUpdate), sizeof(L2Book), sizeof(L3Book));
     });
 
-    m.attr("__version__") = "0.1.0";
+    py::class_<paper_account_snapshot>(m, "PaperAccountSnapshot")
+        .def(py::init<>())
+        .def_readonly("cash", &paper_account_snapshot::cash)
+        .def_readonly("fees_paid", &paper_account_snapshot::fees_paid)
+        .def_readonly("realized_pnl", &paper_account_snapshot::realized_pnl)
+        .def_readonly("unrealized_pnl", &paper_account_snapshot::unrealized_pnl)
+        .def_readonly("gross_notional", &paper_account_snapshot::gross_notional)
+        .def_readonly("equity", &paper_account_snapshot::equity)
+        .def_readonly("net_quantity", &paper_account_snapshot::net_quantity)
+        .def_readonly("average_entry_price",
+                      &paper_account_snapshot::average_entry_price)
+        .def_readonly("fill_count", &paper_account_snapshot::fill_count)
+        .def_readonly("maker_fills", &paper_account_snapshot::maker_fills)
+        .def_readonly("taker_fills", &paper_account_snapshot::taker_fills);
+
+    py::class_<paper_account>(m, "PaperAccount")
+        .def("cash", &paper_account::cash)
+        .def("fees_paid", &paper_account::fees_paid)
+        .def("realized_pnl", &paper_account::realized_pnl)
+        .def("unrealized_pnl", &paper_account::unrealized_pnl)
+        .def("equity", &paper_account::equity)
+        .def("net_quantity", &paper_account::net_quantity)
+        .def("average_entry_price", &paper_account::average_entry_price)
+        .def("snapshot", &paper_account::snapshot);
+
+    py::class_<match_leg>(m, "MatchLeg")
+        .def(py::init<>())
+        .def_readonly("price", &match_leg::price)
+        .def_readonly("quantity", &match_leg::quantity);
+
+    py::class_<match_result>(m, "MatchResult")
+        .def(py::init<>())
+        .def_readonly("filled", &match_result::filled)
+        .def_readonly("remaining", &match_result::remaining)
+        .def_readonly("average_price", &match_result::average_price)
+        .def_readonly("notional", &match_result::notional)
+        .def_readonly("slippage", &match_result::slippage)
+        .def_readonly("touch_price", &match_result::touch_price)
+        .def_readonly("leg_count", &match_result::leg_count)
+        .def_property_readonly("legs", [](const match_result& result) {
+            return std::vector<match_leg>(result.legs.begin(),
+                                          result.legs.begin() + result.leg_count);
+        });
+
+    py::class_<paper_ack>(m, "PaperAck")
+        .def(py::init<>())
+        .def_readonly("order_id", &paper_ack::order_id)
+        .def_readonly("reason", &paper_ack::reason)
+        .def_readonly("average_price", &paper_ack::average_price)
+        .def_readonly("filled", &paper_ack::filled)
+        .def_readonly("slippage", &paper_ack::slippage)
+        .def("accepted", &paper_ack::accepted);
+
+    py::class_<paper_metrics>(m, "PaperMetrics")
+        .def(py::init<>())
+        .def_readonly("depth_events", &paper_metrics::depth_events)
+        .def_readonly("gap_events", &paper_metrics::gap_events)
+        .def_readonly("orders_submitted", &paper_metrics::orders_submitted)
+        .def_readonly("orders_rejected", &paper_metrics::orders_rejected)
+        .def_readonly("orders_cancelled", &paper_metrics::orders_cancelled)
+        .def_readonly("fills", &paper_metrics::fills)
+        .def_readonly("filled_quantity", &paper_metrics::filled_quantity)
+        .def_readonly("traded_notional", &paper_metrics::traded_notional)
+        .def_readonly("slippage_total", &paper_metrics::slippage_total)
+        .def_readonly("p50_ns", &paper_metrics::p50_ns)
+        .def_readonly("p99_ns", &paper_metrics::p99_ns)
+        .def_readonly("p999_ns", &paper_metrics::p999_ns)
+        .def_readonly("open_orders", &paper_metrics::open_orders)
+        .def_readonly("last_update_ts", &paper_metrics::last_update_ts)
+        .def_readonly("last_frame_latency_ns", &paper_metrics::last_frame_latency_ns)
+        .def_readonly("account", &paper_metrics::account);
+
+    py::class_<paper_engine>(m, "PaperEngine")
+        .def(py::init<Price, Price, std::int32_t, std::int32_t, Notional>(),
+             py::arg("tick_size"), py::arg("center"), py::arg("maker_bps") = 0,
+             py::arg("taker_bps") = 5, py::arg("initial_cash") = Notional{})
+        .def("reset", &paper_engine::reset)
+        .def("process_update", &paper_engine::process_update, py::arg("update"))
+        .def("submit", &paper_engine::submit, py::arg("request"))
+        .def("cancel", &paper_engine::cancel, py::arg("order_id"),
+             py::arg("timestamp") = 0)
+        .def("cancel_all", &paper_engine::cancel_all, py::arg("timestamp") = 0)
+        .def("drain_fill", [](paper_engine& engine) -> std::optional<Fill> {
+            Fill fill;
+            if (!engine.drain_fill(fill)) {
+                return std::nullopt;
+            }
+            return fill;
+        })
+        .def("bbo", &paper_engine::bbo)
+        .def("mark_price", &paper_engine::mark_price)
+        .def("position", &paper_engine::position, py::return_value_policy::copy)
+        .def("account", &paper_engine::account,
+             py::return_value_policy::reference_internal)
+        .def("book", &paper_engine::book, py::return_value_policy::reference_internal)
+        .def("metrics", &paper_engine::metrics)
+        .def("pending_fills", &paper_engine::pending_fills)
+        .def("tick_size", &paper_engine::tick_size)
+        .def("center", &paper_engine::center)
+        .def("last_slippage", &paper_engine::last_slippage);
+
+    py::class_<ingest_stats>(m, "IngestStats")
+        .def(py::init<>())
+        .def_readonly("lines", &ingest_stats::lines)
+        .def_readonly("depth_events", &ingest_stats::depth_events)
+        .def_readonly("trade_events", &ingest_stats::trade_events)
+        .def_readonly("malformed", &ingest_stats::malformed)
+        .def_readonly("gaps", &ingest_stats::gaps);
+
+    m.def("match_taker", [](const L2Book& book, Side side, Quantity quantity) {
+        return match_taker(book, side, quantity);
+    }, py::arg("book"), py::arg("side"), py::arg("quantity"));
+
+    m.def("match_aggressive",
+          [](const L2Book& book, Side side, Quantity quantity, Price limit_price) {
+              return match_aggressive(book, side, quantity, limit_price);
+          },
+          py::arg("book"), py::arg("side"), py::arg("quantity"),
+          py::arg("limit_price"));
+
+    m.def("ingest_lines",
+          [](paper_engine& engine, const std::vector<std::string>& lines) {
+              return ingest_lines(engine, lines);
+          },
+          py::arg("engine"), py::arg("lines"));
+
+    m.attr("__version__") = "0.2.0";
 }
 
 
