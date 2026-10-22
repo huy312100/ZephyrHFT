@@ -179,6 +179,9 @@ bool JsonFeedParser::parse_depth_update(std::string_view json, DepthUpdate& out)
     if (locate(json, "U", value)) {
         (void)parse_u64(value, out.first_update_id);
     }
+    if (locate(json, "pu", value)) {
+        (void)parse_u64(value, out.prev_final_update_id);
+    }
     RawValue bids;
     RawValue asks;
     const bool has_bids = locate(json, "b", bids);

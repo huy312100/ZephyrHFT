@@ -286,6 +286,32 @@ worth checking `ntpd`/`chronyd` when it is non-zero.
   drawing conclusions about the venue.
 - One symbol/stream per process — run one process per subscription.
 
+## Live forward paper trading (Phase 2)
+
+Phase 2 wires the Phase 1 `.ndjson.gz` archives straight into the C++23 core and
+executes a deterministic paper-trading simulator with **L2 depth-based slippage**.
+
+```bash
+# Replay the bundled sample through the C++ paper engine (taker orders, slippage, fees)
+python3 scripts/run_live_paper.py --source data/sample_events.ndjson --order-quantity 0.5
+
+# Live-forward a Phase 1 capture (gzip NDJSON) into the paper engine
+python3 scripts/run_live_paper.py --source data/raw_l2/<roll>.ndjson.gz \
+    --tick-size 0.1 --center 81500 --taker-fee-bps 5 --maker-fee-bps -1
+```
+
+| Stage | Behaviour |
+| --- | --- |
+| Bridge | `python_analytics/bridge.py` streams lines in bulk through `hft_native.ingest_lines()`; per-level parsing and book updates run allocation-free in C++ |
+| Order book | `paper_engine.process_update()` applies Binance diffs (`b`/`a`, volume `0` removes a level) and flags `pu`/`u` sequence gaps |
+| Matching | `paper_engine.submit()` walks the real ladder level by level (`matching.hpp`) so market/crossing orders realise realistic slippage; resting limits fill as maker |
+| Account | `paper_account` tracks cash, maker/taker fees, realized/unrealized PnL and equity in fixed point |
+| Telemetry | per-frame processing latency is histogrammed in C++ (p50/p99/p999 ns) and printed per batch |
+
+New C++ headers: `cpp_engine/include/{matching,paper_account,paper_engine,ingest}.hpp`
+(all `snake_case`, header-only, C++23). The Python test `tests/python/test_live_paper.py`
+exercises the bridge end-to-end.
+
 ## Local Paper Trading & Simulation Guide
 
 The repository ships a self-contained paper-trading loop that streams depth
