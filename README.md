@@ -312,6 +312,10 @@ New C++ headers: `cpp_engine/include/{matching,paper_account,paper_engine,ingest
 (all `snake_case`, header-only, C++23). The Python test `tests/python/test_live_paper.py`
 exercises the bridge end-to-end.
 
+The full engineering specification — architecture, ladder mathematics, fee/PnL formulas,
+CLI reference, benchmark methodology and the operational runbook — lives in
+[`docs/phase2_technical_specification.md`](docs/phase2_technical_specification.md).
+
 ## Local Paper Trading & Simulation Guide
 
 The repository ships a self-contained paper-trading loop that streams depth
