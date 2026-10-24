@@ -39,6 +39,7 @@ from python_analytics.backtesting.walk_forward import (  # noqa: E402
     read_lock_file,
     write_lock_file,
 )
+from python_analytics.costs import DEFAULT_MAKER_BPS, DEFAULT_TAKER_BPS  # noqa: E402
 from python_analytics.utils import configure_logging, load_settings  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -78,8 +79,13 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--tick-size", type=str, default=None)
     parser.add_argument("--center", type=str, default=None)
     # Fees / cash / sizing: fractional basis points, negative maker = rebate.
-    parser.add_argument("--maker-bps", type=float, default=-1.0)
-    parser.add_argument("--taker-bps", type=float, default=5.0)
+    # Retail VIP 0 pays 2 bps as a maker, so that is the default.
+    parser.add_argument("--maker-bps", type=float, default=DEFAULT_MAKER_BPS,
+                        help="maker fee in fractional basis points "
+                             "(default: 2.0 = retail VIP 0; negative = rebate)")
+    parser.add_argument("--taker-bps", type=float, default=DEFAULT_TAKER_BPS,
+                        help="taker fee in fractional basis points "
+                             "(default: 5.0 = retail VIP 0)")
     parser.add_argument("--initial-cash", type=float, default=100000.0)
     parser.add_argument("--order-quantity", type=str, default="0.01")
     # Replay controls.

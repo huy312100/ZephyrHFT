@@ -30,6 +30,7 @@ from python_analytics.chaos import (  # noqa: E402
     ChaosNetworkInjector,
     HeartbeatWatchdog,
 )
+from python_analytics.costs import DEFAULT_MAKER_BPS, DEFAULT_TAKER_BPS  # noqa: E402
 from python_analytics.native import hft_native  # noqa: E402
 from python_analytics.native.factory import build_kill_switch  # noqa: E402
 from python_analytics.utils import configure_logging, load_settings  # noqa: E402
@@ -48,10 +49,10 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
                         help="lines per C++ bulk-ingest batch")
     parser.add_argument("--tick-size", type=str, default=None)
     parser.add_argument("--center", type=str, default=None)
-    parser.add_argument("--maker-fee-bps", type=float, default=0.0,
+    parser.add_argument("--maker-fee-bps", type=float, default=DEFAULT_MAKER_BPS,
                         help="maker fee in basis points; negative = rebate, "
-                             "fractions allowed (default: 0.0)")
-    parser.add_argument("--taker-fee-bps", type=float, default=5.0,
+                             "fractions allowed (default: 2.0 = retail VIP 0)")
+    parser.add_argument("--taker-fee-bps", type=float, default=DEFAULT_TAKER_BPS,
                         help="taker fee in basis points; fractions allowed "
                              "(default: 5.0 = 0.05%%, 0.5 = 0.005%%)")
     parser.add_argument("--initial-cash", type=float, default=0.0)

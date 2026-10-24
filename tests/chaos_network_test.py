@@ -59,6 +59,7 @@ from python_analytics.chaos import (  # noqa: E402
     ChaosNetworkInjector,
     HeartbeatWatchdog,
 )
+from python_analytics.costs import DEFAULT_MAKER_BPS, DEFAULT_TAKER_BPS  # noqa: E402
 from python_analytics.native import hft_native  # noqa: E402
 from python_analytics.native.factory import build_kill_switch  # noqa: E402
 from python_analytics.utils import configure_logging, load_settings  # noqa: E402
@@ -138,10 +139,12 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--no-kill-switch", action="store_true",
                         help="run the chaos without the dead-man's switch")
     parser.add_argument("--order-quantity", default="0.05")
-    parser.add_argument("--maker-bps", type=float, default=-1.0,
-                        help="maker fee in fractional basis points (negative = rebate)")
-    parser.add_argument("--taker-bps", type=float, default=5.0,
-                        help="taker fee in fractional basis points")
+    parser.add_argument("--maker-bps", type=float, default=DEFAULT_MAKER_BPS,
+                        help="maker fee in fractional basis points "
+                             "(default: 2.0 = retail VIP 0; negative = rebate)")
+    parser.add_argument("--taker-bps", type=float, default=DEFAULT_TAKER_BPS,
+                        help="taker fee in fractional basis points "
+                             "(default: 5.0 = retail VIP 0)")
     parser.add_argument("--initial-cash", type=float, default=100_000.0)
     parser.add_argument("--tick-size", default=None)
     parser.add_argument("--center", default=None)

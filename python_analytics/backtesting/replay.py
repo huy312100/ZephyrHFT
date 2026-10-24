@@ -14,6 +14,7 @@ from ..bridge import iter_gzip_ndjson, iter_ndjson
 from ..native import factory, hft_native
 from ..strategies.base import Strategy
 from ..utils.config import AppSettings
+from ..costs import DEFAULT_MAKER_BPS, DEFAULT_TAKER_BPS
 from .metrics import distribution, fill_rows, quant_summary, summarize
 
 logger = logging.getLogger(__name__)
@@ -267,7 +268,8 @@ class BulkReplayer:
     """
 
     def __init__(self, *, tick_size: Union[str, float], center: Union[str, float],
-                 maker_bps: float = -1.0, taker_bps: float = 5.0,
+                 maker_bps: float = DEFAULT_MAKER_BPS,
+                 taker_bps: float = DEFAULT_TAKER_BPS,
                  initial_cash: float = 0.0, batch_size: int = 64,
                  frames_per_hook: int = 1,
                  seed: Optional[Mapping[str, Any]] = None,

@@ -184,13 +184,19 @@ jobs:
         run: |
           report=reports/production_readiness_report.md
           test -f "$report" || { echo "::error::$report missing from the bundle"; exit 1; }
-          grep -q '^## Verdict: \*\*GO\*\*$' "$report" || {
-            echo "::error::refusing to attest a tag whose gate is not GO"
+          # A tag ships the strategy, not only the engine, so both headlines must
+          # be GO: a green build with a losing parameter set is not attestable.
+          grep -q '^## Build verdict: \*\*GO\*\*$' "$report" || {
+            echo "::error::refusing to attest a tag whose build verdict is not GO"
+            exit 1
+          }
+          grep -q '^## Alpha verdict: \*\*GO\*\*$' "$report" || {
+            echo "::error::refusing to attest a tag whose parameter set does not make money at the modelled fees"
             exit 1
           }
           {
             echo "### Attestation for \`${GITHUB_REF_NAME}\`"
             echo
-            echo "Commit \`${GITHUB_SHA}\` passed the production readiness gate."
-            echo "Fingerprint and per-phase evidence are in the artifact."
+            echo "Commit \`${GITHUB_SHA}\` passed the production readiness gate: build GO and alpha GO."
+            echo "Fingerprint, fee assumptions and per-phase evidence are in the artifact."
           } >> "$GITHUB_STEP_SUMMARY"

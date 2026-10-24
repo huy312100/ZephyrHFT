@@ -45,7 +45,7 @@ def _parameters(**overrides) -> LockedParameters:
     base = dict(gamma=0.1, sigma=0.02, k=5.0, time_horizon=60.0,
                 inventory_limit=5.0, ofi_sensitivity=0.5, ofi_decay=0.95,
                 ofi_cap=3.0, use_time_spread=True, tick_size="0.5", center="100",
-                market_type="CRYPTO", maker_bps=-1.0, taker_bps=5.0,
+                market_type="CRYPTO", maker_bps=2.0, taker_bps=5.0,
                 initial_cash=100_000.0, order_quantity="0.01")
     base.update(overrides)
     return LockedParameters(**base)

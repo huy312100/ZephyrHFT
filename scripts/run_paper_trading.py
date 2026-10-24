@@ -20,6 +20,7 @@ from typing import List, Optional
 # Make the repository root importable when this script is run directly.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from python_analytics.costs import DEFAULT_MAKER_BPS, DEFAULT_TAKER_BPS
 from python_analytics.native import hft_native
 from python_analytics.native.factory import build_risk_manager
 from python_analytics.simulator.paper_engine import (
@@ -58,8 +59,12 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--time-horizon", type=float, default=60.0)
     parser.add_argument("--tick-size", type=str, default=None)
     parser.add_argument("--center", type=str, default=None)
-    parser.add_argument("--maker-fee-bps", type=float, default=-1.0)
-    parser.add_argument("--taker-fee-bps", type=float, default=5.0)
+    parser.add_argument("--maker-fee-bps", type=float, default=DEFAULT_MAKER_BPS,
+                        help="maker fee in fractional basis points "
+                             "(default: 2.0 = retail VIP 0; negative = rebate)")
+    parser.add_argument("--taker-fee-bps", type=float, default=DEFAULT_TAKER_BPS,
+                        help="taker fee in fractional basis points "
+                             "(default: 5.0 = retail VIP 0)")
     parser.add_argument("--initial-cash", type=float, default=0.0)
     parser.add_argument("--self-trade-prevention", default="cancel_resting",
                         choices=("none", "cancel_resting", "reject"),

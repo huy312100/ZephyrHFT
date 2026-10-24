@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Phase 5 production-readiness gate.
 
-Runs every invariant the previous phases promised, measures it, and prints a
-GO / NO-GO verdict against explicit thresholds:
+Runs every invariant the previous phases promised, measures it, and prints two
+*separate* verdicts against explicit thresholds:
 
 ======================  =====================================================
 Phase 1 (ingestion)     settings parse, archive integrity (0 malformed, 0 gaps)
@@ -12,6 +12,8 @@ Phase 3 (resilience)    disconnect storm, latency injection, dead-man's
                         switch tripping and releasing the trading halt
 Phase 4 (validation)    parameter lock, look-ahead, ledger, OOS window count,
                         optional OOS Sharpe gate
+Alpha                   net OOS PnL after modelled fees, and whether the fee
+                        assumption is one a retail account can actually reach
 ======================  =====================================================
 
 Engine/chaos/walk-forward evidence is produced from a deterministic synthetic
@@ -20,11 +22,14 @@ machine. Phase 1 integrity is measured on the real archive (``--source``).
 When ``reports/walk_forward.json`` already exists it is reused instead of being
 recomputed; pass ``--recompute-walk-forward`` to force a fresh run.
 
-Profitability is deliberately *opt-in* (``--min-oos-sharpe``): the machinery can
-be production-ready while a given alpha is not, and conflating the two hides
-which one is broken.
+Build readiness and profitability are reported side by side and never merged:
+the machinery can be production-ready while a given alpha is not, and
+conflating the two hides which one is broken. The alpha checks always print;
+``--require-positive-alpha`` additionally turns a negative alpha into exit ``3``
+so the promotion checklist cannot ship a losing parameter set.
 
-Exit codes: ``0`` GO, ``1`` NO-GO, ``2`` usage error.
+Exit codes: ``0`` GO, ``1`` build NO-GO, ``2`` usage error, ``3`` alpha NO-GO
+(only with ``--require-positive-alpha``).
 """
 from __future__ import annotations
 
@@ -54,6 +59,11 @@ from python_analytics.chaos import (  # noqa: E402
     ChaosMode,
     ChaosNetworkInjector,
 )
+from python_analytics.costs import (  # noqa: E402
+    DEFAULT_MAKER_BPS,
+    DEFAULT_TAKER_BPS,
+    round_trip_cost_bps,
+)
 from python_analytics.native import hft_native  # noqa: E402
 from python_analytics.simulator.paper_engine import synthetic_depth_messages  # noqa: E402
 from python_analytics.utils import configure_logging, load_settings  # noqa: E402
@@ -66,6 +76,13 @@ DEFAULT_STEM = "production_readiness_report"
 EXIT_GO = 0
 EXIT_NO_GO = 1
 EXIT_USAGE = 2
+#: Build is ready but the strategy does not make money at the modelled fees.
+#: Only returned under ``--require-positive-alpha``; the shipped default reports
+#: the alpha verdict without letting it mask a build regression in CI.
+EXIT_ALPHA_NO_GO = 3
+
+#: Phase id for the profitability checks, which are gated separately from build.
+ALPHA_PHASE = "alpha"
 
 # Evidence book: small, deterministic and liquid enough to fill.
 EVIDENCE_MID = 100.0
@@ -101,7 +118,17 @@ class Check:
 
 @dataclass
 class ReadinessReport:
-    """The verdict plus every measurement that produced it."""
+    """The verdict plus every measurement that produced it.
+
+    Two verdicts are reported and never merged:
+
+    ``verdict``
+        Build readiness -- does the machinery do what the phases promised?
+    ``alpha_verdict``
+        Profitability -- did the frozen parameters make money on the OOS book
+        *at the modelled fees*? A build can be production-ready while its alpha
+        loses money; merging the two hides which one is broken.
+    """
 
     checks: List[Check]
     evidence: Dict[str, Any]
@@ -110,29 +137,54 @@ class ReadinessReport:
     generated_at: str = field(default_factory=utc_timestamp)
 
     @property
+    def build_checks(self) -> List[Check]:
+        return [check for check in self.checks if check.phase != ALPHA_PHASE]
+
+    @property
+    def alpha_checks(self) -> List[Check]:
+        return [check for check in self.checks
+                if check.phase == ALPHA_PHASE and check.gated]
+
+    @property
     def gated(self) -> List[Check]:
-        return [check for check in self.checks if check.gated]
+        return [check for check in self.build_checks if check.gated]
 
     @property
     def failures(self) -> List[Check]:
         return [check for check in self.gated if not check.passed]
 
     @property
+    def alpha_failures(self) -> List[Check]:
+        return [check for check in self.alpha_checks if not check.passed]
+
+    @property
     def verdict(self) -> str:
         return "GO" if not self.failures else "NO-GO"
 
+    @property
+    def alpha_verdict(self) -> str:
+        checks = self.alpha_checks
+        if not checks:
+            return "N/A"
+        return "GO" if not self.alpha_failures else "NO-GO"
+
     def as_dict(self) -> Dict[str, Any]:
         gated = self.gated
+        alpha = self.alpha_checks
         return {
             "report": "production_readiness",
             "generated_at": self.generated_at,
             "verdict": self.verdict,
+            "alpha_verdict": self.alpha_verdict,
             "summary": {
                 "checks": len(self.checks),
                 "gated": len(gated),
                 "passed": sum(1 for check in gated if check.passed),
                 "failed": len(self.failures),
                 "blocking": [check.id for check in self.failures],
+                "alpha_checks": len(alpha),
+                "alpha_failed": len(self.alpha_failures),
+                "alpha_blocking": [check.id for check in self.alpha_failures],
             },
             "thresholds": self.thresholds,
             "inputs": self.inputs,
@@ -164,16 +216,25 @@ class ReadinessReport:
         ("phase2", "Phase 2 - paper execution"),
         ("phase3", "Phase 3 - resilience"),
         ("phase4", "Phase 4 - out-of-sample validation"),
+        (ALPHA_PHASE, "Alpha - profitability at modelled fees"),
     )
 
     def summary_lines(self) -> List[str]:
         gated = self.gated
+        alpha = self.alpha_checks
         lines = [
-            f"verdict: {self.verdict} "
+            f"BUILD: {self.verdict} "
             f"({sum(1 for c in gated if c.passed)}/{len(gated)} gated checks passed)",
+            f"ALPHA: {self.alpha_verdict} "
+            f"({len(alpha) - len(self.alpha_failures)}/{len(alpha)} profitability "
+            f"checks passed at {self.thresholds.get('maker_bps')} / "
+            f"{self.thresholds.get('taker_bps')} bps maker/taker)",
         ]
         for check in self.failures:
             lines.append(f"  BLOCKING {check.id}: {check.measured} (required {check.threshold})")
+        for check in self.alpha_failures:
+            lines.append(f"  ALPHA FAIL {check.id}: {check.measured} "
+                         f"(required {check.threshold})")
         for phase, title in self.PHASES:
             subset = [check for check in self.checks if check.phase == phase]
             if subset:
@@ -183,13 +244,21 @@ class ReadinessReport:
 
     def to_markdown_text(self) -> str:
         gated = self.gated
+        alpha = self.alpha_checks
         lines: List[str] = [
             "# Production readiness report",
             "",
-            f"## Verdict: **{self.verdict}**",
+            f"## Build verdict: **{self.verdict}**",
+            "",
+            f"## Alpha verdict: **{self.alpha_verdict}**",
             "",
             f"- Generated: `{self.generated_at}`",
             f"- Gated checks: {sum(1 for c in gated if c.passed)}/{len(gated)} passed",
+            f"- Profitability checks: "
+            f"{len(alpha) - len(self.alpha_failures)}/{len(alpha)} passed",
+            f"- Fee assumption: {self.thresholds.get('maker_bps')} bps maker / "
+            f"{self.thresholds.get('taker_bps')} bps taker "
+            f"({self.thresholds.get('round_trip_cost_bps')} bps round trip)",
             f"- Evidence source: `{self.inputs.get('evidence', 'synthetic')}`",
             f"- Walk-forward evidence: {self.inputs.get('walk_forward_origin', 'n/a')}",
             "",
@@ -202,6 +271,13 @@ class ReadinessReport:
             lines.append("")
         else:
             lines += ["No blocking failures.", ""]
+
+        lines += [
+            "> Build readiness and profitability are reported separately: a green "
+            "build does not mean the strategy earns, and a negative alpha does not "
+            "mean the machinery is broken.",
+            "",
+        ]
 
         for phase, title in self.PHASES:
             subset = [check for check in self.checks if check.phase == phase]
@@ -585,6 +661,58 @@ def build_parameters(args: argparse.Namespace, settings: Any) -> LockedParameter
     )
 
 
+def measure_alpha(payload: Dict[str, Any], *, maker_bps: float,
+                  taker_bps: float) -> tuple[List[Check], Dict[str, Any]]:
+    """Profitability: does the frozen parameter set earn at honest costs?
+
+    These checks are *never* allowed to hide inside the build verdict. They are
+    computed on every run so the number is always on the page, and only
+    ``--require-positive-alpha`` turns them into a non-zero exit code.
+    """
+    aggregate = payload.get("aggregate", {})
+    net = float(aggregate.get("net_pnl", 0.0) or 0.0)
+    net_pct = float(aggregate.get("net_pnl_pct", 0.0) or 0.0)
+    gross = float(aggregate.get("gross_pnl", 0.0) or 0.0)
+    fees = float(aggregate.get("fees_paid", 0.0) or 0.0)
+    trips = aggregate.get("fills")
+    round_trip = round_trip_cost_bps(maker_bps, both_sides_maker=True)
+    # Fees are already inside realized/unrealized PnL (both come from the cash
+    # ledger), so adding them back is what the study would have earned for free.
+    before_fees = net + fees
+
+    checks = [
+        Check(
+            "alpha.net_pnl", "alpha", "net PnL after fees",
+            f"{net:+,.4f} USDT ({net_pct:+.4f}%); {before_fees:+,.4f} before "
+            f"{fees:+,.4f} of fees",
+            ">= 0 after modelled fees", net >= 0.0,
+            note="a negative number means a live deployment at these rates also "
+                 "loses money, regardless of how healthy the build is"),
+        Check(
+            "alpha.fee_assumption", "alpha", "fee assumption is reachable",
+            f"maker {maker_bps:g} bps / taker {taker_bps:g} bps "
+            f"({round_trip:g} bps round trip), {trips} fill(s)",
+            "maker_bps >= 0 (no rebate assumed)", maker_bps >= 0.0,
+            note="a negative maker_bps is a rebate tier retail VIP 0 does not "
+                 "have; it flatters every passive fill"),
+    ]
+
+    evidence = {
+        "net_pnl": net,
+        "net_pnl_pct": net_pct,
+        "gross_pnl": gross,
+        "pnl_before_fees": before_fees,
+        "pre_fee_profitable": before_fees > 0.0,
+        "fees_paid": fees,
+        "fills": trips,
+        "maker_bps": maker_bps,
+        "taker_bps": taker_bps,
+        "round_trip_cost_bps": round_trip,
+        "rebate_assumed": maker_bps < 0.0,
+    }
+    return checks, evidence
+
+
 def build_report(args: argparse.Namespace) -> ReadinessReport:
     settings = load_settings()
     parameters = build_parameters(args, settings)
@@ -646,6 +774,11 @@ def build_report(args: argparse.Namespace) -> ReadinessReport:
     checks += found
     evidence["walk_forward"] = measured
 
+    found, measured = measure_alpha(payload, maker_bps=args.maker_bps,
+                                    taker_bps=args.taker_bps)
+    checks += found
+    evidence["alpha"] = measured
+
     thresholds = {
         "max_engine_p99_us": args.max_engine_p99_us,
         "max_engine_p999_us": args.max_engine_p999_us,
@@ -656,7 +789,12 @@ def build_report(args: argparse.Namespace) -> ReadinessReport:
         "min_chaos_outages": 1,
         "min_oos_windows": args.min_windows,
         "min_oos_sharpe": args.min_oos_sharpe,
+        "maker_bps": args.maker_bps,
+        "taker_bps": args.taker_bps,
+        "round_trip_cost_bps": round_trip_cost_bps(args.maker_bps),
+        "require_positive_alpha": bool(args.require_positive_alpha),
     }
+    inputs["costs"] = {"maker_bps": args.maker_bps, "taker_bps": args.taker_bps}
     return ReadinessReport(checks=checks, evidence=evidence,
                            thresholds=thresholds, inputs=inputs)
 
@@ -794,8 +932,12 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
                         help="defaults to the value in config/settings.yaml")
     parser.add_argument("--center", default=None,
                         help="defaults to the value in config/settings.yaml")
-    parser.add_argument("--maker-bps", type=float, default=-1.0)
-    parser.add_argument("--taker-bps", type=float, default=5.0)
+    parser.add_argument("--maker-bps", type=float, default=DEFAULT_MAKER_BPS,
+                        help="maker fee in fractional basis points "
+                             "(default: 2.0 = retail VIP 0; negative = rebate)")
+    parser.add_argument("--taker-bps", type=float, default=DEFAULT_TAKER_BPS,
+                        help="taker fee in fractional basis points "
+                             "(default: 5.0 = retail VIP 0)")
     parser.add_argument("--initial-cash", type=float, default=100000.0)
     parser.add_argument("--order-quantity", default="0.01")
     # Gates.
@@ -804,8 +946,13 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--min-throughput-fps", type=int, default=1000)
     parser.add_argument("--ledger-tolerance", type=float, default=1e-2)
     parser.add_argument("--min-oos-sharpe", type=float, default=None,
-                        help="opt-in profitability gate applied to the OOS "
-                             "Sharpe (machinery gates always apply)")
+                        help="opt-in threshold gate applied to the OOS Sharpe "
+                             "(machinery gates always apply)")
+    parser.add_argument("--require-positive-alpha", action="store_true",
+                        help="exit 3 when the alpha verdict is NO-GO (the study "
+                             "loses money at the modelled fees); required by the "
+                             "promotion checklist, off by default so CI gates on "
+                             "build readiness alone")
     # Walk-forward evidence.
     parser.add_argument("--walk-forward-json", default=str(
         DEFAULT_REPORT_DIR / "walk_forward.json"),
@@ -839,7 +986,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         return EXIT_USAGE
 
     print("=" * 78)
-    print(f"  PRODUCTION READINESS: {report.verdict}")
+    print(f"  BUILD READINESS:     {report.verdict}")
+    print(f"  ALPHA (PROFITABILITY): {report.alpha_verdict}")
     print(f"  generated {report.generated_at}")
     print("-" * 78)
     for line in report.summary_lines():
@@ -851,9 +999,15 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(f"  wrote: {md_path}")
     print("=" * 78)
     if report.failures:
-        print("  NO-GO: fix the blocking checks above before promoting this build.",
-              file=sys.stderr)
+        print("  NO-GO: fix the blocking build checks above before promoting "
+              "this build.", file=sys.stderr)
         return EXIT_NO_GO
+    if report.alpha_failures:
+        print("  ALPHA NO-GO: the machinery is ready but this parameter set does "
+              "not make money at the modelled fees; do not trade it live.",
+              file=sys.stderr)
+        if args.require_positive_alpha:
+            return EXIT_ALPHA_NO_GO
     return EXIT_GO
 
 

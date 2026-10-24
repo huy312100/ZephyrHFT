@@ -105,6 +105,30 @@ def test_run_backtest_cli_accepts_fractional_fees() -> None:
     assert legacy.taker_bps == 5.0
 
 
+def test_cli_fee_defaults_are_retail_tier_not_a_rebate() -> None:
+    """Every entry point must default to what a retail VIP 0 account actually pays."""
+
+    from python_analytics.costs import DEFAULT_MAKER_BPS, DEFAULT_TAKER_BPS
+    from scripts.run_backtest import parse_args as backtest_args
+    from scripts.run_live_paper import parse_args as live_paper_args
+    from scripts.run_paper_trading import parse_args as paper_args
+    from scripts.run_walk_forward import parse_args as walk_forward_args
+
+    cases = [
+        (backtest_args, "maker_bps", "taker_bps"),
+        (walk_forward_args, "maker_bps", "taker_bps"),
+        (paper_args, "maker_fee_bps", "taker_fee_bps"),
+        (live_paper_args, "maker_fee_bps", "taker_fee_bps"),
+    ]
+    for parser, maker_attr, taker_attr in cases:
+        defaults = parser([])
+        assert getattr(defaults, maker_attr) == pytest.approx(DEFAULT_MAKER_BPS), \
+            parser.__module__
+        assert getattr(defaults, taker_attr) == pytest.approx(DEFAULT_TAKER_BPS), \
+            parser.__module__
+        assert getattr(defaults, maker_attr) >= 0.0, "a default rebate flatters every fill"
+
+
 def test_export_report_accepts_json_path(tmp_path: Path) -> None:
     """``--report .../summary.json`` must not nest artefacts in a dir named .json."""
     from python_analytics.backtesting.report import export_report

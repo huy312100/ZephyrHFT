@@ -19,6 +19,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from python_analytics.backtesting.replay import BulkReplayer  # noqa: E402
 from python_analytics.backtesting.report import export_report  # noqa: E402
+from python_analytics.costs import DEFAULT_MAKER_BPS, DEFAULT_TAKER_BPS  # noqa: E402
 from python_analytics.strategies import (  # noqa: E402
     AvellanedaStoikovStrategy,
     InventoryMarketMaker,
@@ -49,10 +50,11 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
                         help="disable the gamma*sigma^2*(T-t) spread term")
     # Fees / cash / sizing. Fee rates are fractional basis points, so they are
     # parsed as floats (0.5 => 0.5 bps = 0.005%); negative maker_bps is a rebate.
-    parser.add_argument("--maker-bps", type=float, default=-1.0,
+    # The default is the retail VIP 0 schedule: a maker *pays* 2 bps.
+    parser.add_argument("--maker-bps", type=float, default=DEFAULT_MAKER_BPS,
                         help="maker fee in basis points; negative = rebate "
-                             "(default: -1.0, i.e. 0.01%% rebate)")
-    parser.add_argument("--taker-bps", type=float, default=5.0,
+                             "(default: 2.0 = retail VIP 0, i.e. 0.02%% paid)")
+    parser.add_argument("--taker-bps", type=float, default=DEFAULT_TAKER_BPS,
                         help="taker fee in basis points; fractions allowed "
                              "(default: 5.0, i.e. 0.05%%); e.g. 0.5 = 0.005%%")
     parser.add_argument("--initial-cash", type=float, default=100000.0,
