@@ -48,6 +48,7 @@ from typing import Any, Dict, Iterator, List, Mapping, Optional, Sequence, Tuple
 
 from ..bridge import iter_gzip_ndjson, iter_ndjson
 from ..strategies import AvellanedaStoikovStrategy, MarketConfig, MarketType
+from ..costs import DEFAULT_MAKER_BPS, DEFAULT_TAKER_BPS
 from .metrics import (
     max_drawdown,
     profit_factor,
@@ -249,8 +250,8 @@ class LockedParameters:
     tick_size: str = "0.5"
     center: str = "30000"
     market_type: str = "CRYPTO"
-    maker_bps: float = -1.0
-    taker_bps: float = 5.0
+    maker_bps: float = DEFAULT_MAKER_BPS
+    taker_bps: float = DEFAULT_TAKER_BPS
     initial_cash: float = 100000.0
     order_quantity: str = "0.01"
 

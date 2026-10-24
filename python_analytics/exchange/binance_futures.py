@@ -790,6 +790,65 @@ def parse_open_orders(payload: Any) -> List[OpenOrder]:
     return orders
 
 
+@dataclass(frozen=True)
+class CommissionRate:
+    """The account's real maker/taker rates, straight from the venue.
+
+    Rates are kept as **fractions** exactly as Binance reports them
+    (``0.0002`` = 2 bps) because that is what the engines consume, but the
+    ``*_bps`` properties are what the backtests and the readiness gate speak, so
+    an assumption can be checked against reality instead of typed by hand.
+    """
+
+    symbol: str
+    maker_rate: Decimal
+    taker_rate: Decimal
+
+    @property
+    def maker_bps(self) -> float:
+        return float(self.maker_rate) * 10_000.0
+
+    @property
+    def taker_bps(self) -> float:
+        return float(self.taker_rate) * 10_000.0
+
+    @property
+    def is_rebate(self) -> bool:
+        """True when the venue pays us to provide liquidity (a negative maker fee)."""
+
+        return self.maker_rate < 0
+
+    def describe(self) -> str:
+        return (
+            f"{self.symbol} maker={self.maker_rate} ({self.maker_bps:+.4f} bps) "
+            f"taker={self.taker_rate} ({self.taker_bps:+.4f} bps)"
+            f"{' REBATE' if self.is_rebate else ''}"
+        )
+
+
+def parse_commission_rate(payload: Any, *, symbol: Optional[str] = None) -> CommissionRate:
+    """Normalises an ``/fapi/v1/commissionRate`` payload.
+
+    The endpoint answers ``{"symbol": ..., "makerCommissionRate": "0.0002",
+    "takerCommissionRate": "0.0005"}``. A missing rate is an error rather than a
+    silent zero: charging nobody would make every strategy look profitable.
+    """
+
+    if not isinstance(payload, Mapping):
+        raise BinanceError("commissionRate payload is not an object")
+    for key in ("makerCommissionRate", "takerCommissionRate"):
+        if payload.get(key) in (None, ""):
+            raise BinanceError(f"commissionRate payload has no {key}")
+    resolved = symbol or str(payload.get("symbol") or "").strip().upper()
+    if not resolved:
+        raise BinanceError("commissionRate payload has no symbol")
+    return CommissionRate(
+        symbol=resolved.upper(),
+        maker_rate=_decimal_field(payload, "makerCommissionRate"),
+        taker_rate=_decimal_field(payload, "takerCommissionRate"),
+    )
+
+
 Transport = Callable[[urllib.request.Request, float], Tuple[int, bytes]]
 
 
@@ -996,6 +1055,21 @@ class BinanceFuturesClient:
                 f"invalid markPrice in response: {raw!r}",
                 endpoint="/fapi/v1/premiumIndex",
             ) from exc
+
+    def commission_rate(self, symbol: str) -> CommissionRate:
+        """Fetches the account's actual maker/taker rates for ``symbol``.
+
+        Every backtest cost assumption can be checked against this instead of
+        guessed: retail USDⓈ-M VIP 0 pays 2 bps maker, and only a rebate tier
+        reports a negative maker rate. Requires a signed request, so it is also a
+        cheap liveness probe for the API key's futures permission.
+        """
+
+        payload = self._request(
+            "GET", "/fapi/v1/commissionRate", {"symbol": str(symbol).upper()},
+            signed=True,
+        )
+        return parse_commission_rate(payload, symbol=str(symbol).upper())
 
     def book_ticker(self, symbol: str) -> Mapping[str, Any]:
         return self._request(
