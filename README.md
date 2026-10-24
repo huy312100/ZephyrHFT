@@ -422,6 +422,10 @@ Auto-recovery is conditioned on evidence of life: after the remediation window
 the watchdog waits for a frame that arrived *after* the trip before it calls
 `reset()`. A long outage therefore stays halted (orders blocked, position flat)
 for its whole duration instead of flapping between `TRIGGERED` and `NORMAL`.
+Recovery is also scoped to the halt the heartbeat caused: if a drawdown breach,
+a reject streak or an operator already holds the switch, the expiry is still
+reported but the halt is left to its owner, and a trip that lands during the
+recovery window cancels the automatic reset.
 
 Ctrl+C is a graceful path, not an escape: SIGINT/SIGTERM end the loop at a frame
 boundary and then trip the switch, so resting orders are cancelled and the
@@ -693,6 +697,7 @@ from python_analytics.bridge import PaperSession
 from python_analytics.chaos import HeartbeatWatchdog
 from python_analytics.native import hft_native
 from python_analytics.native.factory import build_kill_switch
+from python_analytics.utils import load_settings
 
 switch = build_kill_switch(load_settings())
 session = PaperSession.create("0.1", "84570", kill_switch=switch)

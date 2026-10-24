@@ -34,6 +34,14 @@ class HeartbeatWatchdog:
     Automatic recovery waits for a frame *after* the trip
     (:meth:`await_beat`): clearing the halt while the socket is still down
     would simply re-trip on the next poll and quote into nothing.
+
+    Recovery is also scoped to the halt the heartbeat caused.
+    ``KillSwitch::trip()`` converges on ``TRIGGERED`` but every call is counted
+    and overwrites the recorded reason, so an expiry that lands while the
+    operator, the drawdown guard or the reject-streak guard already holds the
+    halt must not be moved into the remediation window -- and a second trip
+    arriving during that window abandons the automatic reset instead of
+    clearing a condition that is not ours.
     """
 
     def __init__(
@@ -105,11 +113,17 @@ class HeartbeatWatchdog:
         return thread is not None and thread.is_alive()
 
     # ------------------------------------------------- deterministic surface
-    def poll_once(self, now_ns: int = 0) -> bool:
-        """Runs one supervision step; returns True when an expiry was handled."""
+    def poll_once(self, now_ns: int = 0, *, own_halt: bool = True) -> bool:
+        """Runs one supervision step; returns True when an expiry was handled.
+
+        ``own_halt`` records whether the switch was ``NORMAL`` *before* this
+        poll, i.e. whether the expiry is the only thing halting trading. The
+        timeout is reported either way, but a halt another guard already owns is
+        neither moved to ``RECOVERING`` nor cleared later.
+        """
         if not self._monitor.poll(now_ns):
             return False
-        self._handle_timeout(now_ns)
+        self._handle_timeout(now_ns, own_halt=own_halt)
         return True
 
     def await_beat(self, timeout_s: Optional[float] = None) -> bool:
@@ -165,7 +179,7 @@ class HeartbeatWatchdog:
         }
 
     # ------------------------------------------------------------ internals
-    def _handle_timeout(self, now_ns: int = 0) -> None:
+    def _handle_timeout(self, now_ns: int = 0, *, own_halt: bool = True) -> None:
         native = self._monitor.stats(now_ns)
         self._trip_beat_ns = native.last_beat_ns
         with self._lock:
@@ -177,8 +191,40 @@ class HeartbeatWatchdog:
         )
         if self._on_timeout is not None:
             self._safe_call(self._on_timeout, native, "timeout")
-        if self._kill_switch is not None and self._kill_switch.begin_recovery():
+        if self._kill_switch is None:
+            return
+        if not own_halt:
+            # The switch was already halting for another reason; anything this
+            # thread does to it now -- RECOVERING, reset() -- would edit a halt
+            # it does not understand.
+            logger.error("    halt predates this expiry; "
+                         "leaving it to its owner to clear")
+            return
+        if self._kill_switch.begin_recovery():
             logger.warning("    state=RECOVERING (orders blocked, cancels in flight)")
+
+    def _state_name(self) -> str:
+        """Current switch state by name, without importing the native enum."""
+        if self._kill_switch is None:
+            return "NORMAL"
+        try:
+            state = self._kill_switch.get_state()
+        except Exception:  # noqa: BLE001 - telemetry must not kill the watchdog
+            return "UNKNOWN"
+        return str(getattr(state, "name", state))
+
+    def _switch_is_normal(self) -> bool:
+        """True when no other guard owns a halt on the switch."""
+        return self._state_name() == "NORMAL"
+
+    def _trip_count(self) -> int:
+        """Cumulative trips, used to detect a second trigger during recovery."""
+        if self._kill_switch is None:
+            return 0
+        try:
+            return int(self._kill_switch.get_stats().trip_count)
+        except Exception:  # noqa: BLE001 - a switch without stats still works
+            return 0
 
     def _safe_call(self, callback: Callable[[Any], None], argument: Any,
                    label: str) -> None:
@@ -192,10 +238,20 @@ class HeartbeatWatchdog:
             if self._stop.wait(self._interval_s):
                 return
             try:
-                if not self.poll_once():
+                # Sample ownership *before* the poll: the poll trips the switch
+                # and overwrites the recorded reason, so a halt that already
+                # existed can only be recognised up front.
+                owned = self._switch_is_normal()
+                if not self.poll_once(own_halt=owned):
+                    continue
+                if not owned:
+                    logger.error(
+                        "feed went silent while the switch was already halted; "
+                        "that halt stays with its owner (no auto-recovery)")
                     continue
                 if not self._auto_recover:
                     continue
+                trips = self._trip_count()
                 if self._stop.wait(self._recovery_delay_s):
                     return
                 # Do not clear a halt into a socket that is still silent.
@@ -203,6 +259,15 @@ class HeartbeatWatchdog:
                     logger.error(
                         "feed still silent after %.1fs; halt stays in place "
                         "(operator reset required)", self._recovery_timeout_s)
+                    continue
+                current = self._trip_count()
+                if current != trips:
+                    # A drawdown breach, a reject streak or an operator trip
+                    # landed during the window: clearing now would resume
+                    # trading into a condition this watchdog did not observe.
+                    logger.error(
+                        "another trip landed during the recovery window "
+                        "(trips %d -> %d); halt stays in place", trips, current)
                     continue
                 self.recover()
             except Exception:  # noqa: BLE001 - keep supervising after a bad iteration

@@ -366,6 +366,92 @@ def test_watchdog_thread_supervises_and_recovers() -> None:
     assert watchdog.running is False
 
 
+def test_watchdog_leaves_a_foreign_halt_in_place() -> None:
+    """An expiry must not take over a halt another guard already owns."""
+    monitor, switch = _armed_monitor(timeout_ms=100.0)
+    monitor.beat(1_000_000_000)
+    # A drawdown breach (or an operator) is the reason orders are blocked.
+    switch.trip("drawdown breach")
+    watchdog = HeartbeatWatchdog(monitor, kill_switch=switch, auto_recover=True,
+                                 interval_s=0.01, recovery_delay_s=0.0)
+
+    assert watchdog.poll_once(1_200_000_000, own_halt=False) is True
+    # The silence is still reported, but the switch is left exactly as it was:
+    # no RECOVERING, no reset, and the drawdown guard keeps blocking.
+    assert watchdog.stats()["timeouts"] == 1
+    assert switch.get_state() == hft_native.SystemState.TRIGGERED
+    assert watchdog.stats()["recoveries"] == 0
+    assert switch.get_stats().reset_count == 0
+
+
+def test_watchdog_thread_refuses_a_foreign_halt() -> None:
+    monitor, switch = _armed_monitor(timeout_ms=60.0)
+    switch.trip("drawdown breach")
+    monitor.beat()
+    watchdog = HeartbeatWatchdog(
+        monitor, kill_switch=switch, auto_recover=True,
+        interval_s=0.01, recovery_delay_s=0.0, recovery_timeout_s=0.5,
+    ).start()
+    try:
+        deadline = time.monotonic() + 3.0
+        while watchdog.stats()["timeouts"] == 0 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert watchdog.stats()["timeouts"] >= 1
+
+        # Beats prove the feed is back, yet the halt must keep standing: the
+        # watchdog never observed the condition that caused it.
+        end = time.monotonic() + 0.3
+        while time.monotonic() < end:
+            monitor.beat()
+            time.sleep(0.01)
+        assert switch.get_state() == hft_native.SystemState.TRIGGERED
+        assert switch.get_stats().reset_count == 0
+        assert watchdog.stats()["recoveries"] == 0
+    finally:
+        watchdog.stop()
+        watchdog.join(2.0)
+
+
+def test_watchdog_skips_recovery_when_another_trip_lands() -> None:
+    # A 200 ms deadline against a 10 ms beat: the only trips in this test are
+    # the ones written below, not scheduler jitter.
+    monitor, switch = _armed_monitor(timeout_ms=200.0)
+    monitor.beat()
+    watchdog = HeartbeatWatchdog(
+        monitor, kill_switch=switch, auto_recover=True,
+        interval_s=0.005, recovery_delay_s=0.8, recovery_timeout_s=3.0,
+    ).start()
+    try:
+        deadline = time.monotonic() + 3.0
+        while switch.get_stats().trip_count == 0 and time.monotonic() < deadline:
+            time.sleep(0.005)
+        assert switch.get_stats().trip_count == 1
+
+        # Keep the feed alive while waiting, then land a drawdown breach inside
+        # the recovery window the watchdog is parked in.
+        beat_until = time.monotonic() + 0.3
+        while time.monotonic() < beat_until:
+            monitor.beat()
+            time.sleep(0.01)
+        assert switch.get_state() == hft_native.SystemState.RECOVERING
+        switch.trip("drawdown breach")
+
+        # Fresh beats satisfy await_beat(), so only the trip count can stop the
+        # reset -- and it must.
+        end = time.monotonic() + 1.2
+        while time.monotonic() < end:
+            monitor.beat()
+            time.sleep(0.01)
+        assert switch.get_stats().trip_count == 2
+        assert switch.get_stats().reset_count == 0
+        assert watchdog.stats()["recoveries"] == 0
+        assert switch.get_state() == hft_native.SystemState.TRIGGERED
+        assert switch.get_stats().last_trip_reason == "drawdown breach"
+    finally:
+        watchdog.stop()
+        watchdog.join(2.0)
+
+
 def test_watchdog_rejects_invalid_intervals() -> None:
     monitor, switch = _armed_monitor()
     with pytest.raises(ValueError, match="interval_s"):
@@ -582,6 +668,26 @@ def test_cli_latency_injection_passes(chaos_cli, capsys) -> None:
     assert code == 0
     assert "RESULT: PASS" in output
     assert "latency spikes injected" in output
+
+
+def test_cli_idle_switch_ignores_the_shutdown_trip(chaos_cli, capsys) -> None:
+    # A 5 s deadline against 60 ms outages: nothing should trip, so the exit
+    # trip the harness makes on purpose must not be read as a chaos trip.
+    code = chaos_cli.main([
+        "--mode", "disconnect_storm",
+        "--duration", "1.0",
+        "--interval", "0.3",
+        "--disconnect-s", "0.06",
+        "--heartbeat-timeout-ms", "5000",
+        "--replay-delay", "0.002",
+        "--report-every", "10",
+        "--log-level", "CRITICAL",
+    ])
+    output = capsys.readouterr().out
+    assert code == 0
+    assert "RESULT: PASS" in output
+    assert "[PASS] dead-man's switch idle" in output
+    assert "(pre-exit 0)" in output
 
 
 def test_cli_reports_a_missing_source(chaos_cli, tmp_path: Path) -> None:

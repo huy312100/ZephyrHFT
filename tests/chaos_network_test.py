@@ -86,6 +86,9 @@ class Counters:
     resting_accepted: Optional[bool] = None
     resting_client_id: int = RESTING_CLIENT_ID
     next_report: float = 0.0
+    # Trips observed before the harness trips the switch to shut down: the exit
+    # is deliberate, so it must not colour the chaos verdict.
+    trips_before_shutdown: int = 0
 
 
 @dataclass
@@ -277,7 +280,7 @@ def build_checks(
     elif watchdog_stats is None:
         checks.append(Check("dead-man's switch", True, "disabled (timeout 0)"))
     elif expect_trip:
-        trips = switch.get_stats().trip_count
+        trips = counters.trips_before_shutdown
         timeouts = int(watchdog_stats["timeouts"])
         checks.append(Check(
             "dead-man's switch tripped",
@@ -301,8 +304,10 @@ def build_checks(
     else:
         checks.append(Check(
             "dead-man's switch idle",
-            switch.get_stats().trip_count == 0,
-            "timeout above the worst injected silence",
+            counters.trips_before_shutdown == 0,
+            "no trip during the run "
+            f"(trips={counters.trips_before_shutdown}, "
+            f"limit={args.heartbeat_timeout_ms:.0f}ms)",
         ))
 
     checks.append(Check(
@@ -528,6 +533,8 @@ def run(args: argparse.Namespace) -> int:
             session.service_remediation()
             logger.warning(".. SHUTDOWN  state=%s -> cancel_all + flatten",
                            switch.get_state().name)
+            # The exit trip below is deliberate; keep it out of the verdict.
+            counters.trips_before_shutdown = int(switch.get_stats().trip_count)
             switch.trip("shutdown: chaos harness exit")
             switch.begin_recovery()
             outcome = session.service_remediation()
@@ -572,6 +579,7 @@ def run(args: argparse.Namespace) -> int:
                 "state_after_chaos": state_after_chaos,
                 "state": str(switch.get_state().name),
                 "trip_count": switch.get_stats().trip_count,
+                "trip_count_before_shutdown": counters.trips_before_shutdown,
                 "blocked_orders": switch.get_stats().blocked_orders,
                 "reset_count": switch.get_stats().reset_count,
                 "last_trip_reason": switch.get_stats().last_trip_reason,
@@ -637,7 +645,9 @@ def print_report(
     if switch is not None:
         stats = switch.get_stats()
         print(f"  kill switch     : state={state_after_chaos}  "
-              f"trips={stats.trip_count}  blocked={stats.blocked_orders}  "
+              f"trips={stats.trip_count} "
+              f"(pre-exit {counters.trips_before_shutdown})  "
+              f"blocked={stats.blocked_orders}  "
               f"resets={stats.reset_count}")
         print(f"  last halt       : {stats.last_trip_reason or '-'}")
     else:
