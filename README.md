@@ -96,6 +96,15 @@ ctest --test-dir build --output-on-failure
 ./build/tests/hft_tests
 ```
 
+### Continuous integration
+
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs the same sequence on
+`ubuntu-24.04` for Python 3.9 and 3.12: it installs `build-essential` + `cmake`,
+then `requirements.txt` (PyYAML, pybind11, pytest, websockets), configures
+`cpp_engine`, builds `hft_native`, and runs `ctest`, `pytest` and
+`python main.py --demo`. The extension is built into the checkout rather than
+installed, so the job must build before it tests.
+
 ### Manual extension build (fallback)
 
 If CMake is unavailable, the extension can be compiled directly:
