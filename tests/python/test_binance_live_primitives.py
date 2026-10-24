@@ -82,10 +82,17 @@ def _account_payload(
     *,
     amount: str = "0.002",
     entry: str = "80000",
-    mark: str = "81000",
     leverage: str = "3",
     isolated: str = "true",
 ) -> Dict[str, Any]:
+    """Mirrors an ``/fapi/v2/account`` or ``/fapi/v3/account`` response.
+
+    Two venue quirks matter here: the account endpoint reports unrealised PnL as
+    ``unrealizedProfit`` (``positionRisk`` is the one that spells it
+    ``unRealizedProfit``), and it carries no ``markPrice`` at all. ``entryPrice``
+    / ``leverage`` / ``isolated`` are documented on v2 and returned by v3 too.
+    """
+
     return {
         "availableBalance": "1000.00000000",
         "totalWalletBalance": "1000.00000000",
@@ -95,8 +102,7 @@ def _account_payload(
                 "symbol": "BTCUSDT",
                 "positionAmt": amount,
                 "entryPrice": entry,
-                "markPrice": mark,
-                "unRealizedProfit": "2.00",
+                "unrealizedProfit": "2.00",
                 "leverage": leverage,
                 "isolated": isolated,
                 "positionSide": "BOTH",
@@ -105,14 +111,30 @@ def _account_payload(
                 "symbol": "ETHUSDT",
                 "positionAmt": "0",
                 "entryPrice": "0",
-                "markPrice": "3000",
-                "unRealizedProfit": "0",
+                "unrealizedProfit": "0",
                 "leverage": "5",
                 "isolated": "false",
                 "positionSide": "BOTH",
             },
         ],
     }
+
+
+def _position_risk_payload() -> List[Dict[str, Any]]:
+    """Mirrors ``/fapi/v2/positionRisk``: mark price and the other PnL spelling."""
+
+    return [
+        {
+            "symbol": "BTCUSDT",
+            "positionAmt": "0.002",
+            "entryPrice": "80000",
+            "markPrice": "81000",
+            "unRealizedProfit": "2.00",
+            "leverage": "3",
+            "isolated": "true",
+            "positionSide": "BOTH",
+        }
+    ]
 
 
 # --------------------------------------------------------------------------- #
@@ -126,11 +148,57 @@ def test_parse_positions_drops_flat_symbols_and_signs_quantity():
     assert btc.quantity == Decimal("0.002")
     assert btc.side == "BUY"
     assert btc.closing_side() == "SELL"
-    assert btc.notional == Decimal("162.000")
+    assert btc.mark_price == Decimal("0")  # the account endpoint sends no markPrice
+    assert btc.notional == Decimal("160.000")  # so the entry price is used instead
     assert btc.leverage == Decimal("3")
     assert btc.isolated is True
     assert btc.unrealized_pnl == Decimal("2.00")
     assert "BTCUSDT BUY" in btc.describe()
+
+
+def test_parse_positions_reads_the_unrealized_profit_key_the_account_uses():
+    btc = parse_positions(_account_payload(entry="80000"))[0]
+
+    assert btc.unrealized_pnl == Decimal("2.00")
+    assert btc.entry_price == Decimal("80000")
+
+
+def test_parse_positions_accepts_the_position_risk_pnl_spelling():
+    btc = parse_positions({"positions": _position_risk_payload()})[0]
+
+    assert btc.unrealized_pnl == Decimal("2.00")
+    assert btc.mark_price == Decimal("81000")
+    assert btc.notional == Decimal("162.000")
+
+
+def test_parse_positions_tolerates_a_documented_v3_row():
+    """A row with only the v3 fields (no entryPrice/leverage/isolated) must parse."""
+
+    payload = {
+        "positions": [
+            {
+                "symbol": "BTCUSDT",
+                "positionSide": "BOTH",
+                "positionAmt": "0.002",
+                "unrealizedProfit": "2.00",
+                "isolatedMargin": "0.00000000",
+                "notional": "162",
+                "isolatedWallet": "0",
+                "initialMargin": "0",
+                "maintMargin": "0",
+                "updateTime": 0,
+            }
+        ]
+    }
+
+    btc = parse_positions(payload)[0]
+
+    assert btc.quantity == Decimal("0.002")
+    assert btc.unrealized_pnl == Decimal("2.00")
+    assert btc.entry_price == Decimal("0")
+    assert btc.leverage == Decimal("0")
+    assert btc.isolated is False
+    assert btc.notional == Decimal("0.000")
 
 
 def test_parse_positions_can_include_flat_entries():
@@ -149,7 +217,8 @@ def test_parse_positions_handles_a_short_position():
 
     assert short.side == "SELL"
     assert short.closing_side() == "BUY"
-    assert short.notional == Decimal("40500.0")
+    assert short.entry_price == Decimal("80000")
+    assert short.notional == Decimal("40000.0")
 
 
 def test_parse_positions_rejects_a_malformed_payload():
@@ -449,6 +518,47 @@ def test_positions_filters_to_one_symbol():
 
     assert [position.symbol for position in positions] == ["BTCUSDT"]
     assert _path(transport) == "/fapi/v3/account"
+    assert len(transport.requests) == 1  # no mark-price request unless asked for
+
+
+def test_positions_fills_mark_prices_from_premium_index():
+    transport = FakeTransport(
+        [
+            (200, _account_payload()),
+            (
+                200,
+                {"symbol": "BTCUSDT", "markPrice": "81000.0", "indexPrice": "80990.0"},
+            ),
+        ]
+    )
+
+    positions = _client(transport).positions("btcusdt", with_mark_price=True)
+
+    assert _path(transport, 1) == "/fapi/v1/premiumIndex"
+    assert _query(transport, 1)["symbol"] == ["BTCUSDT"]
+    btc = positions[0]
+    assert btc.mark_price == Decimal("81000.0")
+    assert btc.notional == Decimal("162.000")
+
+
+def test_positions_fills_every_mark_price_in_one_request():
+    payload = _account_payload()
+    payload["positions"][1]["positionAmt"] = "-1"
+    payload["positions"][1]["entryPrice"] = "3000"
+    transport = FakeTransport(
+        [
+            (200, payload),
+            (200, [{"symbol": "BTCUSDT", "markPrice": "81000"}]),
+        ]
+    )
+
+    positions = _client(transport).positions(with_mark_price=True)
+
+    assert "symbol" not in _query(transport, 1)  # one request covers all symbols
+    assert [item.symbol for item in positions] == ["BTCUSDT", "ETHUSDT"]
+    assert positions[0].mark_price == Decimal("81000")
+    assert positions[1].mark_price == Decimal("0")  # unresolved: keeps payload value
+    assert positions[1].notional == Decimal("3000")
 
 
 @pytest.mark.parametrize("status", [429, 418])

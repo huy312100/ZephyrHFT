@@ -25,7 +25,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from decimal import ROUND_CEILING, ROUND_DOWN, Decimal, InvalidOperation
 from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
 
@@ -626,7 +626,14 @@ class Position:
 
     @property
     def notional(self) -> Decimal:
-        return abs(self.quantity) * self.mark_price
+        """Quantity valued at the mark price, or at the entry price if unknown.
+
+        Account payloads carry no ``markPrice`` (only ``positionRisk`` does), so
+        a position parsed from one would otherwise report a notional of zero.
+        """
+
+        price = self.mark_price if self.mark_price > 0 else self.entry_price
+        return abs(self.quantity) * price
 
     def closing_side(self) -> str:
         """The side that reduces this position; raises when it is already flat."""
@@ -706,6 +713,14 @@ def parse_positions(payload: Any, *, include_flat: bool = False) -> List[Positio
     Flat entries are dropped by default: a trading loop that iterates open risk
     should never see the hundreds of zero-quantity rows an account payload
     carries for every symbol the account has ever touched.
+
+    The venue is inconsistent about the unrealised-PnL key: an account payload
+    (``/fapi/v2/account``, ``/fapi/v3/account``) reports ``unrealizedProfit``
+    while ``/fapi/v2/positionRisk`` reports ``unRealizedProfit``. Both spellings
+    are accepted, so either payload can feed a reconciliation. Account rows also
+    carry no ``markPrice`` (that field is positionRisk-only), which is why
+    ``BinanceFuturesClient.positions(..., with_mark_price=True)`` fills it from
+    ``premiumIndex``.
     """
 
     if not isinstance(payload, Mapping):
@@ -723,12 +738,15 @@ def parse_positions(payload: Any, *, include_flat: bool = False) -> List[Positio
         symbol = str(entry.get("symbol") or "").strip().upper()
         if not symbol:
             continue
+        pnl_key = (
+            "unrealizedProfit" if "unrealizedProfit" in entry else "unRealizedProfit"
+        )
         position = Position(
             symbol=symbol,
             quantity=_decimal_field(entry, "positionAmt"),
             entry_price=_decimal_field(entry, "entryPrice"),
             mark_price=_decimal_field(entry, "markPrice"),
-            unrealized_pnl=_decimal_field(entry, "unRealizedProfit"),
+            unrealized_pnl=_decimal_field(entry, pnl_key),
             leverage=_decimal_field(entry, "leverage"),
             isolated=_flag_field(entry, "isolated"),
             position_side=str(entry.get("positionSide") or "BOTH").upper(),
@@ -1110,15 +1128,56 @@ class BinanceFuturesClient:
         return parse_open_orders(payload)
 
     def positions(
-        self, symbol: Optional[str] = None, *, include_flat: bool = False
+        self,
+        symbol: Optional[str] = None,
+        *,
+        include_flat: bool = False,
+        with_mark_price: bool = False,
     ) -> List[Position]:
-        """Returns open positions, optionally filtered to one symbol."""
+        """Returns open positions, optionally filtered to one symbol.
+
+        ``with_mark_price`` fills ``Position.mark_price`` from
+        ``/fapi/v1/premiumIndex``, because an account payload does not carry it.
+        That costs one extra request, so it is opt-in: a caller that only needs
+        quantities and sides (a flatten, a cancel-all) can leave it off.
+        """
 
         wanted = str(symbol).strip().upper() if symbol else None
         parsed = parse_positions(self.account(), include_flat=include_flat)
-        if wanted is None:
-            return parsed
-        return [item for item in parsed if item.symbol == wanted]
+        if wanted is not None:
+            parsed = [item for item in parsed if item.symbol == wanted]
+        if with_mark_price and parsed:
+            parsed = self._with_mark_prices(parsed)
+        return parsed
+
+    def _with_mark_prices(self, positions: List[Position]) -> List[Position]:
+        """Overlays ``premiumIndex`` mark prices onto parsed positions.
+
+        One request covers every symbol when more than one position is open. A
+        symbol whose mark price cannot be resolved keeps whatever the payload
+        carried (usually zero) instead of failing the whole reconciliation.
+        """
+
+        params = {"symbol": positions[0].symbol} if len(positions) == 1 else None
+        payload = self._request("GET", "/fapi/v1/premiumIndex", params)
+        entries = payload if isinstance(payload, list) else [payload]
+        marks: Dict[str, Decimal] = {}
+        for entry in entries:
+            if not isinstance(entry, Mapping) or entry.get("markPrice") is None:
+                continue
+            mark_symbol = str(entry.get("symbol") or "").strip().upper()
+            if not mark_symbol:
+                continue
+            try:
+                marks[mark_symbol] = _decimal_field(entry, "markPrice")
+            except BinanceError:
+                continue
+        return [
+            replace(position, mark_price=marks[position.symbol])
+            if position.symbol in marks
+            else position
+            for position in positions
+        ]
 
     def set_leverage(self, symbol: str, leverage: Any) -> Mapping[str, Any]:
         """Sets the initial leverage for ``symbol`` (integer, 1..125)."""
