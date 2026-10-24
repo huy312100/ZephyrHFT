@@ -1,0 +1,38 @@
+{
+  "fingerprint": "a3aa7022dbbbab72",
+  "kind": "walk_forward_parameter_lock",
+  "metadata": {
+    "source": [
+      "data/sample_events.ndjson"
+    ],
+    "window_events": 400
+  },
+  "parameters": {
+    "costs": {
+      "maker_bps": -1.0,
+      "taker_bps": 5.0
+    },
+    "sizing": {
+      "initial_cash": 100000.0,
+      "order_quantity": "0.01"
+    },
+    "strategy": {
+      "gamma": 0.1,
+      "inventory_limit": 5.0,
+      "k": 5.0,
+      "ofi_cap": 3.0,
+      "ofi_decay": 0.95,
+      "ofi_sensitivity": 0.0,
+      "sigma": 0.02,
+      "time_horizon": 60.0,
+      "use_time_spread": true
+    },
+    "venue": {
+      "center": "30000",
+      "market_type": "CRYPTO",
+      "tick_size": "0.50"
+    }
+  },
+  "phase": 4,
+  "written_at": "2026-10-24T07:56:58+00:00"
+}

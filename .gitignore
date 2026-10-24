@@ -27,6 +27,11 @@ __pycache__/
 *.py[cod]
 *$py.class
 .pytest_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+.mypy_cache/
 venv/
 .venv/
 *.egg-info/

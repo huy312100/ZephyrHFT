@@ -113,7 +113,8 @@ def render_dashboard(engine: PaperMatchingEngine,
         f"  Micro-Price   : {micro:,.6f}",
         f"  Reservation   : {reservation:,.6f}",
         f"  Position (q)  : {engine.inventory:+,.6f}",
-        f"  Active Quotes : bid {_fmt_order(engine.active_bid)} | ask {_fmt_order(engine.active_ask)}",
+        f"  Active Quotes : bid {_fmt_order(engine.active_bid)}"
+        f" | ask {_fmt_order(engine.active_ask)}",
         f"  Trades        : {len(engine.trades_history)} executed"
         f" | self-match prevented {engine.self_trade_prevented}",
         f"  Cumulative PnL: {engine.total_pnl:+,.6f} "
@@ -246,4 +247,3 @@ def main(argv: Optional[List[str]] = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

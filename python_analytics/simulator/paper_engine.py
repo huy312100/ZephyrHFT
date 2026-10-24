@@ -137,7 +137,6 @@ def synthetic_depth_messages(mid: float = 30000.0, tick: float = 0.5,
         yield json.dumps(message)
 
 
-
 @dataclass
 class PaperOrder:
     order_id: int
@@ -733,6 +732,3 @@ class MarketDataFeed:
             result = self._on_depth(update)
             if inspect.isawaitable(result):
                 await result
-
-
-

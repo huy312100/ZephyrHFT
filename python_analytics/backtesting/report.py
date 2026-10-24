@@ -9,7 +9,7 @@ import csv
 import json
 import math
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
+from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 __all__ = ["export_report", "write_csv", "write_equity_png", "write_json"]
 

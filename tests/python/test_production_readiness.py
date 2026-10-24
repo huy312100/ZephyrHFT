@@ -1,0 +1,241 @@
+"""Unit tests for the Phase 5 production-readiness gate.
+
+The gate is only worth trusting if it can say *no*: these tests build a green
+report, then break one input at a time and assert the matching check turns red.
+The evidence book is kept small (400 frames) so the file runs in seconds.
+"""
+from __future__ import annotations
+
+import importlib.util
+import json
+import sys
+from pathlib import Path
+
+import pytest
+
+from python_analytics.simulator.paper_engine import synthetic_depth_messages
+
+ROOT = Path(__file__).resolve().parents[2]
+SCRIPT = ROOT / "scripts" / "generate_readiness_report.py"
+
+PHASE1 = {"phase1.configuration", "phase1.archive_integrity"}
+PHASE2 = {"phase2.engine_latency_p99", "phase2.engine_latency_p999",
+          "phase2.replay_throughput", "phase2.ledger_residual",
+          "phase2.order_rejections", "phase2.fill_activity"}
+PHASE3 = {"phase3.disconnect_storm", "phase3.latency_injection",
+          "phase3.deadman_switch"}
+PHASE4 = {"phase4.parameter_lock", "phase4.no_look_ahead",
+          "phase4.ledger_residual", "phase4.window_coverage"}
+GATED = PHASE1 | PHASE2 | PHASE3 | PHASE4
+
+
+def _load_module():
+    spec = importlib.util.spec_from_file_location("readiness_report_cli", SCRIPT)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module  # dataclasses need a registered module
+    spec.loader.exec_module(module)
+    return module
+
+
+@pytest.fixture(scope="module")
+def gate():
+    return _load_module()
+
+
+def _archive(path: Path, count: int = 400, start_ms: int = 1_700_000_000_000) -> Path:
+    """A Phase 1 shaped archive: chronological depth frames on a 250 ms grid."""
+    generator = synthetic_depth_messages(mid=100.0, tick=0.5, seed=5)
+    with path.open("w", encoding="utf-8") as handle:
+        for index in range(count):
+            message = json.loads(next(generator))
+            message["E"] = start_ms + index * 250
+            handle.write(json.dumps(message) + "\n")
+    return path
+
+
+@pytest.fixture(scope="module")
+def source(tmp_path_factory) -> Path:
+    return _archive(tmp_path_factory.mktemp("archive") / "events.ndjson")
+
+
+@pytest.fixture(scope="module")
+def green(gate, source, tmp_path_factory):
+    """The report the other tests perturb: small book, recomputed windows."""
+    out = tmp_path_factory.mktemp("report")
+    args = gate.parse_args([
+        "--source", str(source),
+        "--evidence-events", "400",
+        "--chaos-frames", "100",
+        "--recompute-walk-forward",
+        "--walk-forward-json", str(out / "missing.json"),
+    ])
+    return args, gate.build_report(args)
+
+
+# --------------------------------------------------------------------------- #
+# The happy path
+# --------------------------------------------------------------------------- #
+def test_green_run_is_go_and_gates_every_phase(green) -> None:
+    report = green[1]
+    assert report.verdict == "GO", report.summary_lines()
+    assert {check.id for check in report.gated} == GATED
+    assert {check.phase for check in report.checks} == {"phase1", "phase2",
+                                                        "phase3", "phase4"}
+
+
+def test_green_run_reports_measurements_not_booleans(green) -> None:
+    engine = green[1].evidence["engine"]
+    assert engine["events"] == 400
+    assert engine["orders_submitted"] > 0
+    assert engine["fills"] > 0
+    assert engine["latency_us"]["p99"] > 0.0
+    assert abs(engine["ledger_residual"]) <= 0.01
+    walk = green[1].evidence["walk_forward"]
+    assert walk["windows"] >= 2
+    assert walk["lock_fingerprint"]
+    assert walk["validation"]["parameter_lock"]["checks"] >= 1
+    assert walk["validation"]["look_ahead"]["chronology_verified"] is True
+
+
+def test_deadman_switch_proves_trip_and_recovery(green) -> None:
+    evidence = green[1].evidence["deadman"]
+    assert evidence["orders_allowed_before"] is True
+    assert evidence["poll_before_timeout_tripped"] is False
+    assert evidence["orders_blocked_while_halted"] is True
+    # The monitor reset alone must not clear a trading halt.
+    assert evidence["blocked_until_explicit_reset"] is True
+    assert evidence["orders_allowed_after_reset"] is True
+    assert evidence["retripped_after_recovery"] is True
+    assert evidence["trip_reason"].startswith("heartbeat_timeout")
+
+
+def test_chaos_profiles_are_attributed(green) -> None:
+    chaos = green[1].evidence["chaos"]
+    storm = chaos["disconnect_storm"]
+    assert storm["outages"] >= 1
+    assert storm["reconnects"] == storm["outages"]
+    assert storm["frames_seen"] == storm["frames_forwarded"] + storm["frames_dropped"]
+    injection = chaos["latency_injection"]
+    assert injection["latency_events"] >= 1
+    assert injection["max_latency_ms"] <= injection["latency_injected_ms"] + 1.0
+
+
+# --------------------------------------------------------------------------- #
+# It must be able to say NO
+# --------------------------------------------------------------------------- #
+def test_corrupt_archive_blocks_the_release(gate, tmp_path, source) -> None:
+    broken = tmp_path / "events.ndjson"
+    broken.write_text(source.read_text(encoding="utf-8") + "not-a-frame\n",
+                      encoding="utf-8")
+    args = gate.parse_args([
+        "--source", str(broken),
+        "--evidence-events", "200",
+        "--chaos-frames", "50",
+        "--recompute-walk-forward",
+        "--walk-forward-json", str(tmp_path / "missing.json"),
+        "--no-report",
+    ])
+    report = gate.build_report(args)
+    assert report.verdict == "NO-GO"
+    blocking = [check.id for check in report.failures]
+    assert blocking == ["phase1.archive_integrity"], blocking
+    integrity = next(c for c in report.checks if c.id == "phase1.archive_integrity")
+    assert "1 malformed" in integrity.measured
+
+
+def test_profitability_gate_is_opt_in(gate, green) -> None:
+    assert "phase4.oos_sharpe" not in {check.id for check in green[1].checks}
+    args, _ = green
+    greedy = gate.parse_args([
+        "--source", args.source,
+        "--evidence-events", "400",
+        "--chaos-frames", "100",
+        "--recompute-walk-forward",
+        "--walk-forward-json", args.walk_forward_json,
+        "--min-oos-sharpe", "1e6",
+    ])
+    report = gate.build_report(greedy)
+    assert report.verdict == "NO-GO"
+    assert [check.id for check in report.failures] == ["phase4.oos_sharpe"]
+
+
+def test_missing_source_is_a_usage_error(gate, tmp_path) -> None:
+    missing = str(tmp_path / "nope.ndjson")
+    with pytest.raises(FileNotFoundError):
+        gate.build_report(gate.parse_args(["--source", missing, "--no-report"]))
+    assert gate.main(["--source", missing, "--no-report"]) == gate.EXIT_USAGE
+
+
+def test_invalid_market_type_is_rejected_before_any_work(gate) -> None:
+    with pytest.raises(SystemExit):
+        gate.parse_args(["--market-type", "EQUITY"])
+    args = gate.parse_args(["--market-type", "crypto"])
+    assert gate.build_parameters(args, gate.load_settings()).market_type == "CRYPTO"
+
+
+# --------------------------------------------------------------------------- #
+# Artefacts
+# --------------------------------------------------------------------------- #
+def test_written_artefacts_round_trip(gate, green, tmp_path) -> None:
+    report = green[1]
+    json_path, md_path = report.write(tmp_path, stem="readiness")
+    payload = json.loads(json_path.read_text(encoding="utf-8"))
+    assert payload["verdict"] == "GO"
+    assert payload["summary"]["failed"] == 0
+    assert len(payload["checks"]) == len(report.checks)
+    assert payload["evidence"]["engine"]["events"] == 400
+    text = md_path.read_text(encoding="utf-8")
+    assert "## Verdict: **GO**" in text
+    for phase in report.PHASES:
+        assert f"## {phase[1]}" in text
+
+
+def test_existing_walk_forward_artefact_is_reused(gate, green, tmp_path) -> None:
+    args, recomputed = green
+    assert recomputed.inputs["walk_forward_origin"].startswith("computed")
+    artefact = tmp_path / "walk_forward.json"
+    artefact.write_text(json.dumps({
+        "report": "phase4_walk_forward",
+        "generated_at": "2026-01-01T00:00:00+00:00",
+        "inputs": {"window_events": 100},
+        "aggregate": {
+            "windows": 4, "events": 400, "initial_cash": 100000.0,
+            "final_equity": 100010.0, "net_pnl": 10.0, "sharpe_ratio": 0.75,
+            "sortino_ratio": 1.0, "max_drawdown_pct": 0.01,
+            "fill_ratio_pct": 12.0, "fills": 40, "positive_windows": 3,
+            "negative_windows": 1, "realized_pnl": 9.5,
+            "boundary_settled_pnl": -0.1, "unrealized_pnl": 0.5,
+            "ledger_residual": 1e-9, "window_hit_rate_pct": 75.0,
+        },
+        "validation": {
+            "parameter_lock": {"fingerprint": "deadbeef", "checks": 4},
+            "look_ahead": {"verified": True, "chronology_verified": True,
+                           "chronology_checks": 3, "windows_checked": 4},
+            "ledger": {"residual": 1e-9, "tolerance": 0.02},
+        },
+    }), encoding="utf-8")
+    reused = gate.parse_args([
+        "--source", args.source,
+        "--evidence-events", "400",
+        "--chaos-frames", "100",
+        "--walk-forward-json", str(artefact),
+    ])
+    report = gate.build_report(reused)
+    assert report.inputs["walk_forward_origin"].startswith("artifact")
+    walk = report.evidence["walk_forward"]
+    assert walk["windows"] == 4
+    assert walk["sharpe_ratio"] == pytest.approx(0.75)
+    assert walk["fill_ratio_pct"] == pytest.approx(12.0)
+    assert walk["windows_positive"] == 3
+    assert walk["lock_fingerprint"] == "deadbeef"
+
+
+def test_no_artefacts_without_consent(gate, green, tmp_path) -> None:
+    args, _ = green
+    assert gate.main([
+        "--source", args.source, "--evidence-events", "400",
+        "--chaos-frames", "100", "--recompute-walk-forward",
+        "--walk-forward-json", args.walk_forward_json,
+        "--no-report", "--report-dir", str(tmp_path),
+    ]) == gate.EXIT_GO
+    assert list(tmp_path.iterdir()) == []

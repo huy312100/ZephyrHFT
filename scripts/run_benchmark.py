@@ -5,11 +5,17 @@ Measures, in microseconds, the end-to-end latency from an L2 depth update
 entering the Python boundary through book application, Avellaneda-Stoikov quote
 generation, and C++ RiskGuard validation (via a post-only order submission).
 Runs a 50,000-tick stress loop with GC disabled and reports p50/p99/p99.9.
+
+``--json`` writes the same numbers for CI to archive, and ``--max-p99-us`` /
+``--max-p999-us`` turn the run into a latency budget: the process exits ``1``
+when the measured tail exceeds the ceiling, so a regression cannot reach a live
+session unnoticed.
 """
 from __future__ import annotations
 
 import argparse
 import gc
+import json
 import sys
 import time
 from pathlib import Path
@@ -149,6 +155,7 @@ def run_benchmark(ticks: int = 50000, seed: int = 0,
     gc.collect()
     return {
         "ticks": ticks,
+        "seed": seed,
         "total_us": _stats(totals),
         "parse_us": _stats(parse_us),
         "apply_us": _stats(apply_us),
@@ -186,12 +193,39 @@ def print_report(report: Dict[str, object]) -> None:
     print("=" * 80)
 
 
+def write_json(report: Dict[str, object], path: Path) -> Path:
+    """Persists the raw report so CI can archive and diff it between builds."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
+    return path
+
+
+def check_budget(report: Dict[str, object], max_p99_us: Optional[float],
+                 max_p999_us: Optional[float]) -> List[str]:
+    """Returns one human-readable message per exceeded latency ceiling."""
+    total = report["total_us"]
+    assert isinstance(total, dict)
+    breaches: List[str] = []
+    if max_p99_us is not None and total["p99"] > max_p99_us:
+        breaches.append(f"p99 {total['p99']:.3f}us > budget {max_p99_us:.3f}us")
+    if max_p999_us is not None and total["p999"] > max_p999_us:
+        breaches.append(
+            f"p99.9 {total['p999']:.3f}us > budget {max_p999_us:.3f}us")
+    return breaches
+
+
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--ticks", type=int, default=50000,
                         help="number of depth ticks in the stress loop")
     parser.add_argument("--seed", type=int, default=0,
                         help="seed for the synthetic market data")
+    parser.add_argument("--json", type=Path, default=None,
+                        help="write the raw latency report to this path")
+    parser.add_argument("--max-p99-us", type=float, default=None,
+                        help="exit 1 when the end-to-end p99 exceeds this ceiling")
+    parser.add_argument("--max-p999-us", type=float, default=None,
+                        help="exit 1 when the end-to-end p99.9 exceeds this ceiling")
     parser.add_argument("--log-level", default="WARNING")
     return parser.parse_args(argv)
 
@@ -202,10 +236,15 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.ticks <= 0:
         print("error: --ticks must be positive", file=sys.stderr)
         return 2
-    print_report(run_benchmark(ticks=args.ticks, seed=args.seed))
-    return 0
+    report = run_benchmark(ticks=args.ticks, seed=args.seed)
+    print_report(report)
+    if args.json is not None:
+        print(f"  json report         : {write_json(report, args.json)}")
+    breaches = check_budget(report, args.max_p99_us, args.max_p999_us)
+    for breach in breaches:
+        print(f"error: latency budget exceeded: {breach}", file=sys.stderr)
+    return 1 if breaches else 0
 
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

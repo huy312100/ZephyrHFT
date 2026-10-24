@@ -21,17 +21,38 @@ from .replay import (
     seed_from_snapshot,
 )
 from .report import export_report, write_csv, write_equity_png, write_json
+from .walk_forward import (
+    LockedParameters,
+    LookAheadError,
+    ParameterLockError,
+    WalkForwardError,
+    WalkForwardReport,
+    WalkForwardRunner,
+    WalkForwardWindow,
+    aggregate_windows,
+    read_lock_file,
+    write_lock_file,
+)
 
 __all__ = [
     "BacktestEngine",
     "BacktestResult",
     "BulkReplayer",
+    "LockedParameters",
+    "LookAheadError",
+    "ParameterLockError",
     "ReplaySummary",
+    "WalkForwardError",
+    "WalkForwardReport",
+    "WalkForwardRunner",
+    "WalkForwardWindow",
+    "aggregate_windows",
     "export_report",
     "fill_rows",
     "iter_jsonl",
     "max_drawdown",
     "quant_summary",
+    "read_lock_file",
     "replay_archive",
     "replay_archives",
     "replay_file",
@@ -44,4 +65,5 @@ __all__ = [
     "write_csv",
     "write_equity_png",
     "write_json",
+    "write_lock_file",
 ]

@@ -140,7 +140,15 @@ public:
         unrealized_pnl_ = notional(price - average_entry_, net_quantity_);
     }
 
-    [[nodiscard]] Notional equity() const noexcept { return cash_ + unrealized_pnl_; }
+    [[nodiscard]] Notional equity() const noexcept {
+        // Mark-to-market account value: cash plus inventory valued at the mark.
+        // `cash_` was debited/credited with the *full* fill notional, so the
+        // cost basis has to be added back before the unrealized term; otherwise
+        // an open position would report `-entry * qty` as a loss. Written as
+        // cost basis + unrealized (both already stored) instead of carrying a
+        // separate mark price, so a `net_quantity_` of zero collapses to cash.
+        return cash_ + notional(average_entry_, net_quantity_) + unrealized_pnl_;
+    }
 
     [[nodiscard]] paper_account_snapshot snapshot() const noexcept {
         paper_account_snapshot out;

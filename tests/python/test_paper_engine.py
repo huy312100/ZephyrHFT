@@ -353,4 +353,3 @@ def test_market_data_feed_replays_ndjson(tmp_path) -> None:
     assert float(bbo.bid_price) == pytest.approx(100.0)
     assert float(bbo.ask_price) == pytest.approx(101.0)
     assert feed.malformed == 1  # the "not-json" line
-

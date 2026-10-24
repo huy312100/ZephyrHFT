@@ -5,7 +5,7 @@ import gzip
 
 import pytest
 
-from python_analytics.bridge import PaperSession, ingest_batch
+from python_analytics.bridge import PaperSession
 from python_analytics.native import hft_native
 
 DEPTH1 = (

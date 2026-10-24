@@ -1,0 +1,196 @@
+name: Production readiness
+
+# The last gate before real money. It rebuilds the engine from the commit,
+# replays the *committed* parameter lock out-of-sample (`--from-lock`, so a
+# re-tune cannot slip in through the command line), and re-measures every
+# Phase 1-4 invariant. A NO-GO verdict fails the run; the uploaded artefacts
+# are the audit trail for that tag/dispatch.
+on:
+  workflow_dispatch:
+    inputs:
+      source:
+        description: "Archive whose Phase 1 integrity is verified"
+        required: false
+        default: "data/sample_events.ndjson"
+      evidence-events:
+        description: "Synthetic frames used for engine/chaos/OOS evidence"
+        required: false
+        default: "2000"
+      max-engine-p99-us:
+        description: "Engine p99 ceiling in microseconds"
+        required: false
+        default: "50"
+      min-oos-sharpe:
+        description: "Block when OOS Sharpe is below this (empty = report only)"
+        required: false
+        default: ""
+      recompute-walk-forward:
+        description: "Ignore reports/walk_forward.json and rerun the study"
+        type: boolean
+        required: false
+        default: false
+  schedule:
+    # Weekday nights: a dependency bump, a runner upgrade or a kernel change can
+    # invalidate a gate that passed on Friday.
+    - cron: "17 3 * * 1-5"
+  push:
+    tags: ["v*"]
+
+# A readiness run must finish once started: cancelling it half-way would leave
+# an operator unsure whether the last verdict refers to the current commit.
+concurrency:
+  group: readiness-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+  PYTHONUNBUFFERED: "1"
+  # `github.event.inputs` is empty for schedule/tag runs, so every input gets a
+  # fallback here rather than relying on the form defaults.
+  SOURCE: ${{ github.event.inputs.source || 'data/sample_events.ndjson' }}
+  EVIDENCE_EVENTS: ${{ github.event.inputs.evidence-events || '2000' }}
+  MAX_ENGINE_P99_US: ${{ github.event.inputs.max-engine-p99-us || '50' }}
+  MIN_OOS_SHARPE: ${{ github.event.inputs.min-oos-sharpe }}
+  RECOMPUTE_WALK_FORWARD: ${{ github.event.inputs.recompute-walk-forward || 'false' }}
+
+
+jobs:
+  gate:
+    name: GO / NO-GO gate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential cmake
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      # Supply chain first: it needs no build, and a CVE in a runtime dependency
+      # outranks anything this workflow is about to measure. PYSEC-2026-1845 is
+      # the dev-only pytest runner, ignored because pytest 9 drops Python 3.9
+      # (still an advertised runtime) — it never ships in the engine.
+      - name: Audit runtime dependencies (pip-audit)
+        run: |
+          python -m pip install "pip-audit>=2.7,<3"
+          pip-audit -r requirements.txt --ignore-vuln PYSEC-2026-1845
+
+      - name: Configure CMake
+        run: |
+          cmake -S cpp_engine -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -Dpybind11_DIR="$(python -m pybind11 --cmakedir)"
+
+      - name: Build C++ core and extension
+        run: cmake --build build --parallel
+
+      - name: Run C++ tests (CTest)
+        run: ctest --test-dir build --output-on-failure
+
+      - name: Run Python tests (pytest)
+        run: python -m pytest
+
+      # The lock is the artefact Phase 4 promises: replaying it must not drift
+      # by a single field, and a drifted lock must stop the run before it
+      # produces an OOS number that looks fine.
+      - name: Verify the committed parameter lock (walk-forward)
+        run: |
+          python scripts/run_walk_forward.py \
+            --source "$SOURCE" \
+            --window-events 400 \
+            --from-lock --lock-file config/walk_forward_lock.json \
+            --report-dir reports --stem walk_forward
+
+      # Informational on purpose: p99 wall-clock on a shared runner is dominated
+      # by scheduler noise, so the authoritative latency gate is the in-engine
+      # histogram measured by phase2.engine_latency_p99 below.
+      - name: Latency benchmark (informational)
+        run: |
+          python scripts/run_benchmark.py --ticks 20000 \
+            --json reports/latency_benchmark.json
+
+      - name: Production readiness gate
+        run: |
+          args=(
+            --source "$SOURCE"
+            --evidence-events "$EVIDENCE_EVENTS"
+            --max-engine-p99-us "$MAX_ENGINE_P99_US"
+            --report-dir reports
+            --stem production_readiness_report
+          )
+          if [ -n "$MIN_OOS_SHARPE" ]; then
+            args+=(--min-oos-sharpe "$MIN_OOS_SHARPE")
+          fi
+          if [ "$RECOMPUTE_WALK_FORWARD" = "true" ]; then
+            args+=(--recompute-walk-forward)
+          fi
+          python scripts/generate_readiness_report.py "${args[@]}"
+
+      - name: Publish the verdict to the job summary
+        if: always()
+        run: |
+          if [ -f reports/production_readiness_report.md ]; then
+            {
+              echo "## Production readiness — ${{ github.ref_name }}"
+              echo
+              cat reports/production_readiness_report.md
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "::error::the gate produced no report; see the step log above"
+          fi
+
+      - name: Upload the evidence bundle
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: readiness-reports
+          path: reports/
+          if-no-files-found: warn
+          retention-days: 30
+
+  # Tagged builds carry a deliberate human in the loop: bind the environment to
+  # required reviewers in the repository settings and the release cannot be
+  # attested until someone has read the verdict.
+  attest:
+    name: attest release verdict
+    needs: gate
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    environment: production
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: readiness-reports
+          path: reports
+
+      - name: Require a GO verdict for the tag
+        run: |
+          report=reports/production_readiness_report.md
+          test -f "$report" || { echo "::error::$report missing from the bundle"; exit 1; }
+          grep -q '^## Verdict: \*\*GO\*\*$' "$report" || {
+            echo "::error::refusing to attest a tag whose gate is not GO"
+            exit 1
+          }
+          {
+            echo "### Attestation for \`${GITHUB_REF_NAME}\`"
+            echo
+            echo "Commit \`${GITHUB_SHA}\` passed the production readiness gate."
+            echo "Fingerprint and per-phase evidence are in the artifact."
+          } >> "$GITHUB_STEP_SUMMARY"

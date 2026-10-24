@@ -1399,6 +1399,27 @@ void test_paper_account() {
     CHECK(account.maker_fills() == 1);
     CHECK(account.taker_fills() == 2);
     CHECK(account.equity() == N("100180.05"));
+
+    // Equity is mark-to-market: opening a position *at the mark* must not move
+    // it, and marking the book revalues the inventory. Regression guard for the
+    // cost-basis term in `equity()` (an open position used to report its whole
+    // entry notional as a loss, which poisoned drawdown/Sharpe curves).
+    hft::paper_account marked;
+    marked.reset(N("100000"), 0.0, 0.0);
+    (void)marked.apply_fill(P("30000"), Q("2"), hft::Side::Buy, true);
+    marked.mark(P("30000"));
+    CHECK(marked.equity() == N("100000"));
+    CHECK(marked.unrealized_pnl() == N("0"));
+    marked.mark(P("30100"));
+    CHECK(marked.equity() == N("100200"));
+    CHECK(marked.realized_pnl() == N("0"));
+
+    // ... and symmetrically for a short: a lower mark is a profit.
+    hft::paper_account short_account;
+    short_account.reset(N("100000"), 0.0, 0.0);
+    (void)short_account.apply_fill(P("30000"), Q("2"), hft::Side::Sell, true);
+    short_account.mark(P("29900"));
+    CHECK(short_account.equity() == N("100200"));
 }
 
 void test_paper_account_fractional_bps() {
