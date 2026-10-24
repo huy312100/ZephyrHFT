@@ -519,7 +519,7 @@ Other failure shapes:
 | Engine p99 is host-sensitive | Two runs on the same machine, differing only in background load, move p99 from `1.4 µs` to `11.3 µs` and p999 from `8 µs` to `724 µs` (§3.3). The 5.0 µs budget is only meaningful with the cores and the load characterised |
 | Chaos runs on a fake monotonic clock | Deterministic and fast, but it does not exercise the socket, the TLS stack or the kernel's retransmit timers |
 | The dead-man's switch is driven directly | It proves monitor + kill-switch semantics, not the full live feed loop that must eventually beat into it |
-| No exchange gateway, persistence or reconciliation exists | The gate cannot and does not certify them |
+| No production exchange gateway, persistence or reconciliation exists (the testnet pilot is connectivity/validation only) | The gate cannot and does not certify them |
 | `pip-audit` is a separate CI step | Its result is not part of the GO/NO-GO verdict; read the workflow log (one dev-only advisory is currently ignored) |
 | A report is a point-in-time snapshot | Re-run per release **and per host**; a `GO` from last month on another machine is not evidence about this one |
 
