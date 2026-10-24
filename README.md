@@ -1023,6 +1023,27 @@ WebSocket endpoint is also available to `scripts/ingest_l2.py` via
 `data_ingestion.exchange: binance_futures_testnet`; public market data needs no
 credentials.
 
+#### Live-trading primitives
+
+The pilot only needs "place, query, cancel". The same client also carries the
+order semantics a real-money session needs, all of them offline-tested in
+`tests/python/test_binance_live_primitives.py`:
+
+| Call | What it does |
+| --- | --- |
+| `new_order(..., post_only=True)` | Sends `timeInForce=GTX`, so the venue rejects a quote that would cross instead of filling it as a taker |
+| `new_order(..., reduce_only=True)` | Marks an exit order so it can only shrink a position |
+| `new_order(..., close_position=True)` | Sends `closePosition=true` (stop-type orders only); refuses a quantity or `reduceOnly` |
+| `stop_market_close_position(...)` | Venue-side `STOP_MARKET` on `MARK_PRICE` that flattens the position even if this process is gone |
+| `close_position_market(...)` / `flatten(...)` | Reduce-only market exit; `flatten` reads the live position first and picks the opposite side |
+| `positions(...)` / `open_orders(...)` | Typed `Position` / `OpenOrder` snapshots for start-up reconciliation; `positions(..., with_mark_price=True)` fills `markPrice` from `premiumIndex` (account rows omit it) and `notional` falls back to the entry price when no mark price is known |
+| `set_leverage(...)` / `set_margin_mode(...)` | Explicit 1..125x and `ISOLATED`/`CROSSED`; `-4046` ("no need to change") is treated as success |
+| `BinanceRateLimitError` | Raised for HTTP 429/418 so a caller can back off instead of retrying an order |
+
+Nothing here changes the pilot: it still refuses `BINANCE_ENV=production`, and
+`_request` still has no retry loop, so a failed submit can never be duplicated
+silently.
+
 ### Continuous integration
 
 `.github/workflows/testnet-pilot.yml` runs two jobs:

@@ -25,9 +25,9 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from decimal import ROUND_CEILING, ROUND_DOWN, Decimal, InvalidOperation
-from typing import Any, Callable, Dict, Mapping, Optional, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
 
 from python_analytics.utils.config import (
     BINANCE_DEFAULT_ENVIRONMENT,
@@ -45,6 +45,14 @@ DEFAULT_ENVIRONMENT = BINANCE_DEFAULT_ENVIRONMENT
 DEFAULT_STREAM_TYPE = "depth@100ms"
 DEFAULT_RECV_WINDOW_MS = 5000
 DEFAULT_TIMEOUT_S = 10.0
+
+#: Binance futures post-only time-in-force. ``GTX`` makes the venue *reject* an
+#: order that would cross instead of filling it, so a passive quote can never
+#: turn into a taker fill at the wrong fee tier.
+POST_ONLY_TIME_IN_FORCE = "GTX"
+
+#: HTTP statuses Binance uses for rate limiting (429) and IP bans (418).
+RATE_LIMIT_STATUSES = frozenset({418, 429})
 
 
 class BinanceError(RuntimeError):
@@ -93,6 +101,18 @@ class BinanceAPIError(BinanceError):
 
 class OrderValidationError(ValueError):
     """Raised when an order would violate the symbol's exchange filters."""
+
+
+class BinanceRateLimitError(BinanceAPIError):
+    """Raised on HTTP 429 (rate limit) or 418 (IP ban).
+
+    Kept separate from :class:`BinanceAPIError` so a trading loop can back off
+    instead of treating the rejection as an order-level problem.
+    """
+
+    @property
+    def is_ban(self) -> bool:
+        return self.status == 418
 
 
 class UnknownSymbolError(BinanceError):
@@ -579,6 +599,197 @@ def build_limit_order(
     )
 
 
+@dataclass(frozen=True)
+class Position:
+    """One symbol's futures position, normalised from the account payload."""
+
+    symbol: str
+    quantity: Decimal
+    entry_price: Decimal
+    mark_price: Decimal
+    unrealized_pnl: Decimal
+    leverage: Decimal
+    isolated: bool = False
+    position_side: str = "BOTH"
+
+    @property
+    def is_flat(self) -> bool:
+        return self.quantity == 0
+
+    @property
+    def side(self) -> str:
+        if self.quantity > 0:
+            return "BUY"
+        if self.quantity < 0:
+            return "SELL"
+        return "FLAT"
+
+    @property
+    def notional(self) -> Decimal:
+        """Quantity valued at the mark price, or at the entry price if unknown.
+
+        Account payloads carry no ``markPrice`` (only ``positionRisk`` does), so
+        a position parsed from one would otherwise report a notional of zero.
+        """
+
+        price = self.mark_price if self.mark_price > 0 else self.entry_price
+        return abs(self.quantity) * price
+
+    def closing_side(self) -> str:
+        """The side that reduces this position; raises when it is already flat."""
+
+        if self.quantity > 0:
+            return "SELL"
+        if self.quantity < 0:
+            return "BUY"
+        raise OrderValidationError(f"{self.symbol} is flat; nothing to close")
+
+    def describe(self) -> str:
+        return (
+            f"{self.symbol} {self.side} qty={decimal_text(self.quantity)} "
+            f"entry={decimal_text(self.entry_price)} "
+            f"mark={decimal_text(self.mark_price)} "
+            f"notional={decimal_text(self.notional)} "
+            f"uPnL={decimal_text(self.unrealized_pnl)} "
+            f"leverage={decimal_text(self.leverage)}x "
+            f"{'isolated' if self.isolated else 'cross'}"
+        )
+
+
+@dataclass(frozen=True)
+class OpenOrder:
+    """One resting order, normalised from ``/fapi/v1/openOrders``."""
+
+    symbol: str
+    order_id: Optional[int]
+    client_order_id: Optional[str]
+    side: str
+    order_type: str
+    price: Decimal
+    stop_price: Decimal
+    quantity: Decimal
+    executed_quantity: Decimal
+    status: str
+    reduce_only: bool = False
+    time_in_force: Optional[str] = None
+    close_position: bool = False
+
+    @property
+    def remaining_quantity(self) -> Decimal:
+        remaining = self.quantity - self.executed_quantity
+        return remaining if remaining > 0 else Decimal("0")
+
+    def describe(self) -> str:
+        stop = f" stop={decimal_text(self.stop_price)}" if self.stop_price > 0 else ""
+        return (
+            f"{self.symbol} {self.side} {self.order_type} "
+            f"id={self.order_id} clientId={self.client_order_id} "
+            f"qty={decimal_text(self.quantity)} "
+            f"filled={decimal_text(self.executed_quantity)} "
+            f"price={decimal_text(self.price)}{stop} status={self.status}"
+        )
+
+
+def _decimal_field(
+    payload: Mapping[str, Any], key: str, *, default: str = "0"
+) -> Decimal:
+    raw = payload.get(key, default)
+    try:
+        return _as_decimal(raw, key)
+    except OrderValidationError as exc:
+        raise BinanceError(f"unparseable {key} in exchange payload: {raw!r}") from exc
+
+
+def _flag_field(payload: Mapping[str, Any], key: str) -> bool:
+    raw = payload.get(key)
+    if isinstance(raw, bool):
+        return raw
+    return str(raw).strip().lower() == "true"
+
+
+def parse_positions(payload: Any, *, include_flat: bool = False) -> List[Position]:
+    """Extracts positions from an account payload.
+
+    Flat entries are dropped by default: a trading loop that iterates open risk
+    should never see the hundreds of zero-quantity rows an account payload
+    carries for every symbol the account has ever touched.
+
+    The venue is inconsistent about the unrealised-PnL key: an account payload
+    (``/fapi/v2/account``, ``/fapi/v3/account``) reports ``unrealizedProfit``
+    while ``/fapi/v2/positionRisk`` reports ``unRealizedProfit``. Both spellings
+    are accepted, so either payload can feed a reconciliation. Account rows also
+    carry no ``markPrice`` (that field is positionRisk-only), which is why
+    ``BinanceFuturesClient.positions(..., with_mark_price=True)`` fills it from
+    ``premiumIndex``.
+    """
+
+    if not isinstance(payload, Mapping):
+        raise BinanceError("account payload is not an object")
+    entries = payload.get("positions")
+    if entries is None:
+        return []
+    if not isinstance(entries, list):
+        raise BinanceError("account payload 'positions' is not a list")
+
+    positions: List[Position] = []
+    for entry in entries:
+        if not isinstance(entry, Mapping):
+            continue
+        symbol = str(entry.get("symbol") or "").strip().upper()
+        if not symbol:
+            continue
+        pnl_key = (
+            "unrealizedProfit" if "unrealizedProfit" in entry else "unRealizedProfit"
+        )
+        position = Position(
+            symbol=symbol,
+            quantity=_decimal_field(entry, "positionAmt"),
+            entry_price=_decimal_field(entry, "entryPrice"),
+            mark_price=_decimal_field(entry, "markPrice"),
+            unrealized_pnl=_decimal_field(entry, pnl_key),
+            leverage=_decimal_field(entry, "leverage"),
+            isolated=_flag_field(entry, "isolated"),
+            position_side=str(entry.get("positionSide") or "BOTH").upper(),
+        )
+        if position.is_flat and not include_flat:
+            continue
+        positions.append(position)
+    return positions
+
+
+def parse_open_orders(payload: Any) -> List[OpenOrder]:
+    """Normalises an ``/fapi/v1/openOrders`` payload into ``OpenOrder`` records."""
+
+    if payload is None:
+        return []
+    if not isinstance(payload, list):
+        raise BinanceError("openOrders payload is not a list")
+
+    orders: List[OpenOrder] = []
+    for entry in payload:
+        if not isinstance(entry, Mapping):
+            continue
+        raw_id = entry.get("orderId")
+        orders.append(
+            OpenOrder(
+                symbol=str(entry.get("symbol") or "").strip().upper(),
+                order_id=raw_id if isinstance(raw_id, int) else None,
+                client_order_id=entry.get("clientOrderId") or None,
+                side=str(entry.get("side") or "").strip().upper(),
+                order_type=str(entry.get("type") or "").strip().upper(),
+                price=_decimal_field(entry, "price"),
+                stop_price=_decimal_field(entry, "stopPrice"),
+                quantity=_decimal_field(entry, "origQty"),
+                executed_quantity=_decimal_field(entry, "executedQty"),
+                status=str(entry.get("status") or "UNKNOWN").strip().upper(),
+                reduce_only=_flag_field(entry, "reduceOnly"),
+                time_in_force=entry.get("timeInForce") or None,
+                close_position=_flag_field(entry, "closePosition"),
+            )
+        )
+    return orders
+
+
 Transport = Callable[[urllib.request.Request, float], Tuple[int, bytes]]
 
 
@@ -729,6 +940,10 @@ class BinanceFuturesClient:
                     code = int(raw_code)
             else:
                 message = str(payload or f"HTTP {status}")[:200]
+            if status in RATE_LIMIT_STATUSES:
+                raise BinanceRateLimitError(
+                    message, status=status, code=code, endpoint=path
+                )
             raise BinanceAPIError(
                 message, status=status, code=code, endpoint=path
             )
@@ -793,27 +1008,69 @@ class BinanceFuturesClient:
         symbol: str,
         side: str,
         order_type: str,
-        quantity: Any,
+        quantity: Any = None,
         price: Any = None,
+        stop_price: Any = None,
         time_in_force: Optional[str] = None,
         client_order_id: Optional[str] = None,
         reduce_only: Optional[bool] = None,
+        post_only: bool = False,
+        close_position: bool = False,
+        working_type: Optional[str] = None,
     ) -> Mapping[str, Any]:
+        """Submits one order, rejecting parameter combinations the venue refuses.
+
+        ``post_only`` maps to ``timeInForce=GTX``: Binance then *rejects* an
+        order that would cross instead of filling it, so a maker quote can never
+        silently become a taker fill. ``close_position`` submits
+        ``closePosition=true``, which the venue only accepts for stop-type orders
+        and which must carry neither a quantity nor ``reduceOnly``.
+        """
+
         params: Dict[str, Any] = {
             "symbol": str(symbol).upper(),
             "side": str(side).upper(),
             "type": str(order_type).upper(),
-            "quantity": _param_text(quantity),
             "newOrderRespType": "RESULT",
         }
+        if close_position:
+            if quantity is not None:
+                raise OrderValidationError(
+                    "closePosition orders must not set quantity; the venue closes "
+                    "the whole position"
+                )
+            if reduce_only is not None:
+                raise OrderValidationError(
+                    "closePosition and reduceOnly are mutually exclusive"
+                )
+            params["closePosition"] = "true"
+        elif quantity is None:
+            raise OrderValidationError(
+                "quantity is required unless close_position is set"
+            )
+        else:
+            params["quantity"] = _param_text(quantity)
+
         if price is not None:
             params["price"] = _param_text(price)
+        if stop_price is not None:
+            params["stopPrice"] = _param_text(stop_price)
+        if post_only:
+            requested = str(time_in_force or POST_ONLY_TIME_IN_FORCE).upper()
+            if requested != POST_ONLY_TIME_IN_FORCE:
+                raise OrderValidationError(
+                    f"post_only requires time_in_force={POST_ONLY_TIME_IN_FORCE}, "
+                    f"got {requested}"
+                )
+            time_in_force = POST_ONLY_TIME_IN_FORCE
         if time_in_force:
             params["timeInForce"] = str(time_in_force).upper()
         if client_order_id:
             params["newClientOrderId"] = str(client_order_id)
         if reduce_only is not None:
             params["reduceOnly"] = "true" if reduce_only else "false"
+        if working_type:
+            params["workingType"] = str(working_type).upper()
         return self._request("POST", "/fapi/v1/order", params, signed=True)
 
     @staticmethod
@@ -857,4 +1114,176 @@ class BinanceFuturesClient:
             "/fapi/v1/allOpenOrders",
             {"symbol": str(symbol).upper()},
             signed=True,
+        )
+
+    def open_orders(self, symbol: str) -> List[OpenOrder]:
+        """Lists the resting orders for ``symbol`` as typed records."""
+
+        payload = self._request(
+            "GET",
+            "/fapi/v1/openOrders",
+            {"symbol": str(symbol).upper()},
+            signed=True,
+        )
+        return parse_open_orders(payload)
+
+    def positions(
+        self,
+        symbol: Optional[str] = None,
+        *,
+        include_flat: bool = False,
+        with_mark_price: bool = False,
+    ) -> List[Position]:
+        """Returns open positions, optionally filtered to one symbol.
+
+        ``with_mark_price`` fills ``Position.mark_price`` from
+        ``/fapi/v1/premiumIndex``, because an account payload does not carry it.
+        That costs one extra request, so it is opt-in: a caller that only needs
+        quantities and sides (a flatten, a cancel-all) can leave it off.
+        """
+
+        wanted = str(symbol).strip().upper() if symbol else None
+        parsed = parse_positions(self.account(), include_flat=include_flat)
+        if wanted is not None:
+            parsed = [item for item in parsed if item.symbol == wanted]
+        if with_mark_price and parsed:
+            parsed = self._with_mark_prices(parsed)
+        return parsed
+
+    def _with_mark_prices(self, positions: List[Position]) -> List[Position]:
+        """Overlays ``premiumIndex`` mark prices onto parsed positions.
+
+        One request covers every symbol when more than one position is open. A
+        symbol whose mark price cannot be resolved keeps whatever the payload
+        carried (usually zero) instead of failing the whole reconciliation.
+        """
+
+        params = {"symbol": positions[0].symbol} if len(positions) == 1 else None
+        payload = self._request("GET", "/fapi/v1/premiumIndex", params)
+        entries = payload if isinstance(payload, list) else [payload]
+        marks: Dict[str, Decimal] = {}
+        for entry in entries:
+            if not isinstance(entry, Mapping) or entry.get("markPrice") is None:
+                continue
+            mark_symbol = str(entry.get("symbol") or "").strip().upper()
+            if not mark_symbol:
+                continue
+            try:
+                marks[mark_symbol] = _decimal_field(entry, "markPrice")
+            except BinanceError:
+                continue
+        return [
+            replace(position, mark_price=marks[position.symbol])
+            if position.symbol in marks
+            else position
+            for position in positions
+        ]
+
+    def set_leverage(self, symbol: str, leverage: Any) -> Mapping[str, Any]:
+        """Sets the initial leverage for ``symbol`` (integer, 1..125)."""
+
+        value = _as_decimal(leverage, "leverage")
+        if value != value.to_integral_value():
+            raise OrderValidationError(f"leverage must be an integer: {leverage!r}")
+        if not Decimal(1) <= value <= Decimal(125):
+            raise OrderValidationError(f"leverage must be within 1..125: {value}")
+        return self._request(
+            "POST",
+            "/fapi/v1/leverage",
+            {"symbol": str(symbol).upper(), "leverage": int(value)},
+            signed=True,
+        )
+
+    def set_margin_mode(
+        self, symbol: str, mode: str = "ISOLATED"
+    ) -> Mapping[str, Any]:
+        """Sets the margin mode; "no need to change" is treated as success.
+
+        Binance answers ``-4046`` when the account already uses that mode. That
+        is the state the caller asked for, so it must not abort a live start-up.
+        """
+
+        normalised = str(mode or "").strip().upper()
+        if normalised not in ("ISOLATED", "CROSSED"):
+            raise OrderValidationError(
+                f"margin mode must be ISOLATED or CROSSED: {mode!r}"
+            )
+        try:
+            return self._request(
+                "POST",
+                "/fapi/v1/marginType",
+                {"symbol": str(symbol).upper(), "marginType": normalised},
+                signed=True,
+            )
+        except BinanceAPIError as exc:
+            if exc.code != -4046:
+                raise
+            logger.info(
+                "%s already on %s margin (no change needed)", symbol, normalised
+            )
+            return {"code": -4046, "msg": "No need to change margin type."}
+
+    def close_position_market(
+        self,
+        *,
+        symbol: str,
+        side: str,
+        quantity: Any,
+        client_order_id: Optional[str] = None,
+    ) -> Mapping[str, Any]:
+        """Closes ``quantity`` with a ``reduceOnly`` market order."""
+
+        return self.new_order(
+            symbol=symbol,
+            side=side,
+            order_type="MARKET",
+            quantity=quantity,
+            client_order_id=client_order_id,
+            reduce_only=True,
+        )
+
+    def flatten(
+        self, symbol: str, *, client_order_id: Optional[str] = None
+    ) -> Mapping[str, Any]:
+        """Closes the whole ``symbol`` position in one reduceOnly market order."""
+
+        position = next(iter(self.positions(symbol)), None)
+        if position is None:
+            raise OrderValidationError(
+                f"{symbol} has no open position; nothing to flatten"
+            )
+        return self.close_position_market(
+            symbol=position.symbol,
+            side=position.closing_side(),
+            quantity=abs(position.quantity),
+            client_order_id=client_order_id,
+        )
+
+    def stop_market_close_position(
+        self,
+        *,
+        symbol: str,
+        side: str,
+        stop_price: Any,
+        client_order_id: Optional[str] = None,
+        working_type: str = "MARK_PRICE",
+    ) -> Mapping[str, Any]:
+        """Places the venue-side dead man's switch for an open position.
+
+        The stop lives on Binance's matcher, so it still fires when this process
+        is dead, asleep, or disconnected. ``working_type`` defaults to the mark
+        price to keep a single wick on the last trade from flattening the book.
+        """
+
+        trigger = _as_decimal(stop_price, "stop_price")
+        if trigger <= 0:
+            raise OrderValidationError(f"stop_price must be positive: {trigger}")
+        return self.new_order(
+            symbol=symbol,
+            side=side,
+            order_type="STOP_MARKET",
+            stop_price=trigger,
+            client_order_id=client_order_id,
+            close_position=True,
+            working_type=working_type,
         )

@@ -18,7 +18,7 @@ on:
       - "python_analytics/exchange/**"
       - "python_analytics/utils/config.py"
       - "scripts/run_testnet_pilot.py"
-      - "tests/python/test_binance_testnet.py"
+      - "tests/python/test_binance_*.py"
       - "requirements.txt"
       - ".github/workflows/testnet-pilot.yml"
   pull_request:
@@ -27,7 +27,7 @@ on:
       - "python_analytics/exchange/**"
       - "python_analytics/utils/config.py"
       - "scripts/run_testnet_pilot.py"
-      - "tests/python/test_binance_testnet.py"
+      - "tests/python/test_binance_*.py"
       - "requirements.txt"
       - ".github/workflows/testnet-pilot.yml"
   workflow_dispatch:
@@ -101,7 +101,10 @@ jobs:
 
       # The fake transport keeps this suite hermetic: no keys, no sockets.
       - name: Run the offline pilot suite
-        run: python -m pytest tests/python/test_binance_testnet.py
+        run: |
+          python -m pytest \
+            tests/python/test_binance_testnet.py \
+            tests/python/test_binance_live_primitives.py
 
       - name: CLI smoke test
         run: python scripts/run_testnet_pilot.py --help
