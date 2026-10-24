@@ -75,9 +75,10 @@ strategy:
 backtest:
   event_limit: 100000
   record_fills: true
-  # Phase 3 bulk-replay defaults.
-  maker_bps: -1
-  taker_bps: 5
+  # Phase 3 bulk-replay defaults. Fee/rebate rates are fractional basis points
+  # (0.5 == 0.5 bps); a negative maker_bps is a rebate.
+  maker_bps: -1.0
+  taker_bps: 5.0
   initial_cash: 100000.0
   batch_size: 64
   frames_per_hook: 1
@@ -89,7 +90,8 @@ backtest:
 paper_trading:
   tick_size: "0.1"
   center: "84570"
-  maker_bps: -1
-  taker_bps: 5
+  # Fractional basis points are supported (0.5 == 0.5 bps).
+  maker_bps: -1.0
+  taker_bps: 5.0
   initial_cash: 100000.0
   order_quantity: "0.01"

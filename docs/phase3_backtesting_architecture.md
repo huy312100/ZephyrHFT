@@ -94,13 +94,17 @@ Additions (existing `replay_lines`/`replay_file` untouched):
 
 ```python
 class BulkReplayer:
-    def __init__(self, *, tick_size, center, maker_bps=-1, taker_bps=5,
+    def __init__(self, *, tick_size, center, maker_bps=-1.0, taker_bps=5.0,
                  initial_cash=0.0, batch_size=64, frames_per_hook=1,
                  seed=None, order_quantity="0.05"): ...
     def reset(self) -> None
     def replay(self, sources, strategy=None, event_limit=0) -> ReplaySummary
     def replay_archives(self, pattern, strategy=None, event_limit=0) -> ReplaySummary
 ```
+
+* `maker_bps`/`taker_bps` are **fractional** basis points (`0.5` ⇒ 0.5 bps). They are
+  never rounded in Python; the C++ ledger freezes them into micro-bps so the fill path
+  stays integer-only. Negative `maker_bps` is a rebate.
 
 * `iter_gzip_ndjson` already streams gzip line-by-line (no full-file materialisation).
 * `frames_per_hook == 1` ⇒ one-line `ingest_lines([line])` batches, strategy runs per
@@ -189,8 +193,9 @@ the p50/p99/p999 reported by `quant_summary` are engine-true, not Python-inclusi
 
 | Surface | Guarantee |
 | --- | --- |
-| `cpp_engine/include/{matching,paper_engine,ingest}.hpp` | untouched; no C++ changes required |
-| `hft_native` 0.2.0 bindings | consumed as-is |
+| `cpp_engine/include/{matching,ingest}.hpp` | untouched |
+| `paper_account.hpp` / `paper_engine.hpp` | fee rates accept `double` bps, frozen into micro-bps; whole-bps results are bit-identical to the previous `int32` path |
+| `hft_native` 0.2.0 bindings | `PaperEngine(..., maker_bps: float = 0.0, taker_bps: float = 5.0, ...)`; int callers still work |
 | `replay_lines`/`replay_file` | signatures unchanged |
 | `metrics.summarize`/`sharpe_ratio`/`max_drawdown`/`fill_rows` | unchanged |
 | `grid_search`/`sortino_ratio`/`backtest_parameters` | signatures unchanged (internals rewired) |

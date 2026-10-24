@@ -339,6 +339,11 @@ python3 -c "from python_analytics.strategies.optimizer import grid_search; \
   tick_size=0.5, center=100.0, order_quantity=0.1).best_params)"
 ```
 
+Fee flags are fractional basis points — `--taker-bps 0.5` charges 0.005% and a
+negative `--maker-bps` models a rebate. `--report` accepts an output directory or
+a `.json` path (resolved to its parent directory), and `--plot` adds
+`equity.png` when `matplotlib` is installed.
+
 | Stage | Behaviour |
 | --- | --- |
 | Replay | `BulkReplayer` streams `.ndjson.gz` archives through `hft_native.ingest_lines()` (zero-allocation C++ matching), with an optional per-frame strategy hook, gap accounting and REST-snapshot seeding |

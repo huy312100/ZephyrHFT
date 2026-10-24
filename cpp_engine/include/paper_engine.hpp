@@ -52,8 +52,10 @@ public:
     static constexpr std::size_t kFillRing = 4096;
     static constexpr std::size_t kMaxCrossed = 256;
 
-    paper_engine(Price tick_size, Price center, std::int32_t maker_bps = 0,
-                 std::int32_t taker_bps = 5,
+    // Fee rates accept fractional basis points (e.g. 0.5); the ledger freezes
+    // them into micro-bps so the matching path remains integer-only.
+    paper_engine(Price tick_size, Price center, double maker_bps = 0.0,
+                 double taker_bps = 5.0,
                  Notional initial_cash = Notional{}) noexcept
         : book_(tick_size, center),
           center_(center),
@@ -345,8 +347,8 @@ private:
     paper_metrics counters_{};
     Price center_{};
     Price mark_price_{};
-    std::int32_t maker_bps_{0};
-    std::int32_t taker_bps_{0};
+    double maker_bps_{0.0};  // basis points, fractions preserved
+    double taker_bps_{5.0};  // basis points, fractions preserved
     Notional initial_cash_{};
     std::uint64_t last_final_update_id_{0};
     Notional last_slippage_{};

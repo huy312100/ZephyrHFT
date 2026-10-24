@@ -267,15 +267,18 @@ class BulkReplayer:
     """
 
     def __init__(self, *, tick_size: Union[str, float], center: Union[str, float],
-                 maker_bps: int = -1, taker_bps: int = 5,
+                 maker_bps: float = -1.0, taker_bps: float = 5.0,
                  initial_cash: float = 0.0, batch_size: int = 64,
                  frames_per_hook: int = 1,
                  seed: Optional[Mapping[str, Any]] = None,
                  order_quantity: Union[str, float] = "0.05") -> None:
         self._tick_size = str(tick_size)
         self._center = str(center)
-        self._maker_bps = int(maker_bps)
-        self._taker_bps = int(taker_bps)
+        # Fee rates are fractional basis points: 0.5 is a valid 0.5 bps charge,
+        # so they are kept as floats and passed straight to the C++ ledger, which
+        # freezes them into micro-bps. Never round/truncate them here.
+        self._maker_bps = float(maker_bps)
+        self._taker_bps = float(taker_bps)
         self._initial_cash = float(initial_cash)
         self._batch_size = max(1, int(batch_size))
         self._frames_per_hook = max(1, int(frames_per_hook))

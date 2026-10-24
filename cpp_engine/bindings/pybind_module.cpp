@@ -689,6 +689,10 @@ PYBIND11_MODULE(hft_native, m) {
         .def("equity", &paper_account::equity)
         .def("net_quantity", &paper_account::net_quantity)
         .def("average_entry_price", &paper_account::average_entry_price)
+        .def("maker_bps", &paper_account::maker_bps,
+             "effective maker rate in bps (fractional values preserved)")
+        .def("taker_bps", &paper_account::taker_bps,
+             "effective taker rate in bps (fractional values preserved)")
         .def("snapshot", &paper_account::snapshot);
 
     py::class_<match_leg>(m, "MatchLeg")
@@ -739,9 +743,9 @@ PYBIND11_MODULE(hft_native, m) {
         .def_readonly("account", &paper_metrics::account);
 
     py::class_<paper_engine>(m, "PaperEngine")
-        .def(py::init<Price, Price, std::int32_t, std::int32_t, Notional>(),
-             py::arg("tick_size"), py::arg("center"), py::arg("maker_bps") = 0,
-             py::arg("taker_bps") = 5, py::arg("initial_cash") = Notional{})
+        .def(py::init<Price, Price, double, double, Notional>(),
+             py::arg("tick_size"), py::arg("center"), py::arg("maker_bps") = 0.0,
+             py::arg("taker_bps") = 5.0, py::arg("initial_cash") = Notional{})
         .def("reset", &paper_engine::reset)
         .def("process_update", &paper_engine::process_update, py::arg("update"))
         .def("submit", &paper_engine::submit, py::arg("request"))
