@@ -5,6 +5,7 @@ into fixed-point integers so no binary floating point ever reaches the engine.
 """
 from __future__ import annotations
 
+import os
 import re
 from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
@@ -22,7 +23,25 @@ DEFAULT_CONFIG_PATH = PROJECT_ROOT / "config" / "settings.yaml"
 # (or overridden per run with ``data_ingestion.ws_base_url``).
 EXCHANGE_ENDPOINTS: Dict[str, str] = {
     "binance_futures": "wss://fstream.binance.com/ws",
+    "binance_futures_testnet": "wss://stream.binancefuture.com/ws",
     "binance_spot": "wss://stream.binance.com:9443/ws",
+}
+
+# Binance USDⓈ-M Futures environments selected by ``BINANCE_ENV``. Only public
+# endpoint metadata lives here: API keys and secrets are read from the
+# ``BINANCE_API_KEY`` / ``BINANCE_API_SECRET`` environment variables so they are
+# never written to (or committed with) the YAML configuration.
+BINANCE_ENV_VAR = "BINANCE_ENV"
+BINANCE_DEFAULT_ENVIRONMENT = "testnet"
+BINANCE_ENDPOINTS: Dict[str, Dict[str, str]] = {
+    "testnet": {
+        "rest": "https://testnet.binancefuture.com",
+        "ws": "wss://stream.binancefuture.com/ws",
+    },
+    "production": {
+        "rest": "https://fapi.binance.com",
+        "ws": "wss://fstream.binance.com/ws",
+    },
 }
 
 COMPRESSION_CHOICES: Tuple[str, ...] = ("gzip", "none")
@@ -30,6 +49,38 @@ COMPRESSION_CHOICES: Tuple[str, ...] = ("gzip", "none")
 
 class ConfigError(ValueError):
     """Raised when the configuration file is missing or invalid."""
+
+
+def resolve_binance_environment(
+    value: Optional[str] = None,
+    *,
+    environ: Optional[Mapping[str, str]] = None,
+) -> str:
+    """Resolves ``testnet`` / ``production``, defaulting to the testnet.
+
+    An explicit ``value`` wins over ``BINANCE_ENV``; an empty variable falls
+    back to ``testnet`` so a bare shell cannot accidentally point a pilot at
+    production funds.
+    """
+
+    env = os.environ if environ is None else environ
+    candidate = value if value is not None else env.get(BINANCE_ENV_VAR)
+    resolved = str(candidate or BINANCE_DEFAULT_ENVIRONMENT).strip().lower()
+    if resolved not in BINANCE_ENDPOINTS:
+        allowed = ", ".join(sorted(BINANCE_ENDPOINTS))
+        raise ConfigError(f"'{BINANCE_ENV_VAR}' must be one of {allowed}: {candidate!r}")
+    return resolved
+
+
+def binance_endpoints(
+    environment: Optional[str] = None,
+    *,
+    environ: Optional[Mapping[str, str]] = None,
+) -> Dict[str, str]:
+    """Returns the REST/WebSocket base URLs for a Binance Futures environment."""
+
+    resolved = resolve_binance_environment(environment, environ=environ)
+    return dict(BINANCE_ENDPOINTS[resolved])
 
 
 @dataclass(frozen=True)

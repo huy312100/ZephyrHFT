@@ -48,6 +48,10 @@ used at the orchestration/analytics boundary.
   that stamps every frame with `time.time_ns()`, reports venue-to-host latency
   percentiles and archives the raw payloads as gzip NDJSON roll files with
   backoff reconnection and graceful shutdown.
+- **Binance Futures testnet pilot** (`scripts/run_testnet_pilot.py`): signed REST
+  (HMAC-SHA256, stdlib only), `exchangeInfo` filter validation, balance check,
+  L2 depth sample and a dry-run or place → query → cancel order lifecycle against
+  the testnet. Refuses to run against production.
 
 ## Phase status
 
@@ -82,9 +86,11 @@ python3 scripts/generate_readiness_report.py
 │   ├── strategies/         # strategy interface, A-S maker, optimizer
 │   ├── simulator/          # paper matching engine + async market-data feed
 │   ├── backtesting/        # replay pipeline and metrics
+│   ├── exchange/           # Binance Futures env config + signed REST client
 │   └── utils/              # YAML config and logging
 ├── scripts/
 │   ├── run_paper_trading.py  # 60s live/mock paper-trading dashboard
+│   ├── run_testnet_pilot.py  # Binance Futures testnet micro-pilot (signed REST)
 │   ├── ingest_l2.py          # real-time L2 capture -> gzip NDJSON roll files
 │   ├── run_walk_forward.py   # Phase 4 OOS study + parameter lock
 │   ├── generate_readiness_report.py  # Phase 5 GO/NO-GO gate
@@ -202,12 +208,25 @@ print(ack.accepted(), engine.position().net_quantity)
   streaks plus a manual `trip()`); the guards are off when a limit is `0`.
 - `data_ingestion.*`: real-time L2 capture (`exchange`, `symbol`,
   `stream_type`, `storage_path`, `compression`, roll-file rotation, telemetry
-  cadence and reconnect backoff) used by `scripts/ingest_l2.py`.
+  cadence and reconnect backoff) used by `scripts/ingest_l2.py`. Set
+  `exchange: binance_futures_testnet` to capture from the testnet stream.
 - `strategy.*`: quote width, size, inventory cap and skew.
 - `backtest.*`: replay limits and fill recording.
 
 All decimals are parsed on the native side; no binary floating point is used
 for prices. Invalid YAML raises `ConfigError` with the offending section.
+
+The testnet pilot does **not** read credentials from YAML. It uses three
+environment variables only:
+
+| Variable | Meaning |
+| --- | --- |
+| `BINANCE_ENV` | `testnet` (default) or `production`; the pilot refuses anything but `testnet` |
+| `BINANCE_API_KEY` | Testnet API key, sent as `X-MBX-APIKEY` |
+| `BINANCE_API_SECRET` | Testnet secret, used for the HMAC-SHA256 signature |
+
+Secrets are never logged, never included in `repr()` and never written to disk.
+An empty or missing `BINANCE_ENV` resolves to `testnet`.
 
 ## Tests
 
@@ -227,9 +246,10 @@ risk rejections, latency buckets, JSON/WebSocket parsing, average-cost PnL,
 IOC/FOK handling, the kill switch and the heartbeat dead-man's switch. Python
 tests exercise the bindings (`test_bindings.py`), the Avellaneda-Stoikov
 strategy (`test_strategy.py`), the paper engine and feed
-(`test_paper_engine.py`), the parameter optimizer (`test_optimizer.py`) and the
-chaos layer end-to-end (`test_chaos_network.py`, which drives
-`tests/chaos_network_test.py` itself).
+(`test_paper_engine.py`), the parameter optimizer (`test_optimizer.py`), the
+testnet REST client and pilot (`test_binance_testnet.py`, fully offline via an
+injected transport) and the chaos layer end-to-end (`test_chaos_network.py`,
+which drives `tests/chaos_network_test.py` itself).
 
 ### CMake / CTest not on `PATH`
 
@@ -934,8 +954,118 @@ host → tag, with the `production` environment reviewer signing the attestation
 The copy-pasteable checklist lives in
 [`docs/phase5_production_readiness.md` §10](docs/phase5_production_readiness.md#10-pre-live-promotion-checklist).
 
+## Binance Futures testnet micro-pilot
+
+`scripts/run_testnet_pilot.py` is the first end-to-end exchange loop: it signs
+REST requests, validates orders against the live `exchangeInfo` filters, checks
+the account balance, samples the L2 depth stream and exercises the order
+lifecycle. It is deliberately **testnet-only** and defaults to a dry run.
+
+```bash
+# Optional: keep the keys in an untracked .env (see .env.example)
+cp .env.example .env && set -a && . ./.env && set +a
+
+export BINANCE_ENV=testnet          # optional: this is the default
+export BINANCE_API_KEY=...          # from testnet.binancefuture.com
+export BINANCE_API_SECRET=...
+
+# Connectivity, filters, balance, 10 s of L2, and a validated dry-run order
+python3 scripts/run_testnet_pilot.py
+
+# Skip the WebSocket probe (useful on a REST-only host)
+python3 scripts/run_testnet_pilot.py --skip-l2
+
+# Place -> query -> cancel one passive limit order on the testnet
+python3 scripts/run_testnet_pilot.py --skip-l2 --order-test submit
+
+# Faster L2 sample with a longer order offset from mark price
+python3 scripts/run_testnet_pilot.py --l2-seconds 5 --order-offset-bps 100
+```
+
+| Check | What it proves |
+| --- | --- |
+| REST connectivity | `/fapi/v1/ping` and `/fapi/v1/time`; request timestamps are offset by the measured clock skew |
+| Exchange filters | `exchangeInfo` parsed for tick size, step size, minQty, minNotional and PERCENT_PRICE |
+| Mark price | `/fapi/v1/premiumIndex` returns a usable reference price |
+| Account balance | Signed `/fapi/v3/account` (falling back to `/fapi/v2/account` on 404) shows available USDT |
+| L2 depth stream | `wss://stream.binancefuture.com/ws/<symbol>@depth20@100ms` delivers parsable best bid/ask frames |
+| Order sizing | The requested quantity is step-aligned and satisfies minNotional at the current mark |
+| Order lifecycle | `dry-run` (default) builds and validates the order; `submit` posts it, queries it, cancels it and confirms the terminal state |
+
+Endpoints come from `BINANCE_ENDPOINTS` in `python_analytics/utils/config.py`:
+testnet REST `https://testnet.binancefuture.com`, testnet WS
+`wss://stream.binancefuture.com/ws`; production REST `https://fapi.binance.com`,
+production WS `wss://fstream.binance.com/ws`.
+
+**Exit codes:** `0` all checks passed, `1` at least one check failed, `2`
+configuration or usage error (missing credentials, unknown `BINANCE_ENV`,
+production requested), `130` interrupted.
+
+**Safety rails.**
+
+- `BINANCE_ENV=production` is refused before any connection is opened.
+- Credentials come from the environment only; `repr()` and every log line mask
+  the key and never print the secret.
+- A BUY limit rests below mark (`--order-offset-bps`, default 50, must be
+  positive) and a SELL above it, so the order is never immediately marketable.
+- `--order-test submit` is the only mode that sends `POST /fapi/v1/order`, and
+  it is explicitly logged as such.
+- `BTCUSDT` enforces a `minNotional` (100 USDT on mainnet, 50 USDT on the
+  current testnet), so a small `--quantity` can fail even though it meets
+  `minQty`. The pilot computes the exact minimum (`required_quantity`) at the
+  live mark and reports it instead of silently changing your size; on the
+  current testnet mark, `0.001 BTC` clears the 50 USDT floor comfortably.
+
+The client (`python_analytics/exchange/binance_futures.py`) is stdlib-only
+(`urllib`, `hmac`, `hashlib`) and takes an injectable transport, so
+`tests/python/test_binance_testnet.py` runs entirely offline. The testnet
+WebSocket endpoint is also available to `scripts/ingest_l2.py` via
+`data_ingestion.exchange: binance_futures_testnet`; public market data needs no
+credentials.
+
+### Continuous integration
+
+`.github/workflows/testnet-pilot.yml` runs two jobs:
+
+- **offline pilot tests** — on pushes and pull requests that touch the exchange
+  surface: `flake8`, `pytest tests/python/test_binance_testnet.py`, the `--help`
+  smoke test, and a check that missing credentials exit `2`. No network, no
+  secrets, so it is safe on forks.
+- **live testnet** — manual `workflow_dispatch` only, gated on the offline job.
+  It runs against `https://testnet.binancefuture.com` using the
+  `BINANCE_API_KEY` / `BINANCE_API_SECRET` **environment secrets** of the
+  `testnet` environment.
+
+Configure the secrets once (Settings → Environments → `testnet`; add a required
+reviewer there if a dispatch should need a second pair of eyes):
+
+```bash
+gh secret set BINANCE_API_KEY --env testnet
+gh secret set BINANCE_API_SECRET --env testnet
+```
+
+Then: Actions → **Testnet pilot** → Run workflow. The inputs mirror the CLI
+(`order-test`, `symbol`, `quantity`, `l2-seconds`, `min-ticks`, `skip-l2`), plus
+`confirm-submit` — which must be `true` before `order-test: submit` will place
+an order — and `runner`, which lets you target a self-hosted label when Binance
+answers GitHub's egress with HTTP 451 (restricted region). The workflow never
+schedules the live job and never stores credentials in the repository; the run
+log and its PASS/FAIL table are uploaded as the `testnet-pilot-log` artifact and
+mirrored to the job summary.
+
 ## Troubleshooting
 
+- **`BINANCE_API_KEY and BINANCE_API_SECRET not set`** — the pilot reads the
+  environment only; `.env` is not auto-loaded. Run
+  `set -a && . ./.env && set +a` (or export both variables) in the same shell.
+- **`pilot verdict: FAIL` with `Account balance`** — the key lacks testnet USDT.
+  Claim funds from the testnet faucet, or run with `--order-test none` for a
+  read-only connectivity check.
+- **`quantity ... is below minNotional`** — the pilot prints the exact minimum
+  for the current mark; raise `--quantity` accordingly.
+- **Order rejected with `-4061`** — the testnet account is in hedge mode; the
+  pilot submits one-way orders, so switch the account to one-way mode (or add
+  `positionSide` support) before using `--order-test submit`.
 - **`ModuleNotFoundError: No module named 'python_analytics'`** — run scripts
   from the repository root (`python3 scripts/...`); the scripts bootstrap
   `sys.path` themselves.
@@ -1015,7 +1145,11 @@ The copy-pasteable checklist lives in
 - Feed sequence gaps are not repaired and there is no snapshot bootstrap:
   `first_update_id`/`final_update_id` are parsed for diagnostics, but the
   operator must reconnect or resynchronise after a gap.
-- There is no persistence, account reconciliation or exchange order gateway.
+- There is no persistence, account reconciliation or production exchange order
+  gateway. `python_analytics/exchange/binance_futures.py` adds a signed REST
+  client and `scripts/run_testnet_pilot.py` exercises it against the Binance
+  Futures **testnet** only; no order state is persisted or reconciled across
+  restarts.
 - L2 capture is **raw**: `ingest_l2.py` archives exchange payloads but does not
   normalise them into `L2Book` updates or repair sequence gaps, there is no
   snapshot bootstrap, and one process handles one symbol/stream.
