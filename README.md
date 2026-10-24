@@ -49,6 +49,24 @@ used at the orchestration/analytics boundary.
   percentiles and archives the raw payloads as gzip NDJSON roll files with
   backoff reconnection and graceful shutdown.
 
+## Phase status
+
+| Phase | Scope | Status | Reference |
+| --- | --- | --- | --- |
+| 1 | Real-time L2 capture to gzip NDJSON | Complete | [`docs/phase1_roadmap.md`](docs/phase1_roadmap.md) |
+| 2 | Zero-allocation paper engine, paper trading | Complete | [`docs/phase2_technical_specification.md`](docs/phase2_technical_specification.md) |
+| 3 | Batch replay, OFI alpha, optimisation, chaos | Complete | [`docs/phase3_backtesting_architecture.md`](docs/phase3_backtesting_architecture.md) |
+| 3.1 / 3.2 | Network chaos injection, heartbeat dead-man's switch | Complete | [Chaos & stress testing](#chaos--stress-testing-phase-31--32) |
+| **4** | **Walk-forward OOS validation, fingerprinted parameter lock** | **Complete / verified** | [`docs/phase4_walk_forward.md`](docs/phase4_walk_forward.md) |
+| **5** | **Production readiness gate, GO / NO-GO verdict** | **Complete / verified (GO, 15/15 gated checks)** | [`docs/phase5_production_readiness.md`](docs/phase5_production_readiness.md) |
+
+The final pre-live check is one command:
+
+```bash
+python3 scripts/generate_readiness_report.py
+# exit 0 = GO, exit 1 = NO-GO, exit 2 = usage error
+```
+
 ## Repository layout
 
 ```text
@@ -71,10 +89,17 @@ used at the orchestration/analytics boundary.
 │   ├── run_walk_forward.py   # Phase 4 OOS study + parameter lock
 │   ├── generate_readiness_report.py  # Phase 5 GO/NO-GO gate
 │   └── run_benchmark.py      # tick-to-quote latency benchmark
+├── docs/
+│   ├── phase1_roadmap.md
+│   ├── phase2_technical_specification.md
+│   ├── phase3_backtesting_architecture.md
+│   ├── phase4_walk_forward.md      # OOS mechanism, lock file, reproduction
+│   └── phase5_production_readiness.md  # gates, thresholds, GO/NO-GO workflow
 ├── config/settings.yaml    # engine, risk, strategy and ingestion settings
 ├── config/walk_forward_lock.json  # committed, fingerprinted Phase 4 fit
 ├── data/sample_events.ndjson
 ├── data/raw_l2/            # capture output (created on demand, git-ignored)
+├── reports/                # Phase 4/5 evidence: walk_forward, readiness, benchmark
 ├── tests/python/           # pytest integration tests
 ├── .github/workflows/      # ci.yml (build/lint/sanitizers), readiness.yml, codeql.yml
 └── main.py                 # demo / replay CLI
@@ -802,6 +827,14 @@ single-threaded). Both runners wire this automatically — see
 
 ## Walk-forward out-of-sample validation (Phase 4)
 
+> **Status: complete and verified.** Committed baseline: 2 OOS windows over 800
+> events, parameter lock `a3aa7022dbbbab72`, 4 pre/post-window lock checks, 1
+> chronology check, ledger residual `+1.4e-7`.
+>
+> Full mechanism — windowing, boundary settlement, lock fingerprinting,
+> look-ahead proofs, artefact schema, CLI reference and NO-GO troubleshooting:
+> [`docs/phase4_walk_forward.md`](docs/phase4_walk_forward.md).
+
 A single backtest over the data you tuned on is an in-sample number. Phase 4
 splits the archive into contiguous windows, freezes the parameters in a lock file
 *before* the first window, re-verifies them after every window, and chains the
@@ -833,16 +866,42 @@ python3 scripts/run_walk_forward.py --source data/raw_l2/*.ndjson.gz \
 
 ## Production readiness gate (Phase 5)
 
+> **Status: complete and verified — `GO`, 15/15 gated checks.**
+>
+> Gate inventory, thresholds, latency-budget policy, chaos/heartbeat invariants,
+> report schema and per-check NO-GO troubleshooting:
+> [`docs/phase5_production_readiness.md`](docs/phase5_production_readiness.md).
+
 `scripts/generate_readiness_report.py` re-measures every Phase 1–4 promise and
 prints a GO/NO-GO verdict against explicit thresholds, so "is this build
 shippable?" is a command, not an opinion.
 
 ```bash
-# Full gate: JSON + Markdown artefacts under reports/, exit code 0/1/2
+# The pre-live gate: JSON + Markdown under reports/, exit 0 (GO) / 1 (NO-GO) / 2 (usage)
 python3 scripts/generate_readiness_report.py
 
 # Console verdict only, plus the opt-in profitability gate
 python3 scripts/generate_readiness_report.py --no-report --min-oos-sharpe 0.5
+
+# Acceptance run on the trading host, at the production latency budget
+python3 scripts/generate_readiness_report.py \
+  --max-engine-p99-us 5.0 --max-engine-p999-us 50 --evidence-events 20000
+
+# Force a fresh OOS study instead of reusing reports/walk_forward.json
+python3 scripts/generate_readiness_report.py --recompute-walk-forward
+```
+
+Sample verdict (`GO`):
+
+```text
+==============================================================================
+  PRODUCTION READINESS: GO
+  verdict: GO (15/15 gated checks passed)
+    Phase 1 - data ingestion               3/3 checks
+    Phase 2 - paper execution              6/6 checks
+    Phase 3 - resilience                   3/3 checks
+    Phase 4 - out-of-sample validation     5/5 checks
+==============================================================================
 ```
 
 | Phase | Gates |
@@ -853,11 +912,26 @@ python3 scripts/generate_readiness_report.py --no-report --min-oos-sharpe 0.5
 | 4 — validation | parameter lock re-verified, look-ahead chronology verified on every boundary, aggregate ledger residual ≤ 2e-2, ≥ 2 OOS windows, optional `--min-oos-sharpe` |
 
 Engine, chaos and walk-forward evidence come from a seeded synthetic book
-(`--evidence-events`, `--seed`), so the verdict reproduces on any machine;
+(`--evidence-events`, `--seed`), so every deterministic check reproduces on any
+machine (latency is the exception — see the budget note below);
 `reports/walk_forward.json` is reused when present (`--recompute-walk-forward`
 forces a fresh study). Profitability is deliberately opt-in: a build can be
 production-ready while the alpha is not, and conflating the two hides which one
 is broken. Artefacts: `reports/production_readiness_report.{json,md}`.
+
+**Latency budget tiers.** The 50 µs default is a machine-tolerant tripwire for
+shared runners, not the performance target. The budget a co-located trading host
+must hold is **engine p99 < 5.0 µs**, applied at promotion time with
+`--max-engine-p99-us 5.0` (measured: `1.4 µs` p99 at 20 k frames on an idle host,
+`8–11 µs` under load). See
+[`docs/phase5_production_readiness.md` §3](docs/phase5_production_readiness.md#3-latency-and-throughput-policy)
+for the measured bands, the p999 noise caveat and the reasoning.
+
+**Promotion sequence:** tests green → `run_walk_forward.py --from-lock` exit 0 →
+readiness `GO` → readiness `GO` at the 5.0 µs budget on the trading host → tag,
+with the `production` environment reviewer signing the attestation. The
+copy-pasteable checklist lives in
+[`docs/phase5_production_readiness.md` §10](docs/phase5_production_readiness.md#10-pre-live-promotion-checklist).
 
 ## Troubleshooting
 

@@ -1,0 +1,565 @@
+# ZephyrHFT — Phase 5: Production Readiness Gate
+
+**Automated GO / NO-GO validation of the Phase 1–4 invariants**
+
+| Field | Value |
+| --- | --- |
+| Document ID | `ZHFT-DOC-P5` |
+| Version | 1.0.0 |
+| Status | Implemented / Verified |
+| Depends on | Phase 1 (capture), Phase 2 (`paper_engine`), Phase 3 (chaos, heartbeat), Phase 4 (walk-forward) |
+| Related | [`phase4_walk_forward.md`](./phase4_walk_forward.md), [`phase2_technical_specification.md`](./phase2_technical_specification.md) |
+| Code | `scripts/generate_readiness_report.py` |
+| Artefacts | `reports/production_readiness_report.{json,md}` |
+| Workflow | `.github/workflows/readiness.yml` |
+
+---
+
+## 1. Purpose
+
+Phase 5 replaces the release checklist with an executable one:
+
+```bash
+python3 scripts/generate_readiness_report.py
+```
+
+It re-measures every promise the earlier phases made — ingestion integrity, engine
+latency, ledger coherence, chaos self-healing, dead-man's switch behaviour,
+parameter locking, look-ahead prevention and OOS coverage — and prints a single
+verdict against **explicit, named thresholds**:
+
+```text
+==============================================================================
+  PRODUCTION READINESS: GO
+  generated 2026-10-24T09:41:10+00:00
+------------------------------------------------------------------------------
+  verdict: GO (15/15 gated checks passed)
+    Phase 1 - data ingestion               3/3 checks
+    Phase 2 - paper execution              6/6 checks
+    Phase 3 - resilience                   3/3 checks
+    Phase 4 - out-of-sample validation     5/5 checks
+------------------------------------------------------------------------------
+  wrote: reports/production_readiness_report.json
+  wrote: reports/production_readiness_report.md
+==============================================================================
+```
+
+"Shippable?" is a command with an exit code, not an opinion in a chat thread.
+
+### 1.1 Design principles
+
+| Principle | Consequence |
+| --- | --- |
+| **Measure, do not assert** | Every check re-runs the invariant and reports the measured value next to the threshold |
+| **Determinism** | Engine, chaos and OOS *ledger* evidence come from a seeded synthetic book (`--evidence-events`, `--seed`), so every deterministic check reproduces on any machine; only Phase 1 integrity reads the real archive, and only latency depends on the host (§3.3) |
+| **Machinery ≠ alpha** | Profitability is opt-in (`--min-oos-sharpe`); a build can be production-ready while the alpha is not, and conflating the two hides which one is broken |
+| **Fail loud, fail closed** | A failed check is named in `summary.blocking`, echoed as `BLOCKING …` on stderr, and returns exit `1` |
+| **Evidence over logs** | The JSON report carries every raw measurement, so an auditor can recompute the verdict without re-running the study |
+
+### 1.2 CLI contract
+
+| Exit | Meaning |
+| --- | --- |
+| `0` | **GO** — every gated check passed |
+| `1` | **NO-GO** — at least one gated check failed, or validation raised (`ParameterLockError`, `LookAheadError`, `WalkForwardError`) |
+| `2` | Usage error: missing archive, unreadable settings, invalid argument |
+
+The gate writes `reports/production_readiness_report.json` and `.md` unless
+`--no-report` is passed.
+
+---
+
+## 2. Gate inventory
+
+15 gated checks by default across 17 table rows (15 gates + 2 informational
+rows); enabling `--min-oos-sharpe` adds one gate for 16 gated checks across 18
+rows.
+
+### 2.1 Phase 1 — data ingestion
+
+| ID | Measures | Passes when |
+| --- | --- | --- |
+| `phase1.configuration` | `config/settings.yaml` parsed: tick size, centre, pre-trade state, kill-switch state | tick > 0, centre > 0, kill switch enabled, and `max_position > 0` **if** pre-trade risk is armed |
+| `phase1.archive_integrity` | Full pass over `--source`: malformed frames and venue-sequence gaps | `0` malformed, `0` gaps, and `> 0` lines |
+| `phase1.ingest_throughput` | Archive ingest rate | *informational* — recorded, never blocking |
+
+Pre-trade guards are legitimately off in the deterministic replay profile, so
+their state is reported but not gated; if they are on, their limits must be sane.
+A sequence gap is treated as a **data defect, not a replay decision**: the gate
+refuses to call an archive healthy when the venue skipped updates.
+
+### 2.2 Phase 2 — paper execution
+
+| ID | Measures | Threshold |
+| --- | --- | --- |
+| `phase2.engine_latency_p99` | Engine p99 over the evidence replay (C++ `apply_depth`: book update + mark + resting match) | `<= 50 µs` (`--max-engine-p99-us`) |
+| `phase2.engine_latency_p999` | Engine p999 | `<= 500 µs` (`--max-engine-p999-us`) |
+| `phase2.replay_throughput` | Depth events/s through the replay path | `>= 1,000` (`--min-throughput-fps`) |
+| `phase2.ledger_residual` | `Δequity − realized − unrealized` | `<= 1e-2` (`--ledger-tolerance`) |
+| `phase2.order_rejections` | Rejected / submitted orders | exactly `0` rejected |
+| `phase2.fill_activity` | Filled / submitted quantity | `> 0 %` |
+
+A rejected order is a **configuration error, not bad luck**: the strategy quoted
+outside its own risk limits. Fill activity exists to prove the evidence book
+actually trades — a book that cannot fill would make every PnL figure vacuous.
+
+### 2.3 Phase 3 — resilience
+
+| ID | Measures | Passes when |
+| --- | --- | --- |
+| `phase3.disconnect_storm` | 200 frames through a seeded disconnect-storm profile (2 outage windows) | `>= 1` outage, `reconnects == outages`, `frames_forwarded + frames_dropped == frames_seen`, and both a forwarded and a dropped count `> 0` |
+| `phase3.latency_injection` | 120 frames with 1–20 ms spikes at 25 % probability | `>= 1` spike, `max_latency_ms <= 20 ms` ceiling, every frame accounted for |
+| `phase3.deadman_switch` | Native `HeartbeatMonitor` + `KillSwitch`, 500 ms timeout | trips on silence, blocks orders while halted, stays halted until an explicit reset, releases after reset, and can trip again |
+
+The storm schedule is scaled to the run length
+(`interval = max(5 × frame_interval, span / 3)`, disconnect = `0.4 × interval`),
+because a burst that ends before the first silence window opens would pass a
+chaos gate without ever exercising chaos.
+
+### 2.4 Phase 4 — out-of-sample validation
+
+| ID | Measures | Threshold |
+| --- | --- | --- |
+| `phase4.parameter_lock` | Pre/post-window lock read-backs from `reports/walk_forward.json` | `>= 1` check and `verified` |
+| `phase4.no_look_ahead` | Chronology checks across window boundaries | `verified`, `chronology_verified`, `chronology_checks > 0` |
+| `phase4.ledger_residual` | Aggregate residual including boundary settlements | `<= 1e-2 × windows` (2e-2 for the default two windows) |
+| `phase4.window_coverage` | Windows and events in the study | `>= 2` windows (`--min-windows`) and `> 0` events |
+| `phase4.oos_sharpe` | OOS Sharpe | *opt-in*: `>= --min-oos-sharpe` when supplied |
+| `phase4.oos_sharpe_info` | OOS Sharpe and net PnL | *informational*; notes that the evidence book is a zero-drift random walk, so ~0 Sharpe is expected and a real archive is required to judge alpha |
+
+By default the gate consumes the committed `reports/walk_forward.json`, so it
+verifies the study that was reviewed. `--recompute-walk-forward` runs a fresh
+study in-process instead (and `--window-events` then controls its slicing).
+
+> **The two studies are not interchangeable.** The committed artefact is the
+> bundled-sample study (Sharpe `1.127`); a recompute runs over the *synthetic
+> evidence book*, which is a zero-drift random walk and therefore scores ~`0.18`.
+> Recomputing is how you check that the pipeline still produces a valid study —
+> it is not how you re-derive a market edge. Gate profitability
+> (`--min-oos-sharpe`) against the committed study, or run
+> `run_walk_forward.py --source <real capture>` and pass the resulting artefact
+> with `--walk-forward-json`.
+
+### 2.5 Threshold table written into every report
+
+| Threshold | Default | Flag |
+| --- | --- | --- |
+| `max_engine_p99_us` | `50.0` | `--max-engine-p99-us` |
+| `max_engine_p999_us` | `500.0` | `--max-engine-p999-us` |
+| `min_throughput_fps` | `1000` | `--min-throughput-fps` |
+| `ledger_tolerance` | `0.01` | `--ledger-tolerance` |
+| `max_archive_malformed` | `0` | *fixed* |
+| `max_archive_gaps` | `0` | *fixed* |
+| `min_chaos_outages` | `1` | *fixed* |
+| `min_oos_windows` | `2` | `--min-windows` |
+| `min_oos_sharpe` | `None` | `--min-oos-sharpe` |
+
+Recording the thresholds inside the artefact is what makes a past verdict
+re-readable: a report that says `GO` under a 500 µs ceiling is not evidence of a
+5 µs system, and the JSON says which ceiling applied.
+
+---
+
+## 3. Latency and throughput policy
+
+### 3.1 What the percentile actually measures
+
+The engine histogram is recorded in C++ around `apply_depth()`:
+
+```cpp
+const auto start = now_ns();
+// ... ladder update, mark-to-market, match_resting()
+latency_.record(now_ns() - start);
+```
+
+So `engine p99` covers **book update + mark + resting-order matching per depth
+frame**, measured on the engine's own clock. It excludes the Python strategy hook
+and the replay harness — exactly the part of the path the C++ core owns.
+
+Percentiles are **bucket upper edges** from a 100 ns histogram: `p99 = 1.10 µs`
+means the true p99 lies in `(1.00, 1.10] µs`. Every latency figure in this
+project is therefore a conservative (upper-bound) reading.
+
+### 3.2 The three latency tiers
+
+| Tier | Metric | Target | Enforced by | Scope |
+| --- | --- | --- | --- | --- |
+| **Production budget** | engine p99 | **< 5.0 µs** | `--max-engine-p99-us 5.0` | The ceiling we accept for a co-located trading host; pass the flag explicitly when promoting a build |
+| **Default gate** | engine p99 | `<= 50 µs` | default of `--max-engine-p99-us` | Machine-tolerant tripwire that catches order-of-magnitude regressions on shared runners, where scheduler noise dominates |
+| **Tail** | engine p999 | `<= 500 µs` | default of `--max-engine-p999-us` | Includes cache-cold first touches of the book ladder; a genuine tail-latency bug blows straight through it |
+
+Supporting gates: replay throughput `>= 1,000` depth events/s
+(`--min-throughput-fps`) and a ledger residual `<= 1e-2` (`--ledger-tolerance`).
+
+The 50 µs default is deliberately **not** the performance target. It is the value
+that fails only when something is genuinely wrong, so the nightly job does not go
+red because a cloud runner was noisy. The 5.0 µs budget is the number the trading
+host must hold, and it is applied at promotion time:
+
+```bash
+# Acceptance run on the host that will trade (expects GO at the production budget)
+python3 scripts/generate_readiness_report.py \
+  --max-engine-p99-us 5.0 --max-engine-p999-us 50 \
+  --evidence-events 20000 --seed 7 \
+  --report-dir reports --stem readiness_trading_host
+```
+
+Run it with the engine pinned to isolated cores, turbo/thermal behaviour
+understood, and nothing else scheduled on the box. On a busy or unpinned machine
+the same command returns **NO-GO**: that is the signal to characterise the host,
+not to relax the budget.
+
+### 3.3 Observed numbers
+
+Every row below was produced by this code base on the same developer host
+(macOS); only the run length and the background load differ.
+
+| Observation | p50 | p99 | p999 | At 50 µs / 500 µs | At 5 µs / 50 µs |
+| --- | --- | --- | --- | --- | --- |
+| 20,000-frame evidence book, idle host | `0.4 µs` | `1.4 µs` | `8.1 µs` | GO | GO |
+| 2,000-frame evidence book, idle host | `0.5 µs` | `3.2 µs` | `723.9 µs` | NO-GO (p999 only) | NO-GO |
+| 2,000-frame evidence book, concurrent load | `0.5 µs` | `8.2–11.3 µs` | `93–724 µs` | GO, unless the tail trips | NO-GO |
+| Phase 2 warm ingest harness (`docs/phase2_technical_specification.md`) | `0.9 µs` | `1.10–1.30 µs` | — | GO | GO |
+
+Reading the table:
+
+- **p50 is stable** (0.4–0.9 µs) across every environment: the median frame costs
+  what the design says it costs.
+- **p99 moves with load** (1.4 → 11.3 µs), which is why the default gate is 50 µs
+  and why the 5.0 µs budget belongs on a pinned host.
+- **p999 is the noise canary.** The 723.9 µs row is a real, reproduced example:
+  one idle 2,000-frame run failed `phase2.engine_latency_p999` at the 500 µs
+  ceiling while three consecutive re-runs passed. A single p999 breach is a
+  statement about the machine, not about the code — re-run on an idle host before
+  investigating.
+- **The 5.0 µs budget is achievable here** when the host is idle and the book is
+  warm (1.4 µs at 20k frames) and fails when it is not. That is exactly how a
+  budget should behave; it is not a number to chase on a laptop.
+
+The warm Phase 2 harness remains the reference for what the engine costs when
+nothing else is running: ~30–40 k frames/s at 0.9 µs p50 and 1.10–1.30 µs p99.
+
+### 3.4 Wall-clock benchmark
+
+`scripts/run_benchmark.py` measures end-to-end tick → parse → quote → risk in
+Python and can gate on its own budget:
+
+```bash
+python3 scripts/run_benchmark.py --ticks 3000 --seed 7 \
+  --max-p99-us 50 --max-p999-us 500
+# exit 1 on breach, 0 when inside the budget
+```
+
+In CI this step is informational: a shared runner's p99 moves by an order of
+magnitude with unrelated load, so a wall-clock failure there would describe the
+runner. The authoritative latency gate remains the in-engine histogram
+(`phase2.engine_latency_p99`); the benchmark budget belongs on the trading host,
+next to the 5.0 µs engine budget.
+
+---
+
+## 4. Chaos and heartbeat invariants
+
+### 4.1 Disconnect storm
+
+| Step | Invariant |
+| --- | --- |
+| Outages happen | `outages >= 1` (default profile: 2) |
+| Recovery is automatic | `reconnects == outages` |
+| Nothing is lost or duplicated | `frames_forwarded + frames_dropped == frames_seen` |
+| The scenario is actually exercised | `frames_forwarded > 0` **and** `frames_dropped > 0` |
+
+A profile that forwards everything (or drops everything) fails: it would prove
+only that the injector could be constructed.
+
+### 4.2 Latency injection
+
+| Step | Invariant |
+| --- | --- |
+| Spikes occur | `latency_events >= 1` |
+| The ceiling holds | `max_latency_ms <= 20 ms` (the configured maximum) |
+| Accounting holds | `frames_forwarded + frames_dropped == frames_seen` |
+
+Spikes are drawn from `[1, 20] ms` at 25 % probability with a fixed seed, so the
+scenario is adversarial but reproducible.
+
+### 4.3 Dead-man's switch
+
+The gate drives the **native** `HeartbeatMonitor` and `KillSwitch` through a full
+lifecycle with a 500 ms timeout:
+
+| # | Action | Required observation |
+| --- | --- | --- |
+| 1 | `beat(1.0 s)`, then `check_order_allowed()` | Orders allowed before the timeout |
+| 2 | `poll(1.4 s)` | Does **not** trip before the deadline |
+| 3 | `poll(1.6 s)` | Trips; `last_trip_reason` starts with `heartbeat_timeout` |
+| 4 | `check_order_allowed()` while halted | Blocked |
+| 5 | `monitor.reset(2.0 s)` **without** clearing the switch | Still blocked — silence alone must not resume trading |
+| 6 | `switch.reset()`, then `check_order_allowed()` | Released |
+| 7 | `beat(2.1 s)`, `poll(2.8 s)` | Trips again — a guard that cannot re-trip is dead |
+
+Steps 5 and 7 are the ones worth keeping: recovery must be an **explicit operator
+action**, and a recovered feed must still be able to halt. A switch that
+auto-releases on the next heartbeat converts a data outage into an unguarded
+position.
+
+The readiness profiles run against a monotonic fake clock, so the checks are
+deterministic and finish in milliseconds; real-time behaviour of the same
+injectors is covered by the Phase 3 harness and the chaos test module.
+
+---
+
+## 5. CLI workflow
+
+### 5.1 The commands that matter
+
+```bash
+# 1. The gate. Artefacts under reports/, exit 0 (GO) / 1 (NO-GO) / 2 (usage)
+python3 scripts/generate_readiness_report.py
+
+# 2. Gate with profitability blocking, using the committed OOS study
+python3 scripts/generate_readiness_report.py --min-oos-sharpe 0.5
+
+# 2b. Fresh in-process study instead of the committed artefact
+#     (the synthetic evidence book has ~0 Sharpe, so pair this with no
+#      profitability gate, or expect a deliberate phase4.oos_sharpe NO-GO)
+python3 scripts/generate_readiness_report.py --recompute-walk-forward
+
+# 3. Console verdict only (no artefacts, nothing to commit)
+python3 scripts/generate_readiness_report.py --no-report
+
+# 4. Verify Phase 1 integrity against a real capture instead of the sample
+python3 scripts/generate_readiness_report.py \
+  --source data/raw_l2/binance_futures_btcusdt_depth_100ms_20261021T173329Z_00001.ndjson.gz
+
+# 5. Production latency budget, on the host that will trade (§3.2)
+python3 scripts/generate_readiness_report.py \
+  --max-engine-p99-us 5.0 --max-engine-p999-us 50 --evidence-events 20000
+
+# 6. Write a named bundle for an audit packet
+python3 scripts/generate_readiness_report.py \
+  --report-dir reports/release-2026-10-24 --stem pre_live
+```
+
+### 5.2 How the evidence is produced
+
+| Input | Used for |
+| --- | --- |
+| `--source` (default `data/sample_events.ndjson`) | Phase 1 integrity + ingest rate — the only check that reads real data |
+| `--evidence-events` (default 2000) | Frames in the seeded synthetic book behind the Phase 2 and Phase 4 measurements |
+| `--seed` (default 7) | Makes the evidence book bit-reproducible |
+| `--chaos-frames` (default 200) | Frames pushed through each Phase 3 chaos profile |
+| `--walk-forward-json` (default `reports/walk_forward.json`) | Phase 4 evidence, reused when present |
+| `--recompute-walk-forward` | Ignores that artefact and runs a fresh study in-process (sliced by `--window-events`; `0` = ¼ of `--evidence-events`) |
+| `--min-windows` (default 2) | Minimum OOS window count for `phase4.window_coverage` |
+
+The synthetic book is re-stamped onto a fixed 250 ms grid rather than the wall
+clock, so walk-forward windows look sequential and chronology checks are
+meaningful. Without that, every frame would share a timestamp and the look-ahead
+proof would be vacuous.
+
+### 5.3 Flag reference
+
+| Group | Flags | Defaults |
+| --- | --- | --- |
+| Evidence | `--source`, `--evidence-events`, `--seed`, `--chaos-frames`, `--window-events`, `--min-windows` | `data/sample_events.ndjson`, `2000`, `7`, `200`, `0`, `2` |
+| Frozen parameters | `--gamma`, `--sigma`, `--k`, `--time-horizon`, `--inventory-limit`, `--ofi-sensitivity`, `--ofi-decay`, `--ofi-cap` | `0.1`, `0.02`, `5.0`, `60.0`, `5.0`, `0.0`, `0.95`, `3.0` |
+| Venue / costs | `--market-type`, `--tick-size`, `--center`, `--maker-bps`, `--taker-bps`, `--initial-cash`, `--order-quantity` | `CRYPTO`, settings, settings, `-1.0`, `5.0`, `100000.0`, `0.01` |
+| Gates | `--max-engine-p99-us`, `--max-engine-p999-us`, `--min-throughput-fps`, `--ledger-tolerance`, `--min-oos-sharpe` | `50.0`, `500.0`, `1000`, `1e-2`, `None` |
+| Walk-forward evidence | `--walk-forward-json`, `--recompute-walk-forward` | `reports/walk_forward.json`, off |
+| Output | `--report-dir`, `--stem`, `--no-report`, `--log-level` | `reports`, `production_readiness_report`, off, `ERROR` |
+
+> **Defaults follow the committed fit.** The gate's frozen `--k` default is `5.0`,
+> matching `config/walk_forward_lock.json`, even though `run_walk_forward.py`
+> defaults to `k = 1.5`. This keeps a reused `reports/walk_forward.json` consistent
+> with the parameters the gate would have used; override both together or not at
+> all.
+
+---
+
+## 6. Reading the report
+
+### 6.1 Markdown
+
+`reports/production_readiness_report.md` opens with the verdict, the gated-check
+count, the evidence source and the walk-forward origin, then repeats the checks
+grouped by phase. When something is blocking, a **Blocking failures** table is
+inserted before the phase sections, so a reader never has to diff PASS/FAIL rows
+to find the reason for a NO-GO:
+
+```markdown
+## Verdict: **NO-GO**
+
+### Blocking failures
+
+| Check | Measured | Required |
+| --- | --- | --- |
+| `phase2.engine_latency_p99` | 8.2 us (p50 0.5 us) | <= 1 us |
+```
+
+A per-phase table follows, with the measured value, the threshold and the status;
+informational checks are explicitly marked `PASS (info)` so they are never
+mistaken for gates.
+
+### 6.2 JSON
+
+`reports/production_readiness_report.json` is the artefact to archive:
+
+| Key | Content |
+| --- | --- |
+| `verdict` | `"GO"` / `"NO-GO"` |
+| `generated_at` | ISO-8601 UTC |
+| `summary` | `checks`, `gated`, `passed`, `failed`, `blocking[]` (check IDs) |
+| `thresholds` | The exact ceilings in force for this run (§2.5) |
+| `inputs` | Source archive, evidence description, parameter fingerprint, walk-forward origin |
+| `checks[]` | One object per check: `id`, `phase`, `title`, `measured`, `threshold`, `passed`, `gated`, `note` |
+| `evidence` | Raw measurements: `configuration`, `ingestion`, `engine`, `chaos`, `deadman`, `walk_forward` |
+
+`summary.blocking` is the machine-readable form of the same fact the console
+prints, so a pipeline can gate on the JSON without parsing prose:
+
+```bash
+python3 scripts/generate_readiness_report.py --report-dir /tmp/gate >/dev/null 2>&1
+python3 - <<'PY'
+import json, pathlib
+report = json.loads(pathlib.Path("/tmp/gate/production_readiness_report.json").read_text())
+print(report["verdict"], report["summary"]["blocking"])
+PY
+```
+
+### 6.3 Committed baseline (development host)
+
+Produced by `python3 scripts/generate_readiness_report.py` on the bundled sample
+before the pre-live review:
+
+| Phase | Representative measurement | Status |
+| --- | --- | --- |
+| 1 — ingestion | `0` malformed / `0` gaps in 800 lines; ~31.7 k lines/s | PASS |
+| 2 — execution | p99 `11.3 µs`, p999 `93.2 µs` (a loaded run — see §3.3), `6,516` depth events/s, residual `-1.1e-7`, `0/3480` rejected, fills `16.4 %` | PASS |
+| 3 — resilience | 2 outages / 2 reconnects / 2 frames dropped; 36 spikes, max `19.8 ms`; switch tripped on `heartbeat_timeout: silence=600ms>=limit=500ms` | PASS |
+| 4 — validation | lock `a3aa7022dbbbab72` (4 checks); 1 chronology check across 2 windows; residual `+1.4e-7`; 2 windows / 800 events; Sharpe `1.127` (info) | PASS |
+| **Verdict** | **15/15 gated checks passed** | **GO** |
+
+Latency and throughput vary per run (§3.3); the ledger, window, lock and chaos
+counts are deterministic.
+
+---
+
+## 7. Continuous enforcement
+
+`scripts/generate_readiness_report.py` is only a gate if something runs it
+unattended. `.github/workflows/readiness.yml` does:
+
+| Trigger | Purpose |
+| --- | --- |
+| Weekdays `03:17 UTC` (cron) | Nightly rehearsal against the committed lock and sample archive |
+| Tag `v*` | Release evidence: the tag cannot be attested without a `GO` |
+| `workflow_dispatch` | Manual run with `source`, `evidence-events`, `max-engine-p99-us`, `min-oos-sharpe` and `recompute-walk-forward` inputs |
+
+The `GO / NO-GO gate` job runs, in order: `pip-audit` over the runtime
+dependencies, a clean CMake build of the C++ core and pybind11 extension, CTest,
+pytest, the Phase 4 replay of the **committed** lock (`run_walk_forward.py
+--from-lock`), the informational latency benchmark, then this gate; it publishes
+the verdict to the job summary and uploads `reports/` as the `readiness-reports`
+artefact (30-day retention). Concurrency is non-cancelling, so a scheduled run
+cannot be silenced by a push.
+
+The `attest release verdict` job (tags only) downloads that artefact and fails
+unless the verdict is `GO`. Binding the `production` environment to required
+reviewers turns tag attestation into a human sign-off rather than a rubber stamp.
+
+> The evidence bundle — not the console log — is the audit trail. Export it if
+> retention longer than 30 days is required.
+
+---
+
+## 8. Troubleshooting a NO-GO
+
+`BLOCKING <id>: <measured> (required <threshold>)` names exactly what failed.
+Map the ID to the action:
+
+| Blocking ID | Likely cause | Action |
+| --- | --- | --- |
+| `phase1.configuration` | Kill switch disabled, non-positive tick/centre, or pre-trade armed with `max_position <= 0` | Fix `config/settings.yaml`; a NO-GO here means the shipped config is not self-consistent |
+| `phase1.archive_integrity` | Malformed lines or a sequence gap in `--source` | Re-capture; a gap is a venue/stream defect, not something to "tolerate" |
+| `phase2.engine_latency_p99` | Noisy host, debug build, or a genuine regression (e.g. allocation in the apply path) | Confirm an optimised build; re-run idle; only then relax `--max-engine-p99-us`, and record why in the release notes |
+| `phase2.engine_latency_p999` | Cold book, or scheduler interference during the run | Re-run on an idle host first: a single p999-only breach on a shared machine is load, not code. Only if it reproduces should you profile the matching path — or raise the ceiling deliberately and record why |
+| `phase2.replay_throughput` | Archive on a slow filesystem, or an interpreter running with tracing enabled | Move the archive to local disk; check `PYTHONPROFILEIMPORTTIME`/debuggers are off |
+| `phase2.ledger_residual` | Accounting defect: a fill or a mark that does not reconcile | Reproduce with `run_walk_forward.py --window-events 0`, compare realized vs equity change |
+| `phase2.order_rejections` | Strategy quoting outside its own risk limits (`NOTIONAL_LIMIT`, `PRICE_BAND`, …) | Align `inventory_limit` / `initial_cash` / `order_quantity` with the risk config; rejects are configuration errors |
+| `phase2.fill_activity` | Evidence book cannot trade (price outside the ladder band) | Check `--center` / `--tick-size`; a book with no fills makes every PnL number vacuous |
+| `phase3.disconnect_storm` | Injector fired no outage, or frames were lost/duplicated | Inspect `evidence.chaos.disconnect_storm`; a missing outage means the schedule is shorter than the run |
+| `phase3.latency_injection` | No spikes, or a spike exceeded the configured ceiling | Same: read the counters in the JSON evidence |
+| `phase3.deadman_switch` | Switch released without an explicit reset, or failed to re-trip | Treat as a **safety defect**: do not trade until it is fixed and the gate is green |
+| `phase4.parameter_lock` | Lock not verified, or zero checks (no windows) | Re-run `run_walk_forward.py --from-lock`; check the artefact is the committed study |
+| `phase4.no_look_ahead` | No chronology checks (single window / no `E` timestamps) | Use ≥ 2 windows and an archive with exchange timestamps |
+| `phase4.ledger_residual` | Boundary settlement mismatch across windows | Recompute the study (`--recompute-walk-forward`); inspect `boundary_settled_pnl` |
+| `phase4.window_coverage` | Fewer windows than `--min-windows` | Lower `--window-events`, add archives, or lower `--min-windows` deliberately |
+| `phase4.oos_sharpe` | Opt-in profitability gate not met | This is the alpha talking, not the machinery: do not weaken the threshold to ship |
+
+Other failure shapes:
+
+| Output | Exit | Meaning |
+| --- | --- | --- |
+| `error: source archive not found: …` | `2` | `--source` path is wrong — no partial verdict is produced |
+| `validation failure: …` | `1` | The Phase 4 study itself raised (`ParameterLockError` / `LookAheadError`); the gate refuses to grade an invalid study |
+| `ModuleNotFoundError: hft_native` | — | Build the extension first (`cmake -S cpp_engine -B build -DHFT_BUILD_PYTHON=ON && cmake --build build`) |
+
+---
+
+## 9. Limitations
+
+| Limitation | Consequence |
+| --- | --- |
+| Engine, chaos and OOS evidence come from a **synthetic book** | The verdict proves the machinery, not a market edge. Profitability needs `--source <real capture>` plus an explicit `--min-oos-sharpe` |
+| The synthetic book is a zero-drift random walk | Expect Sharpe ≈ 0 with a fee drag; the reported `1.127` comes from the bundled sample's drift, not from alpha |
+| Engine p99 is host-sensitive | Two runs on the same machine, differing only in background load, move p99 from `1.4 µs` to `11.3 µs` and p999 from `8 µs` to `724 µs` (§3.3). The 5.0 µs budget is only meaningful with the cores and the load characterised |
+| Chaos runs on a fake monotonic clock | Deterministic and fast, but it does not exercise the socket, the TLS stack or the kernel's retransmit timers |
+| The dead-man's switch is driven directly | It proves monitor + kill-switch semantics, not the full live feed loop that must eventually beat into it |
+| No exchange gateway, persistence or reconciliation exists | The gate cannot and does not certify them |
+| `pip-audit` is a separate CI step | Its result is not part of the GO/NO-GO verdict; read the workflow log (one dev-only advisory is currently ignored) |
+| A report is a point-in-time snapshot | Re-run per release **and per host**; a `GO` from last month on another machine is not evidence about this one |
+
+The gate reduces the set of things that can go wrong before real money; it does
+not replace a staged rollout, position limits on the venue, or a paper-trading
+window against the live feed.
+
+---
+
+## 10. Pre-live promotion checklist
+
+Run in order, from a clean checkout, and archive the output of step 3:
+
+```bash
+# 1. Unit and system tests
+python3 -m pytest
+ctest --test-dir build --output-on-failure
+
+# 2. The committed fit replays verbatim (no flags to drift)
+python3 scripts/run_walk_forward.py \
+  --source data/sample_events.ndjson --window-events 400 \
+  --from-lock --lock-file config/walk_forward_lock.json
+
+# 3. The gate: must print GO and exit 0
+python3 scripts/generate_readiness_report.py
+
+# 4. Same gate on the trading host, at the production latency budget
+python3 scripts/generate_readiness_report.py \
+  --max-engine-p99-us 5.0 --max-engine-p999-us 50 --evidence-events 20000
+
+# 5. Commit the refreshed artefacts (and a new lock if the fit changed)
+git add reports/production_readiness_report.json reports/production_readiness_report.md
+git commit -m "readiness: GO on <host> $(date -u +%Y-%m-%dT%H:%MZ)"
+```
+
+| Gate | Requirement |
+| --- | --- |
+| `pytest` / `ctest` | Green; no skipped phase-specific tests |
+| Walk-forward replay | Exit `0`, lock fingerprint unchanged |
+| Readiness (default) | `GO`, exit `0`, bundle archived |
+| Readiness (trading host) | `GO` at `--max-engine-p99-us 5.0` |
+| Tag | Only after the above; the `production` environment reviewer signs the attestation |
+
+If the fit changes, regenerate the lock with `--write-lock` and re-review the
+study — never hand-edit `config/walk_forward_lock.json`. A study that no longer
+matches its lock is not evidence, and the gate will say so.
