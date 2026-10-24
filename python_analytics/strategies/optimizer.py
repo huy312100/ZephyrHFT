@@ -274,6 +274,7 @@ def random_search(
         ))
     return _rank(rows, keys, metric)
 
+
 def bayesian_search(
     param_space: Dict[str, Sequence[float]],
     lines: Iterable[str],

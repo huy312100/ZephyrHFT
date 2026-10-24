@@ -272,4 +272,3 @@ class HeartbeatWatchdog:
                 self.recover()
             except Exception:  # noqa: BLE001 - keep supervising after a bad iteration
                 logger.exception("watchdog iteration failed; continuing")
-

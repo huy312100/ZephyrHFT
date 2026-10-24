@@ -8,10 +8,14 @@ implements the same "gate" contract the bridge expects::
 so a run can be disrupted without touching the engine, the strategy or the
 matching code. Everything the injector does is observable:
 
-| mode | behaviour | failure exercised |
-| --- | --- | --- |
-| ``disconnect_storm`` | blocks the feed for ``disconnect_s`` every ``interval_s`` | silent socket, ``RECOVERING`` state machine, heartbeat dead-man's switch, missed updates (gaps when the feed carries ``pu``) |
-| ``latency_injection`` | sleeps ``uniform(min, max)`` ms on ``latency_probability`` of frames | stale-book quoting, order timeouts, risk boundaries |
+``disconnect_storm``
+    blocks the feed for ``disconnect_s`` every ``interval_s``; exercises the
+    silent socket, the ``RECOVERING`` state machine, the heartbeat dead-man's
+    switch and the missed-update gaps a silenced feed produces.
+
+``latency_injection``
+    sleeps ``uniform(min, max)`` ms on ``latency_probability`` of frames;
+    exercises stale-book quoting, order timeouts and the risk boundaries.
 
 The clock, sleep function and RNG are injectable, so the schedule is unit
 testable without wall-clock sleeps (pass a fake clock and a fake sleep that
@@ -74,7 +78,6 @@ class HeartbeatSink(Protocol):
 
     def beat(self) -> None:  # pragma: no cover - structural typing only
         ...
-
 
 
 @dataclass(frozen=True)
@@ -460,4 +463,3 @@ class ChaosNetworkInjector:
             )
         lines.append(f"max feed gap    : {stats.max_heartbeat_gap_s:.3f}s")
         return "\n".join(lines)
-

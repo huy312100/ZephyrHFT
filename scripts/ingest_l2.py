@@ -1018,7 +1018,7 @@ def _print_summary(
     print(f"  Stream        : {settings.stream_url}")
     print(f"  Frames        : {stats.frames:,}  ({rate:.1f}/s over {elapsed:.1f}s)")
     if writer is None:
-        print(f"  Archived      : dry-run (no storage)")
+        print("  Archived      : dry-run (no storage)")
     else:
         print(f"  Archived      : {stats.stored:,} frames"
               f"  ({stats.bytes_received / (1024 * 1024):.2f} MiB received)")

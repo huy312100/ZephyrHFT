@@ -84,8 +84,87 @@ jobs:
       - name: Run C++ tests (CTest)
         run: ctest --test-dir build --output-on-failure
 
+      # Coverage is measured once, on the newest interpreter: it is a property
+      # of the code, not of the interpreter, and rerunning it per matrix leg
+      # only burns runner minutes. The floor is the measured baseline minus a
+      # safety margin (~85% today), so a new module cannot land untested.
+      - name: Run Python tests with coverage (pytest-cov)
+        if: matrix.python-version == '3.12'
+        run: |
+          python -m pip install "pytest-cov>=5,<7"
+          python -m pytest --cov=python_analytics --cov-report=term-missing \
+            --cov-fail-under=80
+
       - name: Run Python tests (pytest)
+        if: matrix.python-version != '3.12'
         run: python -m pytest
 
       - name: Smoke test the CLI
         run: python main.py --demo
+
+  # Style gate: cheap (seconds), no build needed, and it catches the class of
+  # defect the test suite cannot see — unused imports, dead f-strings, stray
+  # whitespace and lines that only look aligned in one editor.
+  lint:
+    name: lint (flake8)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+
+      - name: Install lint tooling
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-dev.txt
+
+      - name: flake8
+        run: python -m flake8 --count --statistics python_analytics scripts tests main.py
+
+  # Memory-safety gate for the C++ core. A use-after-free on the book ladder or
+  # a signed overflow in the fixed-point maths does not fail a release build on
+  # a quiet day; it fails in production, on the day it matters. The native
+  # extension is skipped here (the test binary links `hft_core` directly), so
+  # the sanitised build costs seconds rather than a full pybind11 compile.
+  sanitizers:
+    name: asan + ubsan (C++ core)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      # halt_on_error: the first report is the finding; keep going and the log
+      # buries it. Leak reporting is enabled but non-fatal (exitcode=0) until
+      # we have a clean baseline to gate on — flip it to 23 to make leaks fail
+      # the build.
+      ASAN_OPTIONS: halt_on_error=1:detect_leaks=1:abort_on_error=1
+      LSAN_OPTIONS: exitcode=0
+      UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential cmake
+          g++ --version | head -n 1
+
+      - name: Configure CMake (sanitised, no extension)
+        run: |
+          cmake -S cpp_engine -B build/sanitize \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DHFT_BUILD_PYTHON=OFF \
+            -DHFT_ENABLE_NATIVE=OFF \
+            -DHFT_ENABLE_LTO=OFF \
+            -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer -g"
+
+      - name: Build sanitised test binary
+        run: cmake --build build/sanitize --parallel
+
+      - name: Run C++ tests under ASan + UBSan
+        run: ctest --test-dir build/sanitize --output-on-failure

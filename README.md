@@ -68,11 +68,15 @@ used at the orchestration/analytics boundary.
 ├── scripts/
 │   ├── run_paper_trading.py  # 60s live/mock paper-trading dashboard
 │   ├── ingest_l2.py          # real-time L2 capture -> gzip NDJSON roll files
+│   ├── run_walk_forward.py   # Phase 4 OOS study + parameter lock
+│   ├── generate_readiness_report.py  # Phase 5 GO/NO-GO gate
 │   └── run_benchmark.py      # tick-to-quote latency benchmark
 ├── config/settings.yaml    # engine, risk, strategy and ingestion settings
+├── config/walk_forward_lock.json  # committed, fingerprinted Phase 4 fit
 ├── data/sample_events.ndjson
 ├── data/raw_l2/            # capture output (created on demand, git-ignored)
 ├── tests/python/           # pytest integration tests
+├── .github/workflows/      # ci.yml (build/lint/sanitizers), readiness.yml, codeql.yml
 └── main.py                 # demo / replay CLI
 ```
 
@@ -219,6 +223,63 @@ python3 -m cmake --build build --target test
 The wheel also ships `ctest` under its `cmake/data/bin` directory; add that
 directory to `PATH` if you prefer invoking `ctest` directly, or run
 `./build/tests/hft_tests` as shown above.
+
+## Continuous integration and pre-live gates
+
+Every commit is built, sanitised, linted and measured before it can reach
+`main`, and a nightly + tag workflow re-runs the full pre-live rehearsal.
+
+| Workflow / job | Trigger | What it proves |
+| --- | --- | --- |
+| `ci.yml` → `build + test (py3.9, py3.12)` | push, PR, manual | C++ core + pybind11 extension build on both ends of the supported range, CTest, pytest, CLI smoke test, and coverage ≥ 80 % (measured once, on 3.12) |
+| `ci.yml` → `lint (flake8)` | push, PR, manual | `flake8` over `python_analytics`, `scripts` and `tests` with the repo config in `.flake8` |
+| `ci.yml` → `asan + ubsan (C++ core)` | push, PR, manual | the engine compiled with `-fsanitize=address,undefined` and its suite run under both — a use-after-free or an overflow fails the build (leak reports are advisory until a clean baseline exists) |
+| `readiness.yml` → `GO / NO-GO gate` | weekdays 03:17 UTC, tag `v*`, manual | `pip-audit`, clean rebuild, CTest, pytest, replay of the **committed** lock (`--from-lock`), latency benchmark, Phase 5 verdict, evidence bundle as an artifact |
+| `readiness.yml` → `attest release verdict` | tag `v*` | refuses to attest a tag whose report is not `GO`; bind the `production` environment to required reviewers to force a human sign-off |
+| `codeql.yml` | push, PR, weekly | CodeQL analysis of the C++ and Python trees |
+
+The same gates locally (the sanitised build deliberately skips the extension,
+so it links `hft_core` directly and compiles in seconds):
+
+```bash
+python3 -m pip install -r requirements-dev.txt
+
+# Style
+python3 -m flake8 --count python_analytics scripts tests main.py
+
+# Memory safety
+cmake -S cpp_engine -B build/sanitize -DCMAKE_BUILD_TYPE=Debug \
+  -DHFT_BUILD_PYTHON=OFF -DHFT_ENABLE_NATIVE=OFF -DHFT_ENABLE_LTO=OFF \
+  -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer -g"
+cmake --build build/sanitize --parallel
+ASAN_OPTIONS=halt_on_error=1 ctest --test-dir build/sanitize --output-on-failure
+
+# Coverage floor
+python3 -m pytest --cov=python_analytics --cov-fail-under=80
+```
+
+**Running the readiness gate from Actions.** `Production readiness` →
+*Run workflow* accepts the same knobs as the CLI:
+
+| Input | Default | Effect |
+| --- | --- | --- |
+| `source` | `data/sample_events.ndjson` | archive whose Phase 1 integrity is verified |
+| `evidence-events` | `2000` | synthetic frames behind the engine/chaos/OOS evidence |
+| `max-engine-p99-us` | `50` | engine p99 ceiling; relax it on a noisy runner, not in code |
+| `min-oos-sharpe` | *(empty)* | set it to make profitability blocking; empty keeps it `info` |
+| `recompute-walk-forward` | `false` | ignore `reports/walk_forward.json` and rerun the study |
+
+The verdict is printed to the run summary and the whole `reports/` directory is
+uploaded as `readiness-reports` (30-day retention) — that bundle, not the log,
+is the audit trail for a release. To make the gates mandatory, protect `main`
+with the required status checks `build + test (py3.9)`, `build + test (py3.12)`,
+`lint (flake8)` and `asan + ubsan (C++ core)`, and tag releases only after a
+green `Production readiness` run.
+
+Wall-clock latency on a shared runner is dominated by scheduler noise, so the
+benchmark step is informational there; the authoritative latency gate is the
+in-engine histogram behind `phase2.engine_latency_p99`. Run
+`run_benchmark.py --max-p99-us … --max-p999-us …` on the host that will trade.
 
 ## Real-time L2 ingestion (Phase 1)
 
@@ -519,13 +580,20 @@ reported as `Self-Match Stop` in the summary.
 ### Latency benchmark
 
 ```bash
+# Report only
 python3 scripts/run_benchmark.py --ticks 50000
+
+# Pre-live budget: archive the numbers and fail when the tail regresses
+python3 scripts/run_benchmark.py --ticks 50000 \
+  --json reports/latency_benchmark.json --max-p99-us 200 --max-p999-us 1000
 ```
 
 Measures the tick-to-quote hot path in microseconds (p50/p99/p99.9): JSON
 parse → C++ `L2Book` apply → Avellaneda-Stoikov quote generation → C++
 `RiskGuard` validation. GC is disabled during the loop to eliminate collection
-pauses.
+pauses. `--json` writes the raw report for trending; `--max-p99-us` /
+`--max-p999-us` turn the run into a gate (exit `1` on breach) — run that on the
+host that will trade, with cores pinned, not on a shared CI runner.
 
 ### Parameter optimisation
 
@@ -746,7 +814,11 @@ python3 scripts/run_walk_forward.py --source data/sample_events.ndjson \
   --window-events 400 --k 5.0 \
   --write-lock config/walk_forward_lock.json --report-dir reports
 
-# Verify a lock you did not create: the run refuses to start on any drift
+# Verify a lock you did not create: replay it verbatim, no flags to drift
+python3 scripts/run_walk_forward.py --source data/raw_l2/*.ndjson.gz \
+  --window-events 5000 --from-lock --lock-file config/walk_forward_lock.json
+
+# Same check while restating the parameters (refuses to start on any drift)
 python3 scripts/run_walk_forward.py --source data/raw_l2/*.ndjson.gz \
   --window-events 5000 --k 5.0 --lock-file config/walk_forward_lock.json
 ```

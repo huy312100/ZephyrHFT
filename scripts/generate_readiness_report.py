@@ -35,7 +35,7 @@ import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -446,7 +446,7 @@ def measure_chaos(frames: int = 200, *, frame_interval_s: float = 0.001,
         Check("phase3.latency_injection", "phase3", "latency injection",
               f"{spike_stats.latency_events} spike(s), max "
               f"{spike_stats.max_latency_ms:.1f} ms",
-              ">= 1 spike, max <= configured ceiling", 
+              ">= 1 spike, max <= configured ceiling",
               spike_stats.latency_events > 0
               and spike_stats.max_latency_ms <= 20.0 + 1e-6 and spike_accounted),
     ]
@@ -859,6 +859,3 @@ def main(argv: Optional[List[str]] = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
-
-

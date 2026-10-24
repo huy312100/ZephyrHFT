@@ -1,0 +1,17 @@
+[flake8]
+# The codebase is written to ~100 columns (docstrings and log lines included).
+max-line-length = 100
+extend-exclude =
+    .git,
+    .venv,
+    venv,
+    build,
+    __pycache__,
+    data,
+    reports,
+# Executable scripts and test harnesses bootstrap ``sys.path`` before importing
+# the package so they run from a clean checkout; those imports cannot be hoisted
+# above the bootstrap, which is exactly what E402 flags.
+per-file-ignores =
+    scripts/*:E402
+    tests/*:E402

@@ -1,0 +1,35 @@
+# Keeps the pins moving for the two things that decide whether the engine is
+# safe to trade: the runtime libraries that parse market data, and the actions
+# that run the gates. Dependabot PRs go through the same CI as any other commit.
+version: 2
+
+updates:
+  - package-ecosystem: pip
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: "Etc/UTC"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "deps"
+    groups:
+      # Runtime libraries are audited by pip-audit and gated by the readiness
+      # run, so they land as one reviewable PR.
+      runtime:
+        patterns: ["PyYAML", "pybind11", "websockets"]
+      # Test/lint/coverage tooling cannot change engine behaviour.
+      tooling:
+        patterns: ["pytest", "pytest-cov", "flake8", "pip-audit"]
+
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: "Etc/UTC"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "ci"

@@ -92,6 +92,10 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     # Lock handling.
     parser.add_argument("--lock-file", type=str, default=None,
                         help="load a persisted lock and require the CLI to match it")
+    parser.add_argument("--from-lock", action="store_true",
+                        help="adopt the parameters stored in --lock-file instead "
+                             "of restating them on the command line (used by CI "
+                             "to replay the committed lock verbatim)")
     parser.add_argument("--write-lock", type=str, default=None,
                         help="persist the effective parameter lock to this path")
     # Reporting and gating.
@@ -132,14 +136,23 @@ def build_parameters(args: argparse.Namespace) -> LockedParameters:
 
 
 def run(args: argparse.Namespace) -> int:
-    parameters = build_parameters(args)
+    if args.from_lock and not args.lock_file:
+        raise ValueError("--from-lock requires --lock-file")
 
-    lock_source = "cli"
-    if args.lock_file:
-        locked = read_lock_file(args.lock_file)
-        parameters.assert_matches(locked, context=f"--lock-file {args.lock_file}")
-        parameters = locked
+    if args.from_lock:
+        # The lock is the single source of truth: nothing on the command line
+        # can widen a limit or re-tune a parameter between windows.
+        parameters = read_lock_file(args.lock_file)
         lock_source = str(args.lock_file)
+    else:
+        parameters = build_parameters(args)
+        lock_source = "cli"
+        if args.lock_file:
+            locked = read_lock_file(args.lock_file)
+            parameters.assert_matches(locked,
+                                      context=f"--lock-file {args.lock_file}")
+            parameters = locked
+            lock_source = str(args.lock_file)
 
     if args.write_lock:
         write_lock_file(parameters, args.write_lock, metadata={

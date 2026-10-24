@@ -6,7 +6,9 @@ events, and the chained ledger closes to zero.
 """
 from __future__ import annotations
 
+import importlib.util
 import json
+import sys
 from dataclasses import replace
 from pathlib import Path
 
@@ -18,7 +20,6 @@ from python_analytics.backtesting.walk_forward import (
     ParameterLockError,
     WalkForwardError,
     WalkForwardRunner,
-    aggregate_windows,
     read_lock_file,
     write_lock_file,
 )
@@ -176,8 +177,8 @@ def test_runner_expands_globs_in_sorted_order(tmp_path: Path) -> None:
 # --------------------------------------------------------------------------- #
 # Invariant violations must abort, never average out
 # --------------------------------------------------------------------------- #
-def test_runner_aborts_when_a_window_silently_retunes(tmp_path: Path,
-                                                     monkeypatch: pytest.MonkeyPatch) -> None:
+def test_runner_aborts_when_a_window_silently_retunes(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """A strategy that re-tunes itself between windows cannot pass as OOS."""
     source = _write(tmp_path / "archive.ndjson", _lines(300))
     original = LockedParameters.build_strategy
@@ -264,3 +265,59 @@ def test_report_numbers_are_finite_or_null(tmp_path: Path) -> None:
 
     walk(payload)
     json.dumps(payload, allow_nan=False)
+
+
+# --------------------------------------------------------------------------- #
+# CLI: replaying a committed lock without restating it
+# --------------------------------------------------------------------------- #
+ROOT = Path(__file__).resolve().parents[2]
+CLI = ROOT / "scripts" / "run_walk_forward.py"
+
+
+def _load_cli():
+    spec = importlib.util.spec_from_file_location("walk_forward_cli", CLI)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_cli_from_lock_replays_the_committed_parameters(tmp_path: Path, capsys):
+    """``--from-lock`` must run the lock verbatim, even if the CLI disagrees."""
+    cli = _load_cli()
+    parameters = _parameters()
+    lock = tmp_path / "lock.json"
+    write_lock_file(parameters, lock, metadata={"source": ["fixture"]})
+    archive = _write(tmp_path / "archive.ndjson", _lines(300))
+
+    code = cli.main(["--source", str(archive), "--window-events", "100",
+                     "--from-lock", "--lock-file", str(lock),
+                     "--no-report", "--log-level", "ERROR"])
+
+    assert code == cli.EXIT_OK
+    out = capsys.readouterr().out
+    assert parameters.fingerprint in out
+    assert str(lock) in out
+
+
+def test_cli_from_lock_ignores_conflicting_flags(tmp_path: Path, capsys):
+    """A stray ``--k`` on the command line cannot re-tune a locked study."""
+    cli = _load_cli()
+    parameters = _parameters()
+    lock = tmp_path / "lock.json"
+    write_lock_file(parameters, lock)
+    archive = _write(tmp_path / "archive.ndjson", _lines(300))
+
+    code = cli.main(["--source", str(archive), "--window-events", "100",
+                     "--from-lock", "--lock-file", str(lock), "--k", "0.5",
+                     "--no-report", "--log-level", "ERROR"])
+
+    assert code == cli.EXIT_OK
+    assert parameters.fingerprint in capsys.readouterr().out
+
+
+def test_cli_from_lock_without_a_lock_file_is_a_usage_error(tmp_path: Path):
+    cli = _load_cli()
+    archive = _write(tmp_path / "archive.ndjson", _lines(50))
+    code = cli.main(["--source", str(archive), "--from-lock", "--no-report"])
+    assert code == cli.EXIT_USAGE
