@@ -42,7 +42,6 @@ from typing import Any, List, Mapping, Optional, Sequence
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from python_analytics.exchange.binance_futures import (
-    API_SECRET_VAR,
     BinanceAPIError,
     BinanceConfigError,
     BinanceError,
@@ -440,7 +439,7 @@ def run(
     logger.info("REST        : %s", config.rest_url)
     logger.info("WS          : %s", config.stream_url(args.symbol, L2_STREAM_TYPE))
     logger.info("API key     : %s", config.credentials.masked_key())
-    logger.info("secret      : loaded from %s (never logged or persisted)", API_SECRET_VAR)
+    logger.info("secret      : loaded (value never logged or persisted)")
     logger.info(
         "symbol      : %s | quantity=%s | order-test=%s",
         args.symbol.upper(),
