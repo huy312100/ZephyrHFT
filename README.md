@@ -921,16 +921,17 @@ is broken. Artefacts: `reports/production_readiness_report.{json,md}`.
 
 **Latency budget tiers.** The 50 µs default is a machine-tolerant tripwire for
 shared runners, not the performance target. The budget a co-located trading host
-must hold is **engine p99 < 5.0 µs**, applied at promotion time with
+must hold is **engine p99 <= 5.0 µs**, applied at promotion time with
 `--max-engine-p99-us 5.0` (measured: `1.4 µs` p99 at 20 k frames on an idle host,
 `8–11 µs` under load). See
 [`docs/phase5_production_readiness.md` §3](docs/phase5_production_readiness.md#3-latency-and-throughput-policy)
 for the measured bands, the p999 noise caveat and the reasoning.
 
-**Promotion sequence:** tests green → `run_walk_forward.py --from-lock` exit 0 →
-readiness `GO` → readiness `GO` at the 5.0 µs budget on the trading host → tag,
-with the `production` environment reviewer signing the attestation. The
-copy-pasteable checklist lives in
+**Promotion sequence:** tests green →
+`run_walk_forward.py --from-lock --lock-file config/walk_forward_lock.json`
+exit 0 → readiness `GO` → readiness `GO` at the 5.0 µs budget on the trading
+host → tag, with the `production` environment reviewer signing the attestation.
+The copy-pasteable checklist lives in
 [`docs/phase5_production_readiness.md` §10](docs/phase5_production_readiness.md#10-pre-live-promotion-checklist).
 
 ## Troubleshooting

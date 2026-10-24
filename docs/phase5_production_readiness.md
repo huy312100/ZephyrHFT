@@ -51,7 +51,7 @@ verdict against **explicit, named thresholds**:
 | Principle | Consequence |
 | --- | --- |
 | **Measure, do not assert** | Every check re-runs the invariant and reports the measured value next to the threshold |
-| **Determinism** | Engine, chaos and OOS *ledger* evidence come from a seeded synthetic book (`--evidence-events`, `--seed`), so every deterministic check reproduces on any machine; only Phase 1 integrity reads the real archive, and only latency depends on the host (§3.3) |
+| **Determinism** | Engine, chaos and OOS *ledger* evidence come from a seeded synthetic book (`--evidence-events`, `--seed`), so the ledger, chaos and OOS counts reproduce on any machine; only Phase 1 integrity reads the real archive, while engine **latency and replay throughput** are host-sensitive (§3.3) |
 | **Machinery ≠ alpha** | Profitability is opt-in (`--min-oos-sharpe`); a build can be production-ready while the alpha is not, and conflating the two hides which one is broken |
 | **Fail loud, fail closed** | A failed check is named in `summary.blocking`, echoed as `BLOCKING …` on stderr, and returns exit `1` |
 | **Evidence over logs** | The JSON report carries every raw measurement, so an auditor can recompute the verdict without re-running the study |
@@ -184,9 +184,12 @@ project is therefore a conservative (upper-bound) reading.
 
 | Tier | Metric | Target | Enforced by | Scope |
 | --- | --- | --- | --- | --- |
-| **Production budget** | engine p99 | **< 5.0 µs** | `--max-engine-p99-us 5.0` | The ceiling we accept for a co-located trading host; pass the flag explicitly when promoting a build |
+| **Production budget** | engine p99 | **<= 5.0 µs** | `--max-engine-p99-us 5.0` | The ceiling we accept for a co-located trading host; pass the flag explicitly when promoting a build |
 | **Default gate** | engine p99 | `<= 50 µs` | default of `--max-engine-p99-us` | Machine-tolerant tripwire that catches order-of-magnitude regressions on shared runners, where scheduler noise dominates |
 | **Tail** | engine p999 | `<= 500 µs` | default of `--max-engine-p999-us` | Includes cache-cold first touches of the book ladder; a genuine tail-latency bug blows straight through it |
+
+The comparison is inclusive: the gate passes when `p99_us <= max_p99_us`, so a
+reading of exactly `5.0 µs` is a **GO** and `5.1 µs` is a NO-GO.
 
 Supporting gates: replay throughput `>= 1,000` depth events/s
 (`--min-throughput-fps`) and a ledger residual `<= 1e-2` (`--ledger-tolerance`).
@@ -511,7 +514,7 @@ Other failure shapes:
 
 | Limitation | Consequence |
 | --- | --- |
-| Engine, chaos and OOS evidence come from a **synthetic book** | The verdict proves the machinery, not a market edge. Profitability needs `--source <real capture>` plus an explicit `--min-oos-sharpe` |
+| Engine, chaos and OOS evidence come from a **synthetic book** | The verdict proves the machinery, not a market edge. `--source` only drives the Phase 1 integrity check, so judging alpha requires a Phase 4 study over a real capture (`run_walk_forward.py --source <capture> ...`) passed explicitly with `--walk-forward-json <path>` — do not rely on the default `reports/walk_forward.json` — plus an explicit `--min-oos-sharpe` |
 | The synthetic book is a zero-drift random walk | Expect Sharpe ≈ 0 with a fee drag; the reported `1.127` comes from the bundled sample's drift, not from alpha |
 | Engine p99 is host-sensitive | Two runs on the same machine, differing only in background load, move p99 from `1.4 µs` to `11.3 µs` and p999 from `8 µs` to `724 µs` (§3.3). The 5.0 µs budget is only meaningful with the cores and the load characterised |
 | Chaos runs on a fake monotonic clock | Deterministic and fast, but it does not exercise the socket, the TLS stack or the kernel's retransmit timers |
@@ -528,7 +531,7 @@ window against the live feed.
 
 ## 10. Pre-live promotion checklist
 
-Run in order, from a clean checkout, and archive the output of step 3:
+Run in order, from a clean checkout, and archive the output of steps 3 and 4:
 
 ```bash
 # 1. Unit and system tests
@@ -543,12 +546,16 @@ python3 scripts/run_walk_forward.py \
 # 3. The gate: must print GO and exit 0
 python3 scripts/generate_readiness_report.py
 
-# 4. Same gate on the trading host, at the production latency budget
+# 4. Same gate on the trading host, at the production latency budget,
+#    written to its own stem so it does not overwrite step 3
 python3 scripts/generate_readiness_report.py \
-  --max-engine-p99-us 5.0 --max-engine-p999-us 50 --evidence-events 20000
+  --max-engine-p99-us 5.0 --max-engine-p999-us 50 --evidence-events 20000 \
+  --report-dir reports --stem readiness_trading_host
 
-# 5. Commit the refreshed artefacts (and a new lock if the fit changed)
-git add reports/production_readiness_report.json reports/production_readiness_report.md
+# 5. Archive both bundles, then commit the refreshed artefacts
+#    (reports/ is git-ignored, so -f is required)
+git add -f reports/production_readiness_report.json reports/production_readiness_report.md \
+           reports/readiness_trading_host.json reports/readiness_trading_host.md
 git commit -m "readiness: GO on <host> $(date -u +%Y-%m-%dT%H:%MZ)"
 ```
 

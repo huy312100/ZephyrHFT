@@ -34,7 +34,7 @@ single forward-only stream so no window can observe another window's data.
 | --- | --- |
 | The reported PnL/Sharpe/drawdown were produced by one unchanging parameter set | That the parameter set is optimal, or profitable on live data |
 | No window saw events outside its own slice, and exchange time never moved backwards | That the archive is free of survivorship or venue-side bias |
-| Equity chains across windows to fixed-point tolerance (`~1e-7`) | That fills are realisable — the C++ `paper_engine` is a taker-cross simulator |
+| Equity chains across windows within the configured ledger tolerance (`--ledger-tolerance`, default `1e-2` per window; the aggregate ceiling is `1e-2 × windows`) | That fills are realisable — the C++ `paper_engine` is a taker-cross simulator |
 | The study is bit-reproducible from a committed lock file | That regime change between windows was modelled |
 
 Profitability is **not** an implicit Phase 4 gate. The gate a build passes is
@@ -101,7 +101,7 @@ module fails the run instead of degrading the report.
 | **Equity is chained, not reset** | Window *n+1* starts with window *n*'s closing equity, so the aggregate is one continuous account, not a sum of detached experiments |
 | **Boundary inventory is settled, not carried** | Each window opens flat, so exposure left at a boundary becomes realised PnL (`boundary_settled_pnl`); only the final window keeps unrealised PnL |
 | **Returns-based Sharpe, not levels** | Equity levels are ~1e5 with ~1e-3 variance; computing the ratio on levels inflates it by ~1e4 |
-| **Fail closed on missing timestamps** | Archives without an `E` field make chronology unprovable, which the report states instead of claiming a proof it does not have |
+| **Missing timestamps fail closed at the gate, not in the runner** | Without an `E` field the run completes with `chronology_verified = false`; the report says `not verifiable (no timestamps)` and Phase 5's `phase4.no_look_ahead` rejects the study |
 
 ---
 
@@ -150,14 +150,18 @@ Each window opens flat, so a position still open at a boundary is booked as a
 must satisfy is:
 
 ```text
-net_pnl = realized_pnl + boundary_settled_pnl + unrealized_pnl
+net_pnl = realized_pnl + unrealized_pnl
 ```
+
+`realized_pnl` here is the **reported** aggregate figure: it already includes the
+boundary settlements. Expanded, the same identity is
+`net_pnl = in_window_realized_pnl + boundary_settled_pnl + unrealized_pnl`.
 
 | Term | Definition |
 | --- | --- |
 | `in_window_realized_pnl` | PnL closed by fills inside the windows |
 | `boundary_settled_pnl` | Sum of `unrealized_pnl` of every **non-final** window, settled at its last mid |
-| `realized_pnl` (reported) | `in_window_realized_pnl + boundary_settled_pnl` |
+| `realized_pnl` (reported) | `in_window_realized_pnl + boundary_settled_pnl` — the term used in the identity above |
 | `unrealized_pnl` (reported) | The final window's open PnL only — carried exactly once |
 | `ledger_residual` | `net_pnl − (realized_pnl + unrealized_pnl)`, expected `~1e-7` |
 
@@ -429,12 +433,16 @@ Globs expand in sorted order, which is chronological because Phase 1 roll file
 names embed a UTC start stamp and a sequence number.
 
 > **A study needs at least two windows to be evidence.** With
-> `--window-events 5000` that means more than 5,000 captured frames; the bundled
-> 93-frame `data/raw_l2` demo file produces one window, zero chronology checks and
-> zero trades (Sharpe `0.000`), which is enough to prove the pipeline runs and not
-> enough to say anything about a strategy. Phase 5 rejects such a study as
-> `phase4.window_coverage` / `phase4.no_look_ahead`, and `--min-sharpe` will exit
-> `1` on it.
+> `--window-events 5000` that means more than 5,000 captured frames, so
+> `data/raw_l2` has to be created first: a live capture long enough to exceed
+> 5,000 frames (`python3 scripts/ingest_l2.py --duration 600` on the 100 ms
+> stream), or `python3 scripts/ingest_l2.py --replay data/sample_events.ndjson
+> --output-dir data/raw_l2` to exercise the path offline. It is capture output,
+> not a tracked fixture. A short capture produces one window, zero chronology
+> checks and zero trades (Sharpe `0.000`) — enough to prove the pipeline runs,
+> not enough to say anything about a strategy. Phase 5 rejects such a study as
+> `phase4.window_coverage` / `phase4.no_look_ahead`, and `--min-sharpe` exits `1`
+> on it.
 
 ### 6.6 Gates and exit codes
 
