@@ -1253,6 +1253,32 @@ void test_paper_account() {
     CHECK(account.equity() == N("100180.05"));
 }
 
+void test_paper_account_fractional_bps() {
+    // 0.5 bps must not be truncated to 0: 60'000 notional * 0.5 bps = 3.0.
+    hft::paper_account taker_account;
+    taker_account.reset(N("100000"), 0.0, 0.5);
+    CHECK(taker_account.taker_bps() == 0.5);
+    (void)taker_account.apply_fill(P("30000"), Q("2"), hft::Side::Buy, false);
+    CHECK(taker_account.fees_paid() == N("3"));
+    CHECK(taker_account.cash() == N("39997"));
+    CHECK(taker_account.realized_pnl() == N("-3"));
+
+    // Fractional maker rebate: -0.25 bps of 60'000 = -1.5 (credited to cash).
+    hft::paper_account maker_account;
+    maker_account.reset(N("100000"), -0.25, 5.0);
+    CHECK(maker_account.maker_bps() == -0.25);
+    (void)maker_account.apply_fill(P("30000"), Q("2"), hft::Side::Sell, true);
+    CHECK(maker_account.fees_paid() == N("-1.5"));
+    CHECK(maker_account.cash() == N("160001.5"));
+    CHECK(maker_account.realized_pnl() == N("1.5"));
+
+    // Whole-basis-point rates keep the historical integer result bit-for-bit.
+    hft::paper_account legacy_account;
+    legacy_account.reset(N("100000"), -1, 5);
+    (void)legacy_account.apply_fill(P("29999.5"), Q("1"), hft::Side::Sell, true);
+    CHECK(legacy_account.fees_paid() == N("-2.99995"));
+}
+
 void test_matching_slippage() {
     hft::L2Book book{P("0.5"), P("30000")};
     CHECK(book.apply_level(hft::Side::Sell, P("30000.5"), Q("2"), 1));
@@ -1371,6 +1397,7 @@ int main() {
     test_kill_switch_guards();
     test_kill_switch_hooks_and_threads();
     test_paper_account();
+    test_paper_account_fractional_bps();
     test_matching_slippage();
     test_paper_engine_taker();
     test_paper_engine_gap_detection();

@@ -3,6 +3,10 @@
 
 Executes an alpha strategy per frame and emits the full quantitative telemetry
 (financial, execution and system metrics) plus optional JSON/CSV/PNG exports.
+
+Fee and rebate rates (--maker-bps / --taker-bps) are fractional basis points:
+--taker-bps 0.5 charges 0.5 bps (0.005%), and a negative --maker-bps models a
+maker rebate.
 """
 from __future__ import annotations
 
@@ -43,18 +47,27 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--ofi-sensitivity", type=float, default=0.0)
     parser.add_argument("--no-time-spread", action="store_true",
                         help="disable the gamma*sigma^2*(T-t) spread term")
-    # Fees / cash / sizing.
-    parser.add_argument("--maker-bps", type=int, default=-1)
-    parser.add_argument("--taker-bps", type=int, default=5)
-    parser.add_argument("--initial-cash", type=float, default=100000.0)
-    parser.add_argument("--order-quantity", type=str, default="0.01")
+    # Fees / cash / sizing. Fee rates are fractional basis points, so they are
+    # parsed as floats (0.5 => 0.5 bps = 0.005%); negative maker_bps is a rebate.
+    parser.add_argument("--maker-bps", type=float, default=-1.0,
+                        help="maker fee in basis points; negative = rebate "
+                             "(default: -1.0, i.e. 0.01%% rebate)")
+    parser.add_argument("--taker-bps", type=float, default=5.0,
+                        help="taker fee in basis points; fractions allowed "
+                             "(default: 5.0, i.e. 0.05%%); e.g. 0.5 = 0.005%%")
+    parser.add_argument("--initial-cash", type=float, default=100000.0,
+                        help="starting cash for drawdown/return metrics "
+                             "(default: 100000.0)")
+    parser.add_argument("--order-quantity", type=str, default="0.01",
+                        help="base-asset quantity per quote (default: 0.01)")
     # Replay controls.
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--frames-per-hook", type=int, default=1)
     parser.add_argument("--event-limit", type=int, default=0)
     # Reporting.
     parser.add_argument("--report", type=str, default=None,
-                        help="directory to write summary.json/fills.csv/equity.png")
+                        help="output directory for summary.json/fills.csv/equity.png "
+                             "(a .json file path is accepted and resolved to its parent)")
     parser.add_argument("--plot", action="store_true",
                         help="write PNG charts (requires matplotlib)")
     parser.add_argument("--log-level", default="INFO")
@@ -135,8 +148,14 @@ def run(args: argparse.Namespace) -> int:
     print("=" * 78)
 
     if args.report:
+        # Accept both a directory and a file path (e.g. ".../summary.json"):
+        # a ".json" target always resolves to its parent directory so artefacts
+        # never end up nested under a directory named after the file.
+        report_target = Path(args.report)
+        report_dir = report_target.parent if report_target.suffix == ".json" \
+            else report_target
         artefacts = export_report(
-            Path(args.report),
+            report_dir,
             summary=summary.as_dict(),
             fills=summary.fills,
             equity_curve=summary.equity_curve,

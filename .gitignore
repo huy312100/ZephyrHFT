@@ -37,3 +37,8 @@ venv/
 *.log
 *.ndjson
 data/
+
+# ==========================================
+# Generated Backtest Artefacts
+# ==========================================
+reports/

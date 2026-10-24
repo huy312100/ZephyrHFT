@@ -1206,9 +1206,12 @@ Escalation thresholds for a live-forward deployment:
 
 ```python
 PaperEngine(tick_size: Price, center: Price,
-            maker_bps: int = 0, taker_bps: int = 5,
+            maker_bps: float = 0.0, taker_bps: float = 5.0,
             initial_cash: Notional = 0)
 ```
+
+Fee rates are basis points and may be fractional (`0.5` = 0.5 bps); the ledger
+stores them as 64-bit micro-bps, so the matching path is unaffected.
 
 | Member | Signature | Purpose |
 | --- | --- | --- |

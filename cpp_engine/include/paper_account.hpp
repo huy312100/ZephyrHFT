@@ -2,6 +2,11 @@
 // Paper-trading ledger: cash, fees, position and mark-to-market PnL, all in
 // signed 64-bit fixed point. Single-threaded by design: one matching thread
 // mutates it and readers call snapshot().
+//
+// Fee rates are configured as doubles so fractional basis points (for example
+// 0.5 bps) survive the CLI/YAML boundary, then frozen into 64-bit micro-bps
+// once at reset()/configure() time. The fill hot path therefore stays
+// integer-only and bit-deterministic.
 #pragma once
 
 #include <cstdint>
@@ -26,13 +31,28 @@ struct paper_account_snapshot {
 
 class paper_account {
 public:
+    // One basis point = 1/10'000; rates are stored as micro-bps (1e-6 bps) so a
+    // fractional rate such as 0.5 bps is representable exactly.
+    static constexpr std::int64_t kFeeBpsScale = 1'000'000;
+    static constexpr std::int64_t kBpsDenominator = 10'000;
+
     paper_account() noexcept = default;
 
-    void reset(Notional initial_cash, std::int32_t maker_bps,
-               std::int32_t taker_bps) noexcept {
+    // Rounds half away from zero; configuration boundary only, never hot path.
+    [[nodiscard]] static constexpr std::int64_t to_micro_bps(double bps) noexcept {
+        const double scaled = bps * static_cast<double>(kFeeBpsScale);
+        return static_cast<std::int64_t>(scaled >= 0.0 ? scaled + 0.5 : scaled - 0.5);
+    }
+
+    [[nodiscard]] static constexpr double from_micro_bps(std::int64_t micro_bps) noexcept {
+        return static_cast<double>(micro_bps) / static_cast<double>(kFeeBpsScale);
+    }
+
+    void reset(Notional initial_cash, double maker_bps,
+               double taker_bps) noexcept {
         cash_ = initial_cash;
-        maker_bps_ = maker_bps;
-        taker_bps_ = taker_bps;
+        maker_bps_ = to_micro_bps(maker_bps);
+        taker_bps_ = to_micro_bps(taker_bps);
         fees_paid_ = Notional{};
         realized_pnl_ = Notional{};
         unrealized_pnl_ = Notional{};
@@ -44,17 +64,24 @@ public:
         taker_fills_ = 0;
     }
 
-    void configure(std::int32_t maker_bps, std::int32_t taker_bps) noexcept {
-        maker_bps_ = maker_bps;
-        taker_bps_ = taker_bps;
+    void configure(double maker_bps, double taker_bps) noexcept {
+        maker_bps_ = to_micro_bps(maker_bps);
+        taker_bps_ = to_micro_bps(taker_bps);
     }
 
     // Applies one fill and returns the fee (negative for a maker rebate).
     [[nodiscard]] Notional apply_fill(Price price, Quantity quantity, Side side,
                                       bool is_maker) noexcept {
         const Notional fill_notional = notional(price, quantity);
-        const std::int32_t fee_bps = is_maker ? maker_bps_ : taker_bps_;
-        const Notional fee = fill_notional * static_cast<std::int64_t>(fee_bps) / 10'000;
+        const std::int64_t fee_micro_bps = is_maker ? maker_bps_ : taker_bps_;
+        // fee = notional * bps / 10'000, evaluated in 128 bits with the rate in
+        // micro-bps. Truncation is bit-identical to the historical integer path
+        // for whole-basis-point rates, while fractional rates now survive.
+        const Wide scaled = static_cast<Wide>(fill_notional.raw()) *
+                            static_cast<Wide>(fee_micro_bps);
+        const Wide divisor = static_cast<Wide>(kBpsDenominator) *
+                             static_cast<Wide>(kFeeBpsScale);
+        const Notional fee = Notional::from_raw(static_cast<std::int64_t>(scaled / divisor));
 
         if (side == Side::Buy) {
             cash_ = cash_ - fill_notional;
@@ -140,6 +167,9 @@ public:
     [[nodiscard]] std::uint64_t fill_count() const noexcept { return fill_count_; }
     [[nodiscard]] std::uint64_t maker_fills() const noexcept { return maker_fills_; }
     [[nodiscard]] std::uint64_t taker_fills() const noexcept { return taker_fills_; }
+    // Effective rates, in basis points, as configured (fractions preserved).
+    [[nodiscard]] double maker_bps() const noexcept { return from_micro_bps(maker_bps_); }
+    [[nodiscard]] double taker_bps() const noexcept { return from_micro_bps(taker_bps_); }
 
 private:
     Notional cash_{};
@@ -149,8 +179,8 @@ private:
     Notional gross_notional_{};
     Quantity net_quantity_{};
     Price average_entry_{};
-    std::int32_t maker_bps_{0};
-    std::int32_t taker_bps_{0};
+    std::int64_t maker_bps_{0};  // micro-basis points (1e-6 bps)
+    std::int64_t taker_bps_{0};  // micro-basis points (1e-6 bps)
     std::uint64_t fill_count_{0};
     std::uint64_t maker_fills_{0};
     std::uint64_t taker_fills_{0};

@@ -99,9 +99,16 @@ def export_report(directory: Path, *, summary: Mapping[str, Any],
                   plot: bool = False) -> Dict[str, str]:
     """Writes ``summary.json``, ``fills.csv``, optional ``grid.csv`` and PNGs.
 
+    ``directory`` is the output directory. A file path such as
+    ``reports/run_001/summary.json`` is also accepted for CLI convenience and is
+    resolved to its parent directory, so artefacts are never nested inside a
+    directory that happens to be named after a file.
+
     Returns a mapping of artefact name → absolute path written.
     """
     directory = Path(directory)
+    if directory.suffix and not directory.is_dir():
+        directory = directory.parent or Path(".")
     directory.mkdir(parents=True, exist_ok=True)
     written: Dict[str, str] = {}
 

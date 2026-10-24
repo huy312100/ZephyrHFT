@@ -104,8 +104,10 @@ def backtest_parameters(
     ``inventory_std``, ``fees_paid`` and the honest ``max_drawdown_pct``.
     """
     center = center if center is not None else _infer_center(lines, config.tick_size)
-    maker_bps = int(round(maker_fee * 10_000))
-    taker_bps = int(round(taker_fee * 10_000))
+    # Fees arrive as fractions (e.g. -0.0001 == -1 bps). Keep the exact bps value
+    # instead of rounding to an integer so sub-basis-point rates survive.
+    maker_bps = float(maker_fee) * 10_000.0
+    taker_bps = float(taker_fee) * 10_000.0
     strategy = AvellanedaStoikovStrategy(
         config, ofi_sensitivity=ofi_sensitivity, use_time_spread=use_time_spread
     )

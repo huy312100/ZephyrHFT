@@ -32,8 +32,12 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
                         help="lines per C++ bulk-ingest batch")
     parser.add_argument("--tick-size", type=str, default=None)
     parser.add_argument("--center", type=str, default=None)
-    parser.add_argument("--maker-fee-bps", type=float, default=0.0)
-    parser.add_argument("--taker-fee-bps", type=float, default=5.0)
+    parser.add_argument("--maker-fee-bps", type=float, default=0.0,
+                        help="maker fee in basis points; negative = rebate, "
+                             "fractions allowed (default: 0.0)")
+    parser.add_argument("--taker-fee-bps", type=float, default=5.0,
+                        help="taker fee in basis points; fractions allowed "
+                             "(default: 5.0 = 0.05%%, 0.5 = 0.005%%)")
     parser.add_argument("--initial-cash", type=float, default=0.0)
     parser.add_argument("--order-quantity", type=str, default="0.05")
     parser.add_argument("--report-every", type=int, default=5,
@@ -62,8 +66,8 @@ def run(args: argparse.Namespace) -> int:
     session = PaperSession.create(
         tick_size=tick_size,
         center=center,
-        maker_bps=int(args.maker_fee_bps),
-        taker_bps=int(args.taker_fee_bps),
+        maker_bps=args.maker_fee_bps,
+        taker_bps=args.taker_fee_bps,
         initial_cash=args.initial_cash,
     )
 

@@ -36,15 +36,20 @@ def iter_ndjson(path: Path) -> Iterator[str]:
 def build_paper_engine(
     tick_size: str,
     center: str,
-    maker_bps: int = 0,
-    taker_bps: int = 5,
+    maker_bps: float = 0.0,
+    taker_bps: float = 5.0,
     initial_cash: float = 0.0,
 ) -> "hft_native.PaperEngine":
+    """Creates the C++ paper engine.
+
+    ``maker_bps`` / ``taker_bps`` are fractional basis points (e.g. ``0.5``);
+    the ledger stores them as micro-bps so no precision is lost here.
+    """
     return hft_native.PaperEngine(
         hft_native.Price.from_string(tick_size),
         hft_native.Price.from_string(center),
-        int(maker_bps),
-        int(taker_bps),
+        float(maker_bps),
+        float(taker_bps),
         hft_native.Notional.from_string(f"{initial_cash:.8f}"),
     )
 
@@ -111,8 +116,8 @@ class PaperSession:
 
     engine: "hft_native.PaperEngine"
     fills: List[Dict[str, float]] = None  # type: ignore[assignment]
-    maker_bps: int = 0
-    taker_bps: int = 5
+    maker_bps: float = 0.0
+    taker_bps: float = 5.0
 
     def __post_init__(self) -> None:
         if self.fills is None:
@@ -123,10 +128,11 @@ class PaperSession:
         cls,
         tick_size: str,
         center: str,
-        maker_bps: int = 0,
-        taker_bps: int = 5,
+        maker_bps: float = 0.0,
+        taker_bps: float = 5.0,
         initial_cash: float = 0.0,
     ) -> "PaperSession":
+        """Opens a paper session; fee rates are fractional basis points."""
         return cls(
             build_paper_engine(tick_size, center, maker_bps, taker_bps, initial_cash),
             maker_bps=maker_bps,
