@@ -18,6 +18,7 @@
 #include "paper_account.hpp"
 #include "paper_engine.hpp"
 #include "ring_buffer.hpp"
+#include "risk/heartbeat.hpp"
 #include "risk/kill_switch.hpp"
 #include "risk_manager.hpp"
 #include "types.hpp"
@@ -453,6 +454,75 @@ PYBIND11_MODULE(hft_native, m) {
         });
 
     m.def("system_state_name", &system_state_name, py::arg("state"));
+
+    // ---- feed dead-man's switch ------------------------------------------
+    py::class_<HeartbeatConfig>(m, "HeartbeatConfig")
+        .def(py::init<>())
+        .def_readwrite("timeout_ns", &HeartbeatConfig::timeout_ns)
+        .def_property_readonly("expiry_enabled", &HeartbeatConfig::expiry_enabled)
+        .def("__repr__", [](const HeartbeatConfig& config) {
+            return "HeartbeatConfig(timeout_ns=" + std::to_string(config.timeout_ns) +
+                   ", expiry_enabled=" + (config.expiry_enabled() ? "True" : "False") + ")";
+        });
+
+    py::class_<HeartbeatStats>(m, "HeartbeatStats")
+        .def(py::init<>())
+        .def_readonly("beats", &HeartbeatStats::beats)
+        .def_readonly("timeouts", &HeartbeatStats::timeouts)
+        .def_readonly("last_beat_ns", &HeartbeatStats::last_beat_ns)
+        .def_readonly("silence_ns", &HeartbeatStats::silence_ns)
+        .def_readonly("max_silence_ns", &HeartbeatStats::max_silence_ns)
+        .def_readonly("timeout_ns", &HeartbeatStats::timeout_ns)
+        .def_readonly("expired", &HeartbeatStats::expired)
+        .def_readonly("armed", &HeartbeatStats::armed)
+        .def_readonly("state", &HeartbeatStats::state)
+        .def("__repr__", [](const HeartbeatStats& stats) {
+            return "HeartbeatStats(beats=" + std::to_string(stats.beats) +
+                   ", timeouts=" + std::to_string(stats.timeouts) +
+                   ", silence_ms=" + std::to_string(stats.silence_ns / 1'000'000) +
+                   ", expired=" + (stats.expired ? "True" : "False") + ")";
+        });
+
+    py::class_<HeartbeatMonitor>(m, "HeartbeatMonitor")
+        .def(py::init<>())
+        .def(py::init<const HeartbeatConfig&>(), py::arg("config"))
+        .def_static("now_ns", &HeartbeatMonitor::now_ns)
+        // `0` means "sample the monotonic clock"; tests pass explicit stamps.
+        .def("beat", [](HeartbeatMonitor& self) { self.beat(); })
+        .def("beat", [](HeartbeatMonitor& self, std::int64_t timestamp_ns) {
+            self.beat(timestamp_ns);
+        }, py::arg("timestamp_ns"))
+        .def("last_beat_ns", &HeartbeatMonitor::last_beat_ns)
+        .def("silence_ns", [](const HeartbeatMonitor& self) { return self.silence_ns(); })
+        .def("silence_ns", [](const HeartbeatMonitor& self, std::int64_t now) {
+            return self.silence_ns(now);
+        }, py::arg("now_ns"))
+        .def("is_expired", [](const HeartbeatMonitor& self) { return self.is_expired(); })
+        .def("is_expired", [](const HeartbeatMonitor& self, std::int64_t now) {
+            return self.is_expired(now);
+        }, py::arg("now_ns"))
+        .def("poll", [](HeartbeatMonitor& self) { return self.poll(); })
+        .def("poll", [](HeartbeatMonitor& self, std::int64_t now) {
+            return self.poll(now);
+        }, py::arg("now_ns"))
+        .def("stats", [](const HeartbeatMonitor& self) { return self.stats(); })
+        .def("stats", [](const HeartbeatMonitor& self, std::int64_t now) {
+            return self.stats(now);
+        }, py::arg("now_ns"))
+        .def("arm", &HeartbeatMonitor::arm, py::arg("kill_switch"),
+             py::keep_alive<1, 2>())
+        .def("detach", &HeartbeatMonitor::detach)
+        .def("armed", &HeartbeatMonitor::armed)
+        .def("timeout_ns", &HeartbeatMonitor::timeout_ns)
+        .def("set_timeout_ns", &HeartbeatMonitor::set_timeout_ns, py::arg("timeout_ns"))
+        .def("reset", [](HeartbeatMonitor& self) { self.reset(); })
+        .def("reset", [](HeartbeatMonitor& self, std::int64_t now) {
+            self.reset(now);
+        }, py::arg("now_ns"))
+        .def("__repr__", [](const HeartbeatMonitor& self) {
+            return "HeartbeatMonitor(armed=" + std::string(self.armed() ? "True" : "False") +
+                   ", timeout_ms=" + std::to_string(self.timeout_ns() / 1'000'000) + ")";
+        });
 
     py::class_<EngineConfig>(m, "EngineConfig")
         .def(py::init<>())
