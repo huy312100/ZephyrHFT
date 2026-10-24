@@ -47,6 +47,7 @@ from python_analytics.exchange.binance_futures import (
     BinanceError,
     BinanceFuturesClient,
     BinanceFuturesConfig,
+    BinanceTransportError,
     DepthTick,
     LimitOrderPlan,
     OrderValidationError,
@@ -333,22 +334,69 @@ async def probe_depth_stream(
     )
 
 
+def _cancel_after_ambiguous_submit(
+    client: BinanceFuturesClient, plan: LimitOrderPlan
+) -> None:
+    """Cancels by clientOrderId after a submit whose outcome is unknown.
+
+    A transport error does not prove the exchange rejected the order: the POST
+    may have reached the matcher before the connection dropped. The client order
+    id is known before the request is sent, so it is the only identifier that is
+    guaranteed to name the order at this point.
+    """
+
+    try:
+        client.cancel_order(symbol=plan.symbol, client_order_id=plan.client_order_id)
+    except BinanceAPIError as exc:
+        if exc.code == -2011:
+            # "Unknown order sent": nothing rests, which is the desired state.
+            logger.info(
+                "no resting order for clientId=%s (venue reports unknown order)",
+                plan.client_order_id,
+            )
+            return
+        logger.warning(
+            "cleanup cancel for clientId=%s failed (%s); check open orders manually",
+            plan.client_order_id,
+            exc,
+        )
+    except BinanceError as exc:
+        logger.warning(
+            "cleanup cancel for clientId=%s failed (%s); check open orders manually",
+            plan.client_order_id,
+            exc,
+        )
+    else:
+        logger.warning(
+            "submit outcome was ambiguous; cancelled clientId=%s during cleanup",
+            plan.client_order_id,
+        )
+
+
 def _run_order_lifecycle(
     client: BinanceFuturesClient, plan: LimitOrderPlan
 ) -> str:
     """Places, queries, cancels and re-queries one passive testnet limit order."""
 
-    order = client.new_order(
-        symbol=plan.symbol,
-        side=plan.side,
-        order_type="LIMIT",
-        quantity=plan.quantity,
-        price=plan.price,
-        time_in_force=plan.time_in_force,
-        client_order_id=plan.client_order_id,
-    )
+    try:
+        order = client.new_order(
+            symbol=plan.symbol,
+            side=plan.side,
+            order_type="LIMIT",
+            quantity=plan.quantity,
+            price=plan.price,
+            time_in_force=plan.time_in_force,
+            client_order_id=plan.client_order_id,
+        )
+    except BinanceTransportError as exc:
+        # Accepted-then-timed-out is indistinguishable from rejected locally.
+        logger.warning("submit failed before a response (%s)", exc)
+        _cancel_after_ambiguous_submit(client, plan)
+        raise
+
     order_id = order.get("orderId") if isinstance(order, Mapping) else None
     if order_id is None:
+        _cancel_after_ambiguous_submit(client, plan)
         raise BinanceError(f"order response has no orderId: {order!r}")
     logger.info(
         "order placed: id=%s status=%s type=LIMIT %s %s @ %s",

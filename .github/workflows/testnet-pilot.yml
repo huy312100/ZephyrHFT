@@ -80,6 +80,8 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - uses: actions/setup-python@v7
         with:
@@ -137,6 +139,8 @@ jobs:
       MIN_TICKS: ${{ github.event.inputs.min-ticks }}
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - uses: actions/setup-python@v7
         with:
@@ -197,7 +201,7 @@ jobs:
           if [ "$SKIP_L2" = "true" ]; then
             args+=(--skip-l2)
           fi
-          python scripts/run_testnet_pilot.py "${args[@]}" | tee pilot-output/pilot.log
+          python scripts/run_testnet_pilot.py "${args[@]}" 2>&1 | tee pilot-output/pilot.log
 
       - name: Publish the verdict to the job summary
         if: always()

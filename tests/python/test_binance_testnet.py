@@ -702,6 +702,72 @@ def test_run_cancels_the_order_when_the_first_query_fails():
     assert calls.count("cancel_order") == 1
 
 
+def test_run_cancels_by_client_id_when_the_submit_times_out():
+    class TimedOutSubmitClient(FakeClient):
+        def new_order(self, **kwargs: Any) -> Dict[str, Any]:
+            self.calls.append(("new_order", kwargs))
+            raise BinanceTransportError("read timed out after the POST")
+
+    client = TimedOutSubmitClient()
+    code = pilot.run(
+        _config(),
+        pilot.parse_args(["--skip-l2", "--order-test", "submit"]),
+        client=client,
+    )
+    calls = [name for name, _ in client.calls]
+
+    assert code == 1
+    assert calls.count("new_order") == 1
+    assert "query_order" not in calls
+    assert calls[-1] == "cancel_order"
+    cancel = client.calls[-1][1]
+    assert cancel["symbol"] == "BTCUSDT"
+    assert cancel["client_order_id"].startswith("zephyr-pilot-")
+    assert "order_id" not in cancel
+
+
+def test_run_cancels_by_client_id_when_the_response_has_no_order_id():
+    class NoOrderIdClient(FakeClient):
+        def new_order(self, **kwargs: Any) -> Dict[str, Any]:
+            self.calls.append(("new_order", kwargs))
+            return {"status": "NEW"}
+
+    client = NoOrderIdClient()
+    code = pilot.run(
+        _config(),
+        pilot.parse_args(["--skip-l2", "--order-test", "submit"]),
+        client=client,
+    )
+    calls = [name for name, _ in client.calls]
+
+    assert code == 1
+    assert "query_order" not in calls
+    assert calls[-1] == "cancel_order"
+    assert client.calls[-1][1]["client_order_id"].startswith("zephyr-pilot-")
+
+
+def test_run_treats_unknown_order_during_cleanup_as_nothing_resting(caplog):
+    caplog.set_level(logging.INFO)
+
+    class NeverAcceptedClient(FakeClient):
+        def new_order(self, **kwargs: Any) -> Dict[str, Any]:
+            self.calls.append(("new_order", kwargs))
+            raise BinanceTransportError("connection reset before the POST")
+
+        def cancel_order(self, **kwargs: Any) -> Dict[str, Any]:
+            self.calls.append(("cancel_order", kwargs))
+            raise BinanceAPIError("unknown order sent", status=400, code=-2011)
+
+    code = pilot.run(
+        _config(),
+        pilot.parse_args(["--skip-l2", "--order-test", "submit"]),
+        client=NeverAcceptedClient(),
+    )
+
+    assert code == 1
+    assert "no resting order for clientId=zephyr-pilot-" in caplog.text
+
+
 def test_run_refuses_to_submit_without_balance():
     client = FakeClient(available="0")
     code = pilot.run(
