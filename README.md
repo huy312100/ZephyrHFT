@@ -96,6 +96,15 @@ ctest --test-dir build --output-on-failure
 ./build/tests/hft_tests
 ```
 
+### Continuous integration
+
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs the same sequence on
+`ubuntu-24.04` for Python 3.9 and 3.12: it installs `build-essential` + `cmake`,
+then `requirements.txt` (PyYAML, pybind11, pytest, websockets), configures
+`cpp_engine`, builds `hft_native`, and runs `ctest`, `pytest` and
+`python main.py --demo`. The extension is built into the checkout rather than
+installed, so the job must build before it tests.
+
 ### Manual extension build (fallback)
 
 If CMake is unavailable, the extension can be compiled directly:
@@ -171,14 +180,19 @@ ctest --test-dir build --output-on-failure
 
 # Python (all modules: bindings, strategies, simulator, optimizer)
 python3 -m pytest -v
+
+# Chaos / resilience only (native heartbeat, injector, CLI harness)
+python3 -m pytest tests/python/test_chaos_network.py -v
 ```
 
 The C++ suite covers fixed-point parsing, SPSC concurrency, L2/L3 semantics,
 risk rejections, latency buckets, JSON/WebSocket parsing, average-cost PnL,
-IOC/FOK handling and the full engine flow. Python tests exercise the bindings
-(`test_bindings.py`), the Avellaneda-Stoikov strategy (`test_strategy.py`), the
-paper engine and feed (`test_paper_engine.py`) and the parameter optimizer
-(`test_optimizer.py`).
+IOC/FOK handling, the kill switch and the heartbeat dead-man's switch. Python
+tests exercise the bindings (`test_bindings.py`), the Avellaneda-Stoikov
+strategy (`test_strategy.py`), the paper engine and feed
+(`test_paper_engine.py`), the parameter optimizer (`test_optimizer.py`) and the
+chaos layer end-to-end (`test_chaos_network.py`, which drives
+`tests/chaos_network_test.py` itself).
 
 ### CMake / CTest not on `PATH`
 
@@ -354,6 +368,78 @@ a `.json` path (resolved to its parent directory), and `--plot` adds
 The full plan is in
 [`docs/phase3_backtesting_architecture.md`](docs/phase3_backtesting_architecture.md).
 
+## Chaos & stress testing (Phase 3.1 / 3.2)
+
+Two failure modes dominate a live crypto feed: a socket that dies silently and a
+gateway that answers 900 ms late. Both leave the strategy quoting against a
+stale book, and neither raises an exception. `ChaosNetworkInjector` reproduces
+them at the frame boundary; the native `HeartbeatMonitor` turns the resulting
+silence into a `KillSwitch` halt.
+
+```bash
+# Repeated outages: 400 ms down every second, 100 ms heartbeat deadline
+python3 tests/chaos_network_test.py --mode disconnect_storm \
+  --interval 1.0 --disconnect-s 0.4 --duration 8 \
+  --heartbeat-timeout-ms 100 --recovery-delay 0.5
+
+# Latency spikes: 200-1000 ms on 15% of frames (seeded = reproducible)
+python3 tests/chaos_network_test.py --mode latency_injection \
+  --latency-min-ms 200 --latency-max-ms 1000 --latency-probability 0.15 \
+  --seed 7 --duration 8 --heartbeat-timeout-ms 500
+
+# The same injection inside the Phase 2 live-forward loop
+python3 scripts/run_live_paper.py --source data/sample_events.ndjson \
+  --chaos-mode disconnect_storm --chaos-interval 2 --chaos-disconnect-s 1 \
+  --frame-delay 0.01 --heartbeat-timeout-ms 500
+```
+
+| Layer | Behaviour |
+| --- | --- |
+| `disconnect_storm` | blocks the feed for `--disconnect-s` every `--interval`; the frame in hand is lost, the outage window produces no data, and every reconnect bumps the epoch |
+| `latency_injection` | sleeps `uniform(min, max)` ms on `--latency-probability` of frames; nothing is dropped, so the book stays consistent but stale |
+| `HeartbeatMonitor` (C++) | `beat()` is one release store; `poll()` trips the switch once per expiry window, so a 20 Hz watchdog cannot inflate the trip counter |
+| `HeartbeatWatchdog` (Python) | supervision thread: timeout → `TRIGGERED` → `RECOVERING` → `reset()` only after a fresh frame proves the feed is back |
+| `PaperSession` | checks the switch before every order and stages `cancel_all` / `flatten` for the engine thread |
+
+The harness logs one line per disruption with a marker — `!!` disconnect, `++`
+reconnect, `~~` latency, `..` shutdown, `!!!` heartbeat timeout / kill switch —
+then prints the evidence table and a verdict:
+
+```
+  [PASS] feed survived                      407 forwarded, 407 depth events ingested
+  [PASS] disconnect storm executed          3 outages / 3 reconnects, epoch=3
+  [PASS] dead-man's switch tripped          trips=4, watchdog timeouts=3, limit=250ms
+  [PASS] recovered to NORMAL                state=NORMAL, 3 recovery cycle(s)
+  [PASS] engine left flat and clean         open_orders=0, net=+0.00000000
+  RESULT: PASS
+```
+
+Exit codes are `0` (pass), `2` (any check failed) and `130` (interrupted);
+`--json-out report.json` writes the full evidence — event log, heartbeat stats,
+kill-switch stats, engine metrics and checks — for a CI artefact.
+
+The split of responsibilities is deliberate: the *injector never trips the
+switch*. It only stops delivering frames, the ingestion loop stops beating, and
+the monitor decides the feed is dead — the same causal chain as production.
+`KillSwitch::trip()` then runs the registered hooks, which stage
+`cancel_all -> flatten` and are executed by `PaperSession.service_remediation()`
+on the thread that owns the C++ `paper_engine` (single-threaded by contract, so
+remediation must not run on the supervision thread). Blocking itself is one
+atomic load and takes effect immediately.
+
+Auto-recovery is conditioned on evidence of life: after the remediation window
+the watchdog waits for a frame that arrived *after* the trip before it calls
+`reset()`. A long outage therefore stays halted (orders blocked, position flat)
+for its whole duration instead of flapping between `TRIGGERED` and `NORMAL`.
+Recovery is also scoped to the halt the heartbeat caused: if a drawdown breach,
+a reject streak or an operator already holds the switch, the expiry is still
+reported but the halt is left to its owner, and a trip that lands during the
+recovery window cancels the automatic reset.
+
+Ctrl+C is a graceful path, not an escape: SIGINT/SIGTERM end the loop at a frame
+boundary and then trip the switch, so resting orders are cancelled and the
+position is flattened before the summary is printed.
+
 ## Local Paper Trading & Simulation Guide
 
 The repository ships a self-contained paper-trading loop that streams depth
@@ -456,7 +542,8 @@ each parameter combination on net PnL, Sharpe, Sortino and maximum drawdown.
 
 - **C++20 core (`cpp_engine/`)** — header-only `L2Book`, `OrderManager`,
   `RiskGuard`, `TradingEngine`, lock-free SPSC queues, allocation-free JSON and
-  WebSocket parsing. Exposed to Python via `pybind11` as `hft_native`.
+  WebSocket parsing, plus the `KillSwitch` / `HeartbeatMonitor` resilience pair.
+  Exposed to Python via `pybind11` as `hft_native`.
 - **Strategy layer (`python_analytics/strategies/`)** — `MarketConfig`,
   `MicroPriceCalculator`, `AvellanedaStoikovStrategy`, and the `optimizer`
   grid-search utility. Owns all pricing mathematics.
@@ -465,6 +552,10 @@ each parameter combination on net PnL, Sharpe, Sortino and maximum drawdown.
   (WebSocket / NDJSON / synthetic). `PaperMatchingEngine` implements the same
   duck-typed surface as `TradingEngine`, so the strategy quotes against it
   unchanged.
+- **Chaos (`python_analytics/chaos/`)** — `ChaosNetworkInjector` (frame-gate
+  disconnect storms / latency injection) and `HeartbeatWatchdog` (supervises
+  the native heartbeat and drives the switch through
+  `TRIGGERED -> RECOVERING -> NORMAL`).
 - **Backtesting (`python_analytics/backtesting/`)** — NDJSON replay plus
   Sharpe/drawdown metric helpers.
 - **Scripts (`scripts/`)** — the paper-trading runner and latency benchmark.
@@ -571,6 +662,7 @@ both non-normal states block orders, so a half-flattened book never re-quotes.
 | operator halt | `trip(reason)` | — (always wins, even when disabled) |
 | drawdown breach | `check_drawdown(x)` | `max_drawdown_limit` |
 | reject streak | `record_order_rejected()` / `record_order_accepted()` | `max_consecutive_rejects` |
+| feed silence (dead-man's switch) | `HeartbeatMonitor.poll()` | `HeartbeatConfig.timeout_ns` |
 | clear the halt | `reset()` | — |
 
 `trip()` allocates nothing (the reason is copied into a fixed 192-byte buffer)
@@ -601,8 +693,36 @@ switch.reset()                                # NORMAL, order flow resumes
 `max_drawdown_limit` is an absolute drawdown in quote currency and both
 automatic guards are inert when their limit is `0`; `kill_switch.enabled`
 disables only that automation. A manual `trip()` always stops trading.
-`KillSwitch` is standalone today — attach it to `PaperMatchingEngine` (or a
-live order router) through the cancel/flatten hooks.
+
+`HeartbeatMonitor` (`cpp_engine/include/risk/heartbeat.hpp`) is the dead-man's
+switch for the feed: `beat()` once per delivered frame, `poll()` from a
+supervision thread. Silence longer than `timeout_ns` trips the attached switch
+once per outage (the latch is cleared by the next beat, so a 20 Hz watchdog
+cannot inflate `trip_count`), and `reset()` restarts the window while keeping
+the telemetry, mirroring `KillSwitchStats`.
+
+```python
+from python_analytics.bridge import PaperSession
+from python_analytics.chaos import HeartbeatWatchdog
+from python_analytics.native import hft_native
+from python_analytics.native.factory import build_kill_switch
+from python_analytics.utils import load_settings
+
+switch = build_kill_switch(load_settings())
+session = PaperSession.create("0.1", "84570", kill_switch=switch)
+
+heartbeat = hft_native.HeartbeatMonitor(hft_native.HeartbeatConfig())
+heartbeat.arm(switch)
+watchdog = HeartbeatWatchdog(heartbeat, kill_switch=switch).start()
+heartbeat.beat()          # ...on every frame the feed delivers
+```
+
+`PaperSession` takes the switch directly: `market()` returns
+`{"accepted": False, "blocked": True, "reason": "kill_switch:TRIGGERED"}`
+instead of submitting, and the cancel/flatten hooks stage their work for
+`service_remediation()` on the engine thread (the C++ `paper_engine` is
+single-threaded). Both runners wire this automatically — see
+[Chaos & stress testing](#chaos--stress-testing-phase-31--32).
 
 ## Troubleshooting
 

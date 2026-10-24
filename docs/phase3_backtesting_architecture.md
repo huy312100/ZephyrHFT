@@ -174,6 +174,32 @@ JSON (full summary), CSV (fill log + per-parameter grid), PNG (equity curve, dra
 underwater, fill scatter) via matplotlib when available; silently degrades to
 JSON/CSV-only otherwise.
 
+### 3.7 Chaos & resilience (Task 3.1 / 3.2)
+
+| Module | Responsibility |
+| --- | --- |
+| `cpp_engine/include/risk/heartbeat.hpp` + `src/risk/heartbeat.cpp` | `HeartbeatMonitor`: lock-free dead-man's switch. `beat()` = one release store; `poll()` trips an armed `KillSwitch` once per expiry window; telemetry survives `reset()` |
+| `python_analytics/chaos/network.py` | `ChaosNetworkInjector`: frame gate implementing `disconnect_storm` (block the feed) and `latency_injection` (bounded `uniform(min,max)` delay). Clock/sleep/RNG are injectable, so the schedule is unit-testable |
+| `python_analytics/chaos/watchdog.py` | `HeartbeatWatchdog`: supervision thread; timeout → `TRIGGERED` → `RECOVERING` → optional `reset()` |
+| `python_analytics/bridge.py` | `feed_archive(frame_gate=..., should_stop=...)`; `PaperSession(kill_switch=...)` gates orders and stages `cancel_all`/`flatten` for the engine thread |
+| `tests/chaos_network_test.py` | CLI harness: markers, live telemetry, evidence table, PASS/FAIL verdict, `--json-out` |
+| `tests/python/test_chaos_network.py` | 32 tests: schedule invariants, native monitor/watchdog, bridge seam, session gating, CLI end-to-end |
+
+Design rules:
+
+* **The injector never trips the switch.** It stops delivering frames; the
+  ingestion loop stops beating; the monitor concludes the feed is dead. Same
+  causal chain as production, so a passing run means something.
+* **One trip per outage.** The expiry is latched until the next beat, so a
+  20 Hz watchdog cannot inflate `trip_count` to 20 trips/second.
+* **Recovery needs evidence of life.** The watchdog clears the halt only after
+  a frame arrives *after* the trip, so a long outage stays halted instead of
+  flapping `TRIGGERED -> NORMAL -> TRIGGERED`.
+* **Remediation runs on the engine thread.** `paper_engine` is single-threaded;
+  hooks stage work and `service_remediation()` executes it at a batch boundary.
+* **Shutdown is a first-class path.** SIGINT/SIGTERM stop at a frame boundary,
+  trip the switch (cancel + flatten), print the partial report and exit 130.
+
 ---
 
 ## 4. Performance model
@@ -230,7 +256,14 @@ python3 -m python_analytics.strategies.optimizer \
 # 4. Export charts + telemetry
 python3 scripts/run_backtest.py --source ... --report data/backtests/run_001 --plot
 
-# 5. Tests
+# 5. Chaos / resilience (Task 3.1 / 3.2)
+python3 tests/chaos_network_test.py --mode disconnect_storm \
+  --interval 1.0 --disconnect-s 0.4 --duration 8 --heartbeat-timeout-ms 100
+python3 tests/chaos_network_test.py --mode latency_injection \
+  --latency-min-ms 200 --latency-max-ms 1000 --seed 7 --duration 8 \
+  --heartbeat-timeout-ms 500 --json-out reports/chaos_latency.json
+
+# 6. Tests
 python3 -m pytest tests/python -q
 ```
 

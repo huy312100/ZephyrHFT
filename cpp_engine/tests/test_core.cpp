@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Self-contained unit tests for the C++ HFT core (no external framework).
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -21,6 +22,7 @@
 #include "paper_account.hpp"
 #include "paper_engine.hpp"
 #include "ring_buffer.hpp"
+#include "risk/heartbeat.hpp"
 #include "risk/kill_switch.hpp"
 #include "risk_guard.hpp"
 #include "risk_manager.hpp"
@@ -1230,6 +1232,152 @@ void test_kill_switch_hooks_and_threads() {
     CHECK(concurrent.check_order_allowed());
 }
 
+// The dead-man's switch: a silent feed must trip the kill switch exactly once
+// per expiry window, and a single beat must re-arm it for the next outage.
+void test_heartbeat_monitor() {
+    constexpr std::int64_t kMs = 1'000'000;
+    hft::HeartbeatConfig config;
+    config.timeout_ns = 500 * kMs;
+
+    hft::HeartbeatMonitor monitor(config);
+    CHECK(monitor.timeout_ns() == 500 * kMs);
+    CHECK(!monitor.armed());
+    CHECK(monitor.stats(0).beats == 0);
+    CHECK(monitor.last_beat_ns() == 0);
+
+    // Monotonic timestamps make the state machine deterministic without sleeps.
+    const std::int64_t t0 = 10'000 * kMs;
+    monitor.beat(t0);
+    CHECK(monitor.last_beat_ns() == t0);
+    CHECK(monitor.stats(t0 + 100 * kMs).beats == 1);
+    CHECK(monitor.silence_ns(t0 + 100 * kMs) == 100 * kMs);
+    CHECK(!monitor.is_expired(t0 + 499 * kMs));
+
+    // At the deadline the monitor expires, but only the first poll reports it.
+    CHECK(monitor.is_expired(t0 + 500 * kMs));
+    CHECK(monitor.poll(t0 + 500 * kMs));
+    CHECK(!monitor.poll(t0 + 900 * kMs));
+    CHECK(monitor.stats(t0 + 900 * kMs).timeouts == 1);
+    CHECK(monitor.stats(t0 + 900 * kMs).max_silence_ns >= 900 * kMs);
+
+    // An unarmed monitor still reports expiry; it just has nothing to trip.
+    CHECK(!monitor.armed());
+
+    // A beat re-arms the window so the next outage is detected again.
+    monitor.beat(t0 + 1'000 * kMs);
+    CHECK(!monitor.is_expired(t0 + 1'200 * kMs));
+    CHECK(!monitor.poll(t0 + 1'200 * kMs));
+    CHECK(monitor.poll(t0 + 1'500 * kMs));
+    CHECK(monitor.stats(t0 + 1'500 * kMs).timeouts == 2);
+
+    // Armed: the trip runs through the kill switch, hooks included.
+    hft::KillSwitch kill;
+    int cancels = 0;
+    int flattens = 0;
+    kill.set_cancel_all_hook([&cancels] { ++cancels; });
+    kill.set_flatten_hook([&flattens] { ++flattens; });
+    monitor.arm(kill);
+    CHECK(monitor.armed());
+    CHECK(monitor.stats(t0 + 1'500 * kMs).armed);
+    CHECK(!kill.is_tripped());
+
+    CHECK(!monitor.poll(t0 + 1'500 * kMs));  // same window: latched, no new trip
+    CHECK(!kill.is_tripped());
+
+    monitor.beat(t0 + 2'000 * kMs);
+    CHECK(monitor.poll(t0 + 2'500 * kMs));
+    CHECK(kill.get_state() == hft::SystemState::TRIGGERED);
+    CHECK(!kill.check_order_allowed());
+    CHECK(cancels == 1);
+    CHECK(flattens == 1);
+    CHECK(kill.get_stats().last_trip_reason.find("heartbeat_timeout") == 0);
+
+    // `begin_recovery` keeps orders blocked while remediation is in flight.
+    CHECK(kill.begin_recovery());
+    CHECK(kill.get_state() == hft::SystemState::RECOVERING);
+    CHECK(!kill.check_order_allowed());
+
+    // `reset()` clears the switch and restarts the heartbeat window, but it
+    // keeps the telemetry (beats/timeouts survive, like KillSwitchStats).
+    kill.reset();
+    monitor.reset(t0 + 3'000 * kMs);
+    CHECK(kill.get_state() == hft::SystemState::NORMAL);
+    CHECK(monitor.armed());
+    CHECK(monitor.stats(t0 + 3'000 * kMs).beats == 3);
+    CHECK(monitor.stats(t0 + 3'000 * kMs).timeouts == 3);
+    CHECK(!monitor.is_expired(t0 + 3'100 * kMs));
+
+    // `timeout_ns == 0` disables expiry entirely (pure latency gauge).
+    monitor.set_timeout_ns(0);
+    CHECK(!monitor.is_expired(t0 + 10'000 * kMs));
+    CHECK(!monitor.poll(t0 + 10'000 * kMs));
+    CHECK(monitor.stats(t0 + 10'000 * kMs).max_silence_ns > 0);
+
+    // A vanishing window: a beat before expiry must prevent the trip.
+    hft::HeartbeatMonitor steady(config);
+    hft::KillSwitch steady_kill;
+    steady.arm(steady_kill);
+    for (int i = 0; i < 10; ++i) {
+        steady.beat(t0 + i * 100 * kMs);
+        CHECK(!steady.poll(t0 + i * 100 * kMs + 99 * kMs));
+    }
+    CHECK(!steady_kill.is_tripped());
+    CHECK(steady.stats().timeouts == 0);
+
+    steady.detach();
+    CHECK(!steady.armed());
+}
+
+// Beats come from the ingestion thread while the watchdog polls: the state must
+// stay coherent with no locks on either side.
+void test_heartbeat_concurrency() {
+    hft::HeartbeatConfig config;
+    config.timeout_ns = 50'000'000;  // 50 ms
+    hft::HeartbeatMonitor monitor(config);
+    hft::KillSwitch kill;
+    monitor.arm(kill);
+
+    std::atomic<bool> stop{false};
+    std::atomic<int> torn{0};
+    std::vector<std::thread> threads;
+    threads.emplace_back([&] {
+        while (!stop.load(std::memory_order_relaxed)) {
+            monitor.beat();
+            if (monitor.last_beat_ns() <= 0) {
+                torn.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+    });
+    threads.emplace_back([&] {
+        while (!stop.load(std::memory_order_relaxed)) {
+            (void)monitor.poll();
+            const hft::HeartbeatStats stats = monitor.stats();
+            if (stats.timeout_ns != 50'000'000) {
+                torn.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+    });
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(60));
+    stop.store(true);
+    for (auto& worker : threads) {
+        worker.join();
+    }
+
+    CHECK(torn.load() == 0);
+    CHECK(monitor.stats().beats > 0);
+    CHECK(monitor.stats().max_silence_ns >= 0);
+    // Whether an expiry happened depends on scheduling; the switch must simply
+    // be in a legal state and still block orders if it tripped.
+    const hft::SystemState state = kill.get_state();
+    CHECK(state == hft::SystemState::NORMAL || state == hft::SystemState::TRIGGERED);
+    CHECK(kill.is_tripped() == !kill.check_order_allowed());
+
+    monitor.detach();
+    CHECK(!monitor.armed());
+}
+
+
 void test_paper_account() {
     hft::paper_account account;
     account.reset(N("100000"), -10, 0);
@@ -1396,6 +1544,8 @@ int main() {
     test_kill_switch_basic();
     test_kill_switch_guards();
     test_kill_switch_hooks_and_threads();
+    test_heartbeat_monitor();
+    test_heartbeat_concurrency();
     test_paper_account();
     test_paper_account_fractional_bps();
     test_matching_slippage();
