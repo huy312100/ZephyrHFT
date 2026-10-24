@@ -204,6 +204,26 @@ class AvellanedaStoikovStrategy(Strategy):
         self._vol_samples = 0
 
     # ------------------------------------------------------------------ maths
+    @property
+    def config(self) -> MarketConfig:
+        """The frozen market configuration this instance was built from."""
+        return self._config
+
+    @property
+    def ofi_sensitivity(self) -> float:
+        """Alpha coupling in price units per OFI z-score (``0`` disables it)."""
+        return self._ofi_sensitivity
+
+    @property
+    def ofi_signal(self) -> OfiSignal:
+        """The live OFI normaliser (exposes ``decay``/``cap``)."""
+        return self._ofi_signal
+
+    @property
+    def use_time_spread(self) -> bool:
+        """Whether the ``gamma*sigma^2*(T-t)`` spread term is enabled."""
+        return self._use_time_spread
+
     def reservation_price(self, micro_price: float, inventory: float,
                           time_remaining: float,
                           sigma: Optional[float] = None,

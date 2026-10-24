@@ -125,6 +125,16 @@ class OfiSignal:
         return self._value
 
     @property
+    def decay(self) -> float:
+        """EMA decay used for the running mean/variance."""
+        return self._decay
+
+    @property
+    def cap(self) -> float:
+        """Absolute clip applied to the z-score."""
+        return self._cap
+
+    @property
     def samples(self) -> int:
         """Number of OFI observations ingested."""
         return self._samples
