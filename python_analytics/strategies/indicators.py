@@ -1,6 +1,7 @@
 """Micro-price and order-flow analytics for the strategy layer."""
 from __future__ import annotations
 
+import math
 from typing import Optional
 
 
@@ -78,3 +79,100 @@ class MicroPriceCalculator:
         if ask_price > prev_price:
             return -prev_volume
         return ask_volume - prev_volume
+
+
+class OfiSignal:
+    """Exponentially-weighted, z-scored order-flow imbalance (OFI) signal.
+
+    OFI is noisy and unbounded in price units, so it is normalised against an
+    EMA mean/variance pair and clipped to ``[-cap, cap]``. The resulting
+    ``ofi_z`` is a dimensionless, stationary alpha term suitable for shifting a
+    reservation price via ``ofi_sensitivity * ofi_z``.
+    """
+
+    def __init__(self, decay: float = 0.95, cap: float = 3.0,
+                 warmup: int = 5) -> None:
+        if not 0.0 < decay < 1.0:
+            raise ValueError("decay must be in (0, 1)")
+        if cap <= 0.0:
+            raise ValueError("cap must be positive")
+        self._decay = float(decay)
+        self._cap = float(cap)
+        self._warmup = int(warmup)
+        self._mean = 0.0
+        self._variance = 1.0
+        self._samples = 0
+        self._value = 0.0
+
+    def update(self, ofi: float) -> float:
+        """Ingests a raw OFI observation and returns the z-scored, clipped value."""
+        value = float(ofi)
+        self._samples += 1
+        decay = self._decay
+        self._mean = decay * self._mean + (1.0 - decay) * value
+        deviation = value - self._mean
+        self._variance = decay * self._variance + (1.0 - decay) * deviation ** 2
+        if self._samples < self._warmup or self._variance <= 0.0:
+            self._value = 0.0
+        else:
+            z_score = (value - self._mean) / math.sqrt(self._variance)
+            self._value = max(-self._cap, min(self._cap, z_score))
+        return self._value
+
+    @property
+    def value(self) -> float:
+        """Most recent clipped z-score."""
+        return self._value
+
+    @property
+    def samples(self) -> int:
+        """Number of OFI observations ingested."""
+        return self._samples
+
+    def reset(self) -> None:
+        """Re-initialises the estimator (used between backtest runs)."""
+        self._mean = 0.0
+        self._variance = 1.0
+        self._samples = 0
+        self._value = 0.0
+
+
+class SpreadDepthStats:
+    """Snapshot of top-of-book spread and depth-based microstructure metrics.
+
+    Produces, per tick, the bid/ask spread (absolute and bps), the quoted
+    depth on each side, the depth imbalance and both the mid and micro price.
+    """
+
+    def __init__(self) -> None:
+        self._state: dict = {}
+
+    def update(self, bid_price: float, bid_volume: float,
+               ask_price: float, ask_volume: float) -> dict:
+        """Computes and stores the latest top-of-book statistics."""
+        spread = ask_price - bid_price if bid_price > 0.0 and ask_price > 0.0 else 0.0
+        mid = (bid_price + ask_price) / 2.0 if bid_price > 0.0 and ask_price > 0.0 else 0.0
+        spread_bps = (spread / mid * 10_000.0) if mid > 0.0 else 0.0
+        total_depth = bid_volume + ask_volume
+        depth_imbalance = (
+            (bid_volume - ask_volume) / total_depth if total_depth > 0.0 else 0.0
+        )
+        self._state = {
+            "bid_price": bid_price,
+            "ask_price": ask_price,
+            "bid_volume": bid_volume,
+            "ask_volume": ask_volume,
+            "spread": spread,
+            "spread_bps": spread_bps,
+            "mid": mid,
+            "micro": MicroPriceCalculator.micro_price(
+                bid_price, bid_volume, ask_price, ask_volume
+            ),
+            "depth_imbalance": depth_imbalance,
+        }
+        return self._state
+
+    @property
+    def state(self) -> dict:
+        """Most recent statistics dictionary."""
+        return self._state

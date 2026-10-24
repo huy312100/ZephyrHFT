@@ -57,7 +57,39 @@ strategy:
   order_quantity: "0.05"
   max_inventory: "1.0"
   skew_ticks: 1
+  # Phase 3 Avellaneda-Stoikov parameters (consumed by scripts/run_backtest.py
+  # and the optimizer). ``ofi_sensitivity`` scales the OFI z-score into a
+  # reservation-price shift; ``use_time_spread`` enables the gamma*sigma^2*(T-t)
+  # term in the optimal spread.
+  market_maker:
+    gamma: 0.1
+    sigma: 0.02
+    k: 1.5
+    time_horizon: 60.0
+    inventory_limit: 5.0
+    ofi_sensitivity: 0.0
+    ofi_decay: 0.95
+    ofi_cap: 3.0
+    use_time_spread: true
 
 backtest:
   event_limit: 100000
   record_fills: true
+  # Phase 3 bulk-replay defaults.
+  maker_bps: -1
+  taker_bps: 5
+  initial_cash: 100000.0
+  batch_size: 64
+  frames_per_hook: 1
+  report_dir: data/backtests/latest
+
+# Phase 3 forward paper trading / backtesting runtime (see
+# docs/phase3_backtesting_architecture.md). Not read by load_settings(); kept as
+# the single source of truth for the CLI defaults documented there.
+paper_trading:
+  tick_size: "0.1"
+  center: "84570"
+  maker_bps: -1
+  taker_bps: 5
+  initial_cash: 100000.0
+  order_quantity: "0.01"
