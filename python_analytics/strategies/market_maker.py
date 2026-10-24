@@ -14,7 +14,7 @@ from ..native import hft_native
 from ..utils.config import StrategySettings
 from .base import Quote, Strategy
 from .config import MarketConfig, MarketType
-from .indicators import MicroPriceCalculator
+from .indicators import MicroPriceCalculator, OfiSignal
 
 
 class InventoryMarketMaker(Strategy):
@@ -179,15 +179,26 @@ class AvellanedaStoikovStrategy(Strategy):
 
     name = "avellaneda_stoikov"
 
-    def __init__(self, config: MarketConfig) -> None:
+    def __init__(self, config: MarketConfig, *,
+                 ofi_sensitivity: float = 0.0,
+                 ofi_decay: float = 0.95,
+                 ofi_cap: float = 3.0,
+                 use_time_spread: bool = True) -> None:
         self._config = config
         self._calculator = MicroPriceCalculator()
+        # Alpha coupling: an OFI z-score shifts the reservation price by
+        # ``ofi_sensitivity * ofi_z`` (price units). Zero disables the skew so
+        # the legacy Avellaneda-Stoikov quotes are reproduced exactly.
+        self._ofi_sensitivity = float(ofi_sensitivity)
+        self._ofi_signal = OfiSignal(decay=ofi_decay, cap=ofi_cap)
+        self._use_time_spread = bool(use_time_spread)
         self._bid_id: Optional[int] = None
         self._ask_id: Optional[int] = None
         self._last_quote: Optional[Quote] = None
         self._quotes_sent = 0
         self._rejections = 0
         self._start_monotonic = time.monotonic()
+        self._event_start_ns: Optional[int] = None
         self._last_micro: Optional[float] = None
         self._variance_ema = config.sigma ** 2
         self._vol_samples = 0
@@ -195,33 +206,57 @@ class AvellanedaStoikovStrategy(Strategy):
     # ------------------------------------------------------------------ maths
     def reservation_price(self, micro_price: float, inventory: float,
                           time_remaining: float,
-                          sigma: Optional[float] = None) -> float:
-        """Indifference price ``R = S - q * gamma * sigma**2 * (T - t)``."""
+                          sigma: Optional[float] = None,
+                          ofi_z: float = 0.0) -> float:
+        """Indifference price ``R = S - q*gamma*sigma**2*(T-t) + ofi_sens*ofi_z``.
+
+        The OFI term ``ofi_sensitivity * ofi_z`` skews the reservation toward the
+        prevailing order-flow direction: positive OFI (buy pressure) raises the
+        indifference price, making the maker willing to pay up to stay flat.
+        """
         volatility = self._config.sigma if sigma is None else float(sigma)
-        return micro_price - inventory * self._config.gamma * (
+        reservation = micro_price - inventory * self._config.gamma * (
             volatility ** 2
         ) * time_remaining
+        if self._ofi_sensitivity != 0.0:
+            reservation += self._ofi_sensitivity * float(ofi_z)
+        return reservation
 
-    def optimal_half_spread(self) -> float:
-        """``delta = (1 / gamma) * ln(1 + gamma / k)``."""
+    def optimal_half_spread(self, time_remaining: Optional[float] = None,
+                            sigma: Optional[float] = None) -> float:
+        """Per-side optimal spread.
+
+        ``delta = (1/gamma) * ln(1 + gamma/k)`` is the liquidity component. When
+        ``time_remaining`` and ``sigma`` are supplied the time-decaying inventory
+        component ``(gamma/2) * sigma**2 * (T - t)`` is added, so the full
+        two-sided spread is ``gamma*sigma**2*(T-t) + (2/gamma)*ln(1+gamma/k)``.
+        """
         gamma = self._config.gamma
-        return (1.0 / gamma) * math.log1p(gamma / self._config.k)
+        spread = (1.0 / gamma) * math.log1p(gamma / self._config.k)
+        if (self._use_time_spread and time_remaining is not None
+                and time_remaining > 0.0):
+            volatility = self._config.sigma if sigma is None else float(sigma)
+            spread += 0.5 * gamma * (volatility ** 2) * time_remaining
+        return spread
 
     def raw_quotes(self, micro_price: float, inventory: float,
                    time_remaining: float,
-                   sigma: Optional[float] = None) -> tuple[float, float]:
-        """Unrounded ``(bid, ask)`` around the reservation price."""
+                   sigma: Optional[float] = None,
+                   ofi_z: float = 0.0) -> tuple[float, float]:
+        """Unrounded ``(bid, ask)`` around the (OFI-skewed) reservation price."""
         reservation = self.reservation_price(
-            micro_price, inventory, time_remaining, sigma=sigma
+            micro_price, inventory, time_remaining, sigma=sigma, ofi_z=ofi_z
         )
-        half = self.optimal_half_spread()
-        return reservation - half / 2.0, reservation + half / 2.0
+        half = self.optimal_half_spread(time_remaining, sigma=sigma)
+        return reservation - half, reservation + half
 
     def adjusted_quotes(self, micro_price: float, inventory: float,
                         time_remaining: float,
-                        sigma: Optional[float] = None) -> tuple[float, float]:
+                        sigma: Optional[float] = None,
+                        ofi_z: float = 0.0) -> tuple[float, float]:
         """Raw quotes with market-specific adapter rules applied."""
-        bid, ask = self.raw_quotes(micro_price, inventory, time_remaining, sigma=sigma)
+        bid, ask = self.raw_quotes(micro_price, inventory, time_remaining,
+                                   sigma=sigma, ofi_z=ofi_z)
         if self._config.market_type in (MarketType.STOCK, MarketType.COMMODITIES):
             bid = self.round_to_tick(bid)
             ask = self.round_to_tick(ask)
@@ -279,8 +314,18 @@ class AvellanedaStoikovStrategy(Strategy):
 
         return max(0.0, bid_qty), max(0.0, ask_qty)
 
-    def _time_remaining(self) -> float:
-        elapsed = time.monotonic() - self._start_monotonic
+    def _time_remaining(self, now_ns: Optional[int] = None) -> float:
+        """Seconds until ``T``, measured in event time when ``now_ns`` is given.
+
+        Under replay the exchange ``E`` timestamp (nanoseconds) is authoritative;
+        without it the strategy falls back to wall-clock time for live paper mode.
+        """
+        if now_ns and now_ns > 0:
+            if self._event_start_ns is None:
+                self._event_start_ns = now_ns
+            elapsed = (now_ns - self._event_start_ns) / 1e9
+        else:
+            elapsed = time.monotonic() - self._start_monotonic
         return max(0.0, self._config.time_horizon - elapsed)
 
     def _observe_micro(self, micro_price: float) -> None:
@@ -309,24 +354,33 @@ class AvellanedaStoikovStrategy(Strategy):
     def _to_raw(value: float) -> int:
         return int(round(value * _FIXED_SCALE))
 
-    def quote(self, engine: "hft_native.TradingEngine") -> Optional[Quote]:
+    def quote(self, engine: "hft_native.TradingEngine",
+              now_ns: Optional[int] = None) -> Optional[Quote]:
         bbo = engine.bbo()
         if not bbo.is_valid():
             return None
 
         best_bid = float(bbo.bid_price)
         best_ask = float(bbo.ask_price)
+        bid_volume = float(bbo.bid_quantity)
+        ask_volume = float(bbo.ask_quantity)
         micro = self._calculator.micro_price(
-            best_bid, float(bbo.bid_quantity), best_ask, float(bbo.ask_quantity)
+            best_bid, bid_volume, best_ask, ask_volume
         )
         if micro <= 0.0:
             return None
         self._observe_micro(micro)
 
+        # Alpha coupling: feed the raw OFI into the EMA-z-score signal so a
+        # positive imbalance (buy pressure) raises the reservation price.
+        ofi = self._calculator.update(best_bid, bid_volume, best_ask, ask_volume)
+        ofi_z = self._ofi_signal.update(ofi)
+
         inventory = float(engine.position().net_quantity)
-        time_remaining = self._time_remaining()
+        time_remaining = self._time_remaining(now_ns)
         bid, ask = self.adjusted_quotes(
-            micro, inventory, time_remaining, sigma=self._effective_sigma()
+            micro, inventory, time_remaining, sigma=self._effective_sigma(),
+            ofi_z=ofi_z,
         )
 
         # Session-bound venues stop quoting outside market hours.
@@ -360,10 +414,11 @@ class AvellanedaStoikovStrategy(Strategy):
     # ------------------------------------------------------------ event loop
     def on_depth(self, engine: "hft_native.TradingEngine",
                  depth: "hft_native.DepthUpdate") -> None:
-        self.on_timer(engine, time.monotonic_ns())
+        exchange_ns = int(getattr(depth, "exchange_ts", 0) or 0)
+        self.on_timer(engine, exchange_ns if exchange_ns > 0 else time.monotonic_ns())
 
     def on_timer(self, engine: "hft_native.TradingEngine", now_ns: int) -> None:
-        quote = self.quote(engine)
+        quote = self.quote(engine, now_ns)
         if quote is None:
             self.cancel_all(engine)
             return

@@ -316,6 +316,39 @@ The full engineering specification — architecture, ladder mathematics, fee/PnL
 CLI reference, benchmark methodology and the operational runbook — lives in
 [`docs/phase2_technical_specification.md`](docs/phase2_technical_specification.md).
 
+## High-performance backtesting & alpha optimisation (Phase 3)
+
+Phase 3 turns the Phase 2 `paper_engine` into a batch historical replay and
+optimisation platform, coupling Order-Flow Imbalance into the Avellaneda–Stoikov
+reservation price.
+
+```bash
+# Single-archive backtest with an OFI-skewed Avellaneda–Stoikov market maker
+python3 scripts/run_backtest.py \
+  --source data/raw_l2/binance_futures_btcusdt_depth_100ms_20261021T173329Z_00001.ndjson.gz \
+  --tick-size 0.1 --center 84570 \
+  --strategy avellaneda_stoikov --gamma 0.1 --k 5 --ofi-sensitivity 0.5 \
+  --maker-bps -1 --taker-bps 5 --order-quantity 0.01 \
+  --report data/backtests/run_001
+
+# Parameter optimisation (grid / random / Bayesian)
+python3 -c "from python_analytics.strategies.optimizer import grid_search; \
+  from python_analytics.simulator.paper_engine import synthetic_depth_messages; \
+  lines=[next(synthetic_depth_messages(mid=100.0,tick=0.5,seed=1)) for _ in range(200)]; \
+  print(grid_search({'gamma':[0.1,0.5],'k':[5,10]}, lines, metric='composite', \
+  tick_size=0.5, center=100.0, order_quantity=0.1).best_params)"
+```
+
+| Stage | Behaviour |
+| --- | --- |
+| Replay | `BulkReplayer` streams `.ndjson.gz` archives through `hft_native.ingest_lines()` (zero-allocation C++ matching), with an optional per-frame strategy hook, gap accounting and REST-snapshot seeding |
+| Alpha | `OfiSignal` (EMA z-score) shifts the A-S reservation price by `ofi_sensitivity · ofi_z`; the spread includes the `γσ²(T−t)` term |
+| Optimisation | `grid_search`, `random_search` and `bayesian_search` (scipy/skopt optional) minimise drawdown + inventory variance while maximising Sharpe and fill ratio |
+| Reporting | `quant_summary` emits realized/unrealized PnL, Sharpe/Sortino, max drawdown, win rate, profit factor, holding time, turnover, fill rate, slippage and latency percentiles; `export_report` writes JSON/CSV/PNG |
+
+The full plan is in
+[`docs/phase3_backtesting_architecture.md`](docs/phase3_backtesting_architecture.md).
+
 ## Local Paper Trading & Simulation Guide
 
 The repository ships a self-contained paper-trading loop that streams depth

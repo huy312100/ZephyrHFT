@@ -30,8 +30,11 @@ def test_sortino_ratio_accuracy() -> None:
 def test_backtest_parameters_single_run() -> None:
     generator = synthetic_depth_messages(mid=100.0, tick=0.5, seed=2)
     lines = [next(generator) for _ in range(250)]
+    # ``k=5.0`` models a liquid book: the corrected Avellaneda-Stoikov spread
+    # ``(1/gamma)*ln(1+gamma/k)`` is then narrow enough that the synthetic
+    # ±3-tick jumps trade through our resting quotes.
     config = MarketConfig(
-        gamma=0.1, sigma=0.02, k=1.5, tick_size=0.5,
+        gamma=0.1, sigma=0.02, k=5.0, tick_size=0.5,
         market_type=MarketType.CRYPTO, time_horizon=60.0, order_quantity=0.1,
     )
     metrics = backtest_parameters(config, lines, center=100.0)
@@ -47,7 +50,7 @@ def test_grid_search_returns_best_params() -> None:
     generator = synthetic_depth_messages(mid=100.0, tick=0.5, seed=1)
     lines = [next(generator) for _ in range(300)]
     result = grid_search(
-        {"gamma": [0.1, 0.5], "k": [1.0, 2.0]},
+        {"gamma": [0.1, 0.5], "k": [2.0, 5.0]},
         lines,
         metric="net_pnl",
         tick_size=0.5,
