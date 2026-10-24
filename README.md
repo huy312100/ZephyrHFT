@@ -36,6 +36,14 @@ used at the orchestration/analytics boundary.
   `time_horizon`) scoring Sharpe, Sortino, drawdown and net PnL.
 - **Latency benchmark** (`scripts/run_benchmark.py`) measuring tick-to-quote
   microseconds through the C++ `RiskGuard`.
+- **Walk-forward OOS validation** (`scripts/run_walk_forward.py`): a frozen,
+  fingerprinted parameter lock re-verified around every window, contiguous
+  windows with a look-ahead guard, boundary-settled ledger accounting and
+  per-window Sharpe/Sortino aggregated into one out-of-sample curve.
+- **Production readiness gate** (`scripts/generate_readiness_report.py`):
+  re-measures the Phase 1–4 promises (ingestion integrity, engine latency and
+  ledger coherence, chaos self-healing, dead-man's switch, parameter lock) and
+  prints a GO/NO-GO verdict with JSON + Markdown artefacts.
 - **Real-time L2 capture** (`scripts/ingest_l2.py`): asyncio WebSocket client
   that stamps every frame with `time.time_ns()`, reports venue-to-host latency
   percentiles and archives the raw payloads as gzip NDJSON roll files with
@@ -723,6 +731,61 @@ instead of submitting, and the cancel/flatten hooks stage their work for
 `service_remediation()` on the engine thread (the C++ `paper_engine` is
 single-threaded). Both runners wire this automatically — see
 [Chaos & stress testing](#chaos--stress-testing-phase-31--32).
+
+## Walk-forward out-of-sample validation (Phase 4)
+
+A single backtest over the data you tuned on is an in-sample number. Phase 4
+splits the archive into contiguous windows, freezes the parameters in a lock file
+*before* the first window, re-verifies them after every window, and chains the
+ledger across boundaries so the reported equity belongs to one continuous
+account.
+
+```bash
+# Two contiguous OOS windows over the bundled sample, lock file written for audit
+python3 scripts/run_walk_forward.py --source data/sample_events.ndjson \
+  --window-events 400 --k 5.0 \
+  --write-lock config/walk_forward_lock.json --report-dir reports
+
+# Verify a lock you did not create: the run refuses to start on any drift
+python3 scripts/run_walk_forward.py --source data/raw_l2/*.ndjson.gz \
+  --window-events 5000 --k 5.0 --lock-file config/walk_forward_lock.json
+```
+
+| Layer | Behaviour |
+| --- | --- |
+| `LockedParameters` | One frozen parameter set (strategy, venue class, costs, sizing) with a `sha256`-derived fingerprint; `diff()` names every drifted field, and an unknown `MarketType` is rejected at construction instead of mid-run |
+| `WalkForwardRunner` | Slices each archive into contiguous windows, builds a *fresh* strategy per window, and runs the native paper engine over it — window `n+1` never sees window `n`'s events |
+| Look-ahead guard | Every event must be non-decreasing in `E` and confined to its own window; an out-of-order or overlapping event raises `LookAheadError` rather than silently shifting a fill |
+| Boundary settlement | A position opened inside a window is settled at that window's last mark, so `realized + boundary_settled + unrealized` closes the ledger to ~1e-7 across the whole run |
+| Aggregation | `aggregate_windows` reports net/gross PnL, per-window Sharpe/Sortino (from the chained equity curve), hit rate, fill ratio, profit factor and the ledger residual |
+
+## Production readiness gate (Phase 5)
+
+`scripts/generate_readiness_report.py` re-measures every Phase 1–4 promise and
+prints a GO/NO-GO verdict against explicit thresholds, so "is this build
+shippable?" is a command, not an opinion.
+
+```bash
+# Full gate: JSON + Markdown artefacts under reports/, exit code 0/1/2
+python3 scripts/generate_readiness_report.py
+
+# Console verdict only, plus the opt-in profitability gate
+python3 scripts/generate_readiness_report.py --no-report --min-oos-sharpe 0.5
+```
+
+| Phase | Gates |
+| --- | --- |
+| 1 — ingestion | settings self-consistency (positive tick/center, kill switch armed), archive integrity (`0` malformed, `0` sequence gaps) on the real NDJSON, ingest rate (info) |
+| 2 — execution | engine p99 ≤ 50 µs, p999 ≤ 500 µs, replay ≥ 1,000 depth events/s, equity-vs-PnL ledger residual ≤ 1e-2, `0` rejected orders, fill activity > 0 % |
+| 3 — resilience | disconnect storm self-heals (`reconnects == outages`, every frame accounted for), latency injection spikes but never exceeds its ceiling, dead-man's switch trips on silence, blocks orders, releases only on an explicit reset and can trip again |
+| 4 — validation | parameter lock re-verified, look-ahead chronology verified on every boundary, aggregate ledger residual ≤ 2e-2, ≥ 2 OOS windows, optional `--min-oos-sharpe` |
+
+Engine, chaos and walk-forward evidence come from a seeded synthetic book
+(`--evidence-events`, `--seed`), so the verdict reproduces on any machine;
+`reports/walk_forward.json` is reused when present (`--recompute-walk-forward`
+forces a fresh study). Profitability is deliberately opt-in: a build can be
+production-ready while the alpha is not, and conflating the two hides which one
+is broken. Artefacts: `reports/production_readiness_report.{json,md}`.
 
 ## Troubleshooting
 
