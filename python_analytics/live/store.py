@@ -151,6 +151,11 @@ class OrderStore:
                 + ", ".join(KNOWN_STATUSES)
             )
         with self._conn:
+            # Take the write lock up front: the status read and the update it
+            # authorises must be one transaction. An implicit transaction would
+            # only lock at the UPDATE, leaving a window in which another writer
+            # can move this row to a terminal state between check and write.
+            self._conn.execute("BEGIN IMMEDIATE")
             row = self._conn.execute(
                 "SELECT status FROM orders WHERE client_order_id = ?",
                 (str(client_order_id),),

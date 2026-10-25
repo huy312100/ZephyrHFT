@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -41,12 +42,17 @@ from python_analytics.exchange.binance_futures import (
     OrderValidationError,
     Position,
 )
-from python_analytics.live.store import LiveStoreError, OrderStore
+from python_analytics.live.store import ACTIVE_STATUSES, LiveStoreError, OrderStore
 
 logger = logging.getLogger(__name__)
 
 #: Binance's "order does not exist" code, returned when querying by client id.
 UNKNOWN_ORDER_CODE = -2013
+
+#: Binance's "timeout waiting for response from backend" code: the request may
+#: have reached the matcher, so the order has to be resolved rather than
+#: assumed rejected.
+AMBIGUOUS_SUBMIT_CODE = -1007
 
 #: Venue status strings mapped onto the store's vocabulary.
 VENUE_STATUS = {
@@ -61,6 +67,19 @@ VENUE_STATUS = {
 }
 
 
+def _is_ambiguous_api_error(exc: BinanceAPIError) -> bool:
+    """True when the venue may have accepted an order we could not confirm.
+
+    HTTP 5xx and ``-1007`` are the venue saying "I do not know", not "no": the
+    matcher may be holding the order. An ordinary 4xx rejection is the venue
+    saying no, and only that is recorded as ``REJECTED``.
+    """
+
+    if exc.code == AMBIGUOUS_SUBMIT_CODE:
+        return True
+    return isinstance(exc.status, int) and exc.status >= 500
+
+
 class LiveExecutionError(RuntimeError):
     """Raised when a live execution invariant would be violated."""
 
@@ -71,13 +90,19 @@ class AlphaGateError(LiveExecutionError):
 
 @dataclass(frozen=True)
 class SubmissionResult:
-    """Outcome of one submit attempt, including the resolved-ambiguity case."""
+    """Outcome of one submit attempt, including the resolved-ambiguity case.
+
+    ``code`` carries the venue's error code when the venue rejected the order,
+    so a caller can tell a post-only crossing rejection (nothing rested) from a
+    rejection that needs an operator.
+    """
 
     client_order_id: str
     status: str
     venue_order_id: Optional[int] = None
     retryable: bool = False
     note: Optional[str] = None
+    code: Optional[int] = None
 
     @property
     def accepted(self) -> bool:
@@ -237,21 +262,68 @@ class LiveExecutor:
             # ask the venue instead of guessing.
             self._store.mark_status(cid, "UNKNOWN", note=f"transport error: {exc}")
             self._store.record_event("transport_error", f"{cid}: {exc}")
-            status = self.resolve(cid)
+            status = self._resolve_after_ambiguity(cid)
+            if status is None:
+                # The lookup failed too. UNKNOWN is the honest answer and
+                # reconciliation can chase it; REJECTED would lose the order.
+                return SubmissionResult(
+                    cid,
+                    "UNKNOWN",
+                    retryable=True,
+                    note=f"transport error and the venue lookup failed: {exc}",
+                )
             return SubmissionResult(
                 cid, status, note="resolved after transport error"
             )
         except BinanceAPIError as exc:
+            if _is_ambiguous_api_error(exc):
+                # A 5xx or -1007 means the matcher may hold the order. Marking
+                # it REJECTED would silently drop a live quote, so resolve it.
+                note = f"ambiguous venue response: {exc}"
+                self._store.mark_status(cid, "UNKNOWN", note=note)
+                self._store.record_event("ambiguous_submit", f"{cid}: {exc}")
+                status = self._resolve_after_ambiguity(cid)
+                if status is None:
+                    return SubmissionResult(
+                        cid,
+                        "UNKNOWN",
+                        retryable=True,
+                        note=note + "; venue lookup also failed",
+                    )
+                return SubmissionResult(
+                    cid, status, note=f"resolved after ambiguous response: {exc}"
+                )
             note = f"venue rejected: {exc}"
             self._store.mark_status(cid, "REJECTED", note=note)
             self._store.record_event("order_rejected", f"{cid}: {exc}")
-            return SubmissionResult(cid, "REJECTED", note=note)
+            return SubmissionResult(cid, "REJECTED", note=note, code=exc.code)
 
         venue_order_id = payload.get("orderId") if isinstance(payload, Mapping) else None
         self._store.mark_status(cid, "SUBMITTED", venue_order_id=venue_order_id)
         self._store.record_event("order_submitted", f"{cid}: {px} x {qty}")
         logger.info("submitted %s %s %s @ %s", self.symbol, side, qty, px)
         return SubmissionResult(cid, "SUBMITTED", venue_order_id=venue_order_id)
+
+    def _resolve_after_ambiguity(self, client_order_id: str) -> Optional[str]:
+        """Asks the venue about an unconfirmed submit; ``None`` means it failed.
+
+        A failed lookup leaves the row ``UNKNOWN`` on purpose: reconciliation can
+        chase an unresolved order, whereas a ``REJECTED`` row would be treated
+        as dead and the resting quote would be forgotten.
+        """
+
+        try:
+            return self.resolve(client_order_id)
+        except BinanceError as exc:
+            self._store.record_event(
+                "resolve_failed", f"{client_order_id}: {exc}"
+            )
+            logger.error(
+                "could not resolve %s after an ambiguous submit: %s",
+                client_order_id,
+                exc,
+            )
+            return None
 
     def resolve(self, client_order_id: str) -> str:
         """Asks the venue what became of ``client_order_id`` and records it."""
@@ -307,12 +379,25 @@ class LiveExecutor:
         venue_open = self._client.open_orders(self.symbol)
         venue_ids = {o.client_order_id for o in venue_open if o.client_order_id}
         local_active = self._store.active_orders(self.symbol)
-        local_ids = {row["client_order_id"] for row in local_active}
+        local_status = {
+            str(row["client_order_id"]): str(row["status"]) for row in local_active
+        }
 
         adopted: List[OpenOrder] = []
         for order in venue_open:
             cid = order.client_order_id
-            if cid and cid in local_ids:
+            if cid and cid in local_status:
+                # The venue holds it, so the submit landed even if our write of
+                # SUBMITTED did not. Promote the rows that still say otherwise;
+                # a SUBMITTED/ADOPTED row already records the same fact.
+                if local_status[cid] in ("INTENT", "UNKNOWN"):
+                    self._store.mark_status(
+                        cid,
+                        "SUBMITTED",
+                        venue_order_id=order.order_id,
+                        note="venue holds the order; promoted during reconcile",
+                    )
+                    local_status[cid] = "SUBMITTED"
                 continue
             if not cid:
                 self._store.record_event(
@@ -371,7 +456,8 @@ class LiveExecutor:
 
         Callers must log the return value and exit non-zero on a non-empty list:
         a kill switch that reports success it did not achieve is worse than no
-        kill switch at all.
+        kill switch at all. An order the venue still reports as working after
+        the cancel is therefore a failure, not a success.
         """
 
         errors: List[str] = []
@@ -402,11 +488,28 @@ class LiveExecutor:
                 logger.error("panic: flatten failed: %s", exc)
 
         for row in self._store.active_orders(self.symbol):
-            self._store.mark_status(
-                str(row["client_order_id"]),
-                "CANCELLED" if cancel_ok else "UNKNOWN",
-                note=f"panic: {reason}",
-            )
+            cid = str(row["client_order_id"])
+            if cancel_ok:
+                # Cancelling all is not proof of each order's fate: it may have
+                # filled in the same instant. Ask the venue and record the
+                # answer, falling back to CANCELLED only if that query fails.
+                try:
+                    status = self.resolve(cid)
+                except BinanceError as exc:
+                    errors.append(f"resolve {cid}: {exc}")
+                    logger.error("panic: resolve failed for %s: %s", cid, exc)
+                    status = "CANCELLED"
+                else:
+                    if status in ACTIVE_STATUSES:
+                        # The venue still reports it working: a live quote, not
+                        # a clean kill, so the caller must not see success.
+                        errors.append(f"{cid} still {status} after cancel_all")
+                        logger.error(
+                            "panic: %s is still %s after cancel_all", cid, status
+                        )
+            else:
+                status = "UNKNOWN"
+            self._store.mark_status(cid, status, note=f"panic: {reason}")
 
         self._store.record_event(
             "panic_complete", f"{reason}: errors={errors or 'none'}"
@@ -468,10 +571,16 @@ def alpha_gate_verdict(report: Mapping[str, Any]) -> Tuple[bool, str]:
             net = block.get("net_pnl")
     if net is None:
         return False, "readiness report carries no alpha.net_pnl"
+    if isinstance(net, bool):
+        # JSON true/false is not a PnL: float(True) == 1.0 would arm on a typo.
+        return False, f"alpha.net_pnl must be a number, not a boolean: {net!r}"
     try:
         value = float(net)
     except (TypeError, ValueError):
         return False, f"alpha.net_pnl is not numeric: {net!r}"
+    if not math.isfinite(value):
+        # inf > 0 and nan comparisons are all false; neither is evidence.
+        return False, f"alpha.net_pnl must be finite: {net!r}"
     if value <= 0:
         return (
             False,

@@ -248,6 +248,27 @@ def test_build_timeline_from_files_merges_captures_and_checks_the_market(
         build_timeline_from_files([first, other])
 
 
+def test_build_timeline_from_files_carries_the_ladder_across_the_boundary(
+        tmp_path: Path) -> None:
+    first = tmp_path / "before.ndjson"
+    second = tmp_path / "after.ndjson"
+    first.write_text(json.dumps({"e": "depthUpdate", "E": BASE_MS, "s": "BTCUSDT",
+                                 "b": [["100.0", "1"]], "a": [["101.0", "1"]]}) + "\n",
+                     encoding="utf-8")
+    # Rotation splits a capture by size, not by market event: this delta only
+    # removes a level created in the first file. A fresh ladder per file would
+    # keep the delete as a no-op, leave no ask, and drop the sample entirely.
+    second.write_text(json.dumps({"e": "depthUpdate", "E": BASE_MS + 1_000,
+                                  "s": "BTCUSDT", "b": [["100.0", "0"], ["99.8", "1"]],
+                                  "a": []}) + "\n", encoding="utf-8")
+
+    timeline = build_timeline_from_files([first, second])
+
+    assert len(timeline) == 2
+    assert timeline.ignored == 0
+    assert timeline.at_or_before(BASE_NS + 1_000 * 1_000_000)[1] == pytest.approx(100.4)
+
+
 # --------------------------------------------------------------------------- #
 # Resolution
 # --------------------------------------------------------------------------- #
@@ -532,8 +553,27 @@ def test_parse_fill_payload_refuses_rows_it_cannot_sign_or_time() -> None:
     with pytest.raises(ValueError, match="side"):
         parse_fill_payload([{"ts_ns": BASE_NS, "side": "long", "price": 1.0,
                              "quantity": 1.0}])
+    # A missing side must be refused, never defaulted to BUY: the default would
+    # report a profitable buy markout for what was actually a sell.
+    with pytest.raises(ValueError, match="side"):
+        parse_fill_payload([{"timestamp": BASE_MS, "price": 1.0, "quantity": 1.0}])
     with pytest.raises(ValueError, match="list"):
         parse_fill_payload({"fills": "nope"})
+
+
+def test_parse_fill_payload_reads_the_venue_qty_and_maker_aliases() -> None:
+    # Binance's myTrades export names the size ``qty`` and the passive flag
+    # ``maker``; reading only the snake_case names would misclassify the fill.
+    fills = parse_fill_payload([
+        {"time": BASE_MS, "side": "SELL", "price": "100.0", "qty": "0.25",
+         "maker": False},
+        {"time": BASE_MS + 5, "side": "BUY", "price": "100.0", "qty": 0.5,
+         "maker": True},
+    ])
+
+    assert [fill.quantity for fill in fills] == [pytest.approx(0.25), pytest.approx(0.5)]
+    assert [fill.is_maker for fill in fills] == [False, True]
+    assert fills[0].ts_ns == BASE_NS
 
 
 def test_load_fills_reads_a_file_with_an_explicit_nanosecond_clock(

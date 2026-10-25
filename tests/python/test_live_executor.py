@@ -273,6 +273,75 @@ def test_transport_error_with_no_venue_record_is_lost(store: OrderStore) -> None
     assert row["status"] == "LOST"
 
 
+def test_transport_error_whose_lookup_fails_stays_unknown(store: OrderStore) -> None:
+    client = FakeClient()
+    client.new_order_error = BinanceTransportError("read timeout")
+    client.query_result = BinanceTransportError("dns still down")
+    executor, _ = _executor(store, client)
+
+    result = executor.submit_post_only(side="BUY", quantity="0.002", price="79980")
+
+    # The lookup failed too. Guessing either way is worse than leaving a row
+    # that reconciliation will chase.
+    assert result.status == "UNKNOWN"
+    assert result.retryable
+    row = store.get(result.client_order_id)
+    assert row is not None
+    assert row["status"] == "UNKNOWN"
+    assert "resolve_failed" in [event["kind"] for event in store.events()]
+
+
+def test_server_error_submit_is_resolved_not_rejected(store: OrderStore) -> None:
+    client = FakeClient()
+    client.new_order_error = BinanceAPIError("service unavailable", status=503)
+    client.query_result = {"orderId": 77, "status": "NEW"}
+    executor, _ = _executor(store, client)
+
+    result = executor.submit_post_only(side="BUY", quantity="0.002", price="79980")
+
+    # 5xx is "I do not know", not "no": the matcher may hold the order.
+    assert result.status == "SUBMITTED"
+    assert result.accepted
+    row = store.get(result.client_order_id)
+    assert row is not None
+    assert row["status"] == "SUBMITTED"
+    assert row["venue_order_id"] == 77
+    kinds = [event["kind"] for event in store.events()]
+    assert "ambiguous_submit" in kinds
+    assert "order_rejected" not in kinds
+
+
+def test_backend_timeout_code_is_ambiguous_not_rejected(store: OrderStore) -> None:
+    client = FakeClient()
+    client.new_order_error = BinanceAPIError(
+        "timeout waiting for response from backend", code=-1007
+    )
+    client.query_result = BinanceAPIError("order does not exist", code=-2013)
+    executor, _ = _executor(store, client)
+
+    result = executor.submit_post_only(side="BUY", quantity="0.002", price="79980")
+
+    assert result.status == "LOST"
+    kinds = [event["kind"] for event in store.events()]
+    assert "ambiguous_submit" in kinds
+    assert "order_rejected" not in kinds
+
+
+def test_server_error_whose_lookup_fails_stays_unknown(store: OrderStore) -> None:
+    client = FakeClient()
+    client.new_order_error = BinanceAPIError("bad gateway", status=502)
+    client.query_result = BinanceAPIError("still down", status=503)
+    executor, _ = _executor(store, client)
+
+    result = executor.submit_post_only(side="BUY", quantity="0.002", price="79980")
+
+    assert result.status == "UNKNOWN"
+    assert result.retryable
+    row = store.get(result.client_order_id)
+    assert row is not None
+    assert row["status"] == "UNKNOWN"
+
+
 def test_post_only_rejection_is_recorded_not_raised(store: OrderStore) -> None:
     client = FakeClient()
     client.new_order_error = BinanceAPIError("would immediately trigger", code=-2010)
@@ -394,6 +463,35 @@ def test_reconcile_is_clean_when_the_books_agree(store: OrderStore) -> None:
     assert report.position is None
 
 
+def test_reconcile_promotes_local_orders_the_venue_holds(store: OrderStore) -> None:
+    client = FakeClient()
+    executor, _ = _executor(store, client)
+    for cid, status in (("crashed-intent", "INTENT"), ("ambiguous", "UNKNOWN")):
+        store.record_intent(
+            client_order_id=cid, symbol="BTCUSDT", side="BUY",
+            price="79980", quantity="0.002",
+        )
+        if status != "INTENT":
+            store.mark_status(cid, status)
+    client.orders = [
+        _open_order("crashed-intent", order_id=7),
+        _open_order("ambiguous", order_id=8),
+    ]
+
+    report = executor.reconcile()
+
+    # The venue holding the order proves the submit landed even if the local
+    # write did not: promote it instead of resolving it as vanished.
+    assert report.clean
+    assert report.adopted == []
+    assert report.vanished == []
+    for cid, order_id in (("crashed-intent", 7), ("ambiguous", 8)):
+        row = store.get(cid)
+        assert row is not None
+        assert row["status"] == "SUBMITTED"
+        assert row["venue_order_id"] == order_id
+
+
 def test_reconcile_reports_the_position(store: OrderStore) -> None:
     client = FakeClient(position=_position("0.002"))
     executor, _ = _executor(store, client)
@@ -412,6 +510,7 @@ def test_panic_cancels_orders_and_flattens(store: OrderStore) -> None:
     client = FakeClient(position=_position("0.002"))
     executor, _ = _executor(store, client)
     result = executor.submit_post_only(side="BUY", quantity="0.002", price="79980")
+    client.query_result = {"orderId": 4242, "status": "CANCELED"}
 
     errors = executor.panic("signal: SIGINT")
 
@@ -422,6 +521,25 @@ def test_panic_cancels_orders_and_flattens(store: OrderStore) -> None:
     assert row is not None
     assert row["status"] == "CANCELLED"
     assert "panic" in [event["kind"] for event in store.events()]
+    # A cancel-all is followed by a per-order query: an order can fill in the
+    # same instant, and the book of record should say so, not assume CANCELLED.
+    assert "order_resolved" in [event["kind"] for event in store.events()]
+
+
+def test_panic_reports_an_order_the_venue_still_holds(store: OrderStore) -> None:
+    client = FakeClient()
+    executor, _ = _executor(store, client)
+    result = executor.submit_post_only(side="BUY", quantity="0.002", price="79980")
+    client.query_result = {"orderId": 4242, "status": "NEW"}
+
+    errors = executor.panic("signal: SIGINT")
+
+    # cancel_all returned, but the venue still reports the quote working: that
+    # is exposure, so the kill switch must not report a clean shutdown.
+    assert any("still SUBMITTED" in error for error in errors)
+    row = store.get(result.client_order_id)
+    assert row is not None
+    assert row["status"] == "SUBMITTED"
 
 
 def test_panic_does_not_flatten_a_flat_book(store: OrderStore) -> None:
@@ -517,6 +635,22 @@ def test_gate_rejects_a_zero_net_even_when_checks_pass(tmp_path: Path) -> None:
     ok, detail = alpha_gate_verdict(json.loads(report.read_text(encoding="utf-8")))
     assert not ok
     assert "needs > 0" in detail
+
+
+def test_gate_rejects_a_boolean_net(tmp_path: Path) -> None:
+    report = _write_report(tmp_path, net=True)
+    ok, detail = alpha_gate_verdict(json.loads(report.read_text(encoding="utf-8")))
+    assert not ok
+    # float(True) == 1.0 would otherwise arm a live session on a typo.
+    assert "boolean" in detail
+
+
+@pytest.mark.parametrize("net", [float("inf"), float("-inf"), float("nan")])
+def test_gate_rejects_a_non_finite_net(tmp_path: Path, net: float) -> None:
+    report = _write_report(tmp_path, net=net)
+    ok, detail = alpha_gate_verdict(json.loads(report.read_text(encoding="utf-8")))
+    assert not ok
+    assert "finite" in detail
 
 
 def test_gate_honours_a_red_headline_over_passing_checks(tmp_path: Path) -> None:

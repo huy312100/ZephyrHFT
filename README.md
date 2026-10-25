@@ -1143,7 +1143,7 @@ python3 scripts/run_live_trader.py --cancel-all
 | No resurrected orders | `FILLED`/`CANCELLED`/`REJECTED`/`EXPIRED`/`LOST` are terminal in the store |
 | No blind cancels | Reconciliation adopts foreign orders instead of killing them |
 | No silent unwind failure | `panic()` returns the failures it hit; the script logs them and exits non-zero |
-| No real money without evidence | Production needs `--live` **and** a fresh positive alpha in `reports/production_readiness_report.json` |
+| No real money without evidence | Production needs `--live` **and** a fresh positive alpha in `reports/production_readiness_report.json`; `--cancel-all` is exempt, because the kill switch must not depend on an arming flag |
 
 The last row is the one that matters today: the committed study is `NO-GO`
 (`net_pnl = -16.47 USDT` after fees), so `--live` exits `3` until either the

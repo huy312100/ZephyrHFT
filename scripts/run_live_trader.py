@@ -34,6 +34,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import math
 import signal
 import sys
 from decimal import Decimal, InvalidOperation
@@ -56,6 +57,7 @@ from python_analytics.live import (
     AlphaGateError,
     LiveExecutor,
     OrderStore,
+    SubmissionResult,
     alpha_gate_verdict,
     require_alpha_go,
 )
@@ -68,6 +70,12 @@ DEFAULT_STORE = "state/live_orders.sqlite3"
 DEFAULT_REPORT = "reports/production_readiness_report.json"
 DEFAULT_QUANTITY = "0.002"
 DEFAULT_OFFSET_BPS = 5.0
+
+#: Binance's post-only rejection: ``-2010`` with "Order would immediately
+#: trigger". It means GTX refused to cross, so nothing rested and nothing is
+#: owed. Any other rejection needs an operator, not a success code.
+POST_ONLY_REJECTION_CODE = -2010
+POST_ONLY_REJECTION_TEXT = "would immediately trigger"
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -151,8 +159,10 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         parser.error(f"--quantity must be a positive decimal: {args.quantity!r}")
     if args.offset_bps <= 0:
         parser.error("--offset-bps must be > 0 to keep the quote passive")
-    if args.max_report_age_hours <= 0:
-        parser.error("--max-report-age-hours must be positive")
+    if not math.isfinite(args.max_report_age_hours) or args.max_report_age_hours <= 0:
+        # nan/inf would slip through a plain ``<= 0`` check and disable the
+        # freshness test that keeps a stale GO from arming real money.
+        parser.error("--max-report-age-hours must be finite and > 0")
     if args.recv_window <= 0:
         parser.error("--recv-window must be positive")
     if args.timeout <= 0:
@@ -160,6 +170,32 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     if args.submit and args.cancel_all:
         parser.error("--submit and --cancel-all are mutually exclusive")
     return args
+
+
+def _production_refused(
+    config: BinanceFuturesConfig, args: argparse.Namespace
+) -> bool:
+    """True when a production run lacks the explicit ``--live`` opt-in.
+
+    ``--cancel-all`` is exempt: the kill switch must work on the environment it
+    is needed on, and refusing to cancel an open position because an arming flag
+    was omitted is the wrong failure mode. It still bypasses the alpha gate.
+    """
+
+    return not config.is_testnet and not (args.live or args.cancel_all)
+
+
+def _post_only_crossing_rejected(result: SubmissionResult) -> bool:
+    """True only for a venue-confirmed post-only crossing rejection.
+
+    GTX refusing to cross means nothing rested, so the run is clean. Every other
+    rejection — filters, margin, an unknown code — leaves the operator with a
+    question and must exit non-zero.
+    """
+
+    if result.status != "REJECTED" or result.code != POST_ONLY_REJECTION_CODE:
+        return False
+    return POST_ONLY_REJECTION_TEXT in (result.note or "").lower()
 
 
 def _mid_price(payload: object) -> Decimal:
@@ -210,14 +246,25 @@ def run(
 ) -> int:
     executor = LiveExecutor(client, store, args.symbol)
 
-    if not client.time_synced:
-        logger.info("clock offset: %+d ms", client.sync_time())
-
     if args.cancel_all:
+        # Clock sync matters for signed requests, but a failure must not stop
+        # the kill path: report it alongside the panic result and still try.
+        sync_error: Optional[str] = None
+        if not client.time_synced:
+            try:
+                logger.info("clock offset: %+d ms", client.sync_time())
+            except BinanceError as exc:
+                sync_error = f"sync_time: {exc}"
+                logger.error("clock sync failed before panic: %s", exc)
         errors = executor.panic("operator requested --cancel-all")
         for error in errors:
             logger.error("panic step failed: %s", error)
+        if sync_error is not None:
+            errors = [sync_error, *errors]
         return 0 if not errors else 1
+
+    if not client.time_synced:
+        logger.info("clock offset: %+d ms", client.sync_time())
 
     report = executor.reconcile()
     logger.info("%s", report.describe())
@@ -259,9 +306,12 @@ def run(
     )
     logger.info("submit result: %s", result.describe())
 
-    if result.accepted or result.status == "REJECTED":
-        # A post-only rejection means nothing was left resting: not a failure.
+    if result.accepted:
         return 0
+    if _post_only_crossing_rejected(result):
+        logger.warning("post-only quote would have crossed; nothing rested")
+        return 0
+    logger.error("submit did not leave a resting order: %s", result.describe())
     return 1
 
 
@@ -275,10 +325,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         logger.error("configuration error: %s", exc)
         return 2
 
-    if not config.is_testnet and not args.live:
+    if _production_refused(config, args):
         logger.error(
             "refusing to run: BINANCE_ENV=%s. This harness talks to the testnet "
-            "unless --live is passed explicitly.",
+            "unless --live is passed explicitly; --cancel-all is the only "
+            "production exception.",
             config.environment,
         )
         return 2

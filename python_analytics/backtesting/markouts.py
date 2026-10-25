@@ -81,7 +81,13 @@ _NANOS_THRESHOLD = 1e15
 
 
 def side_sign(value: Any) -> float:
-    """``+1`` for a buy, ``-1`` for a sell; accepts ``'Side.BUY'`` and ``1``."""
+    """``+1`` for a buy, ``-1`` for a sell; accepts ``BUY``/``SELL`` spellings.
+
+    Every string spelling that contains ``BUY`` or ``SELL`` is accepted,
+    including the engine's ``'Side.BUY'``. A bare integer such as ``1`` is
+    refused: it is ambiguous between "buy" and "side enum 1", and guessing it
+    would silently flip the sign of a markout.
+    """
     text = str(value).upper()
     if "BUY" in text:
         return 1.0
@@ -429,6 +435,114 @@ def iter_capture_lines(path: Path) -> Iterable[str]:
             yield line
 
 
+class _TimelineBuilder:
+    """Stateful feed parser: one book, one ticker, one timeline.
+
+    The ladder state is what makes multi-file analysis honest. A capture is
+    split into files by size, not by market event, so the first ``depthUpdate``
+    of the second file may delete a level created by the first. Parsing each
+    file with a fresh ladder would drop that delta — and a midpoint computed
+    from half a book is not a measurement, it is a fabrication.
+    """
+
+    __slots__ = ("timeline", "book", "ticker", "want", "explicit", "file_symbol")
+
+    def __init__(self, symbol: Optional[str] = None) -> None:
+        self.timeline = MarkoutTimeline(symbol=symbol)
+        self.book = TopOfBook()
+        self.ticker: Optional[Tuple[float, float]] = None
+        self.want = symbol.upper() if symbol else None
+        self.explicit = bool(symbol)
+        #: First symbol seen in the file most recently passed to :meth:`feed`.
+        self.file_symbol: Optional[str] = None
+
+    def feed(self, lines: Iterable[str]) -> MarkoutTimeline:
+        """Applies one capture's lines to the running book and timeline."""
+        timeline = self.timeline
+        book = self.book
+        self.file_symbol = None
+
+        for raw in lines:
+            text = raw.strip() if isinstance(raw, str) else str(raw).strip()
+            if not text:
+                continue
+            try:
+                message = json.loads(text)
+            except (TypeError, ValueError):
+                timeline.malformed += 1
+                continue
+            if not isinstance(message, Mapping):
+                timeline.malformed += 1
+                continue
+
+            frame_symbol = message.get("s") or message.get("symbol")
+            if frame_symbol:
+                name = str(frame_symbol).upper()
+                if self.file_symbol is None:
+                    self.file_symbol = name
+                if self.want is None:
+                    self.want = name
+                    timeline.symbol = name
+                elif name != self.want:
+                    timeline.ignored += 1
+                    continue
+
+            kind = str(message.get("e") or message.get("type") or "")
+            ts_ns = _message_ts_ns(message)
+
+            if kind == "depthUpdate" or ("b" in message and "a" in message
+                                         and isinstance(message.get("b"), list)):
+                book.apply("BUY", message.get("b") or ())
+                book.apply("SELL", message.get("a") or ())
+                mid = book.mid
+                if mid is None and self.ticker is not None:
+                    mid = (self.ticker[0] + self.ticker[1]) / 2.0
+                if ts_ns is None:
+                    timeline.ignored += 1
+                    continue
+                if not timeline.add(ts_ns, mid if mid is not None else 0.0,
+                                    book.spread_bps):
+                    timeline.ignored += 1
+                continue
+
+            if "lastUpdateId" in message:
+                book.set(message.get("bids") or (), message.get("asks") or ())
+                if ts_ns is None:
+                    timeline.ignored += 1
+                    continue
+                if not timeline.add(ts_ns, book.mid or 0.0, book.spread_bps):
+                    timeline.ignored += 1
+                continue
+
+            if kind == "bookTicker" or (
+                    not kind
+                    and isinstance(message.get("b"), (str, float, int))
+                    and isinstance(message.get("a"), (str, float, int))):
+                # The type-based branch must not run for a known kind: a spot
+                # `trade` frame carries buyer/seller *order ids* in `b`/`a`, and
+                # reading those as a bid/ask would fabricate a mid.
+                try:
+                    bid = float(message["b"])
+                    ask = float(message["a"])
+                except (TypeError, ValueError, KeyError):
+                    timeline.malformed += 1
+                    continue
+                if (not (math.isfinite(bid) and math.isfinite(ask))
+                        or ask < bid or bid <= 0.0):
+                    timeline.malformed += 1
+                    continue
+                self.ticker = (bid, ask)
+                mid = book.mid or (bid + ask) / 2.0
+                spread = book.spread_bps or (ask - bid) / mid * 10_000.0
+                if ts_ns is None or not timeline.add(ts_ns, mid, spread):
+                    timeline.ignored += 1
+                continue
+
+            timeline.ignored += 1
+
+        return timeline
+
+
 def build_timeline(lines: Iterable[str], *,
                    symbol: Optional[str] = None) -> MarkoutTimeline:
     """Builds a mid-price timeline from depth / best-bid-ask frames.
@@ -444,109 +558,33 @@ def build_timeline(lines: Iterable[str], *,
     :attr:`MarkoutTimeline.ignored` and never blended in: averaging BTC and ETH
     mids would produce a number that looks like evidence and is not.
     """
-    timeline = MarkoutTimeline(symbol=symbol)
-    book = TopOfBook()
-    ticker: Optional[Tuple[float, float]] = None
-    want = symbol.upper() if symbol else None
-
-    for raw in lines:
-        text = raw.strip() if isinstance(raw, str) else str(raw).strip()
-        if not text:
-            continue
-        try:
-            message = json.loads(text)
-        except (TypeError, ValueError):
-            timeline.malformed += 1
-            continue
-        if not isinstance(message, Mapping):
-            timeline.malformed += 1
-            continue
-
-        frame_symbol = message.get("s") or message.get("symbol")
-        if frame_symbol:
-            name = str(frame_symbol).upper()
-            if want is None:
-                want = name
-                timeline.symbol = name
-            elif name != want:
-                timeline.ignored += 1
-                continue
-
-        kind = str(message.get("e") or message.get("type") or "")
-        ts_ns = _message_ts_ns(message)
-
-        if kind == "depthUpdate" or ("b" in message and "a" in message
-                                     and isinstance(message.get("b"), list)):
-            book.apply("BUY", message.get("b") or ())
-            book.apply("SELL", message.get("a") or ())
-            mid = book.mid
-            if mid is None and ticker is not None:
-                mid = (ticker[0] + ticker[1]) / 2.0
-            if ts_ns is None:
-                timeline.ignored += 1
-                continue
-            if not timeline.add(ts_ns, mid if mid is not None else 0.0,
-                                book.spread_bps):
-                timeline.ignored += 1
-            continue
-
-        if "lastUpdateId" in message:
-            book.set(message.get("bids") or (), message.get("asks") or ())
-            if ts_ns is None:
-                timeline.ignored += 1
-                continue
-            if not timeline.add(ts_ns, book.mid or 0.0, book.spread_bps):
-                timeline.ignored += 1
-            continue
-
-        if kind == "bookTicker" or (not kind
-                                    and isinstance(message.get("b"), (str, float, int))
-                                    and isinstance(message.get("a"), (str, float, int))):
-            # The type-based branch must not run for a known kind: a spot `trade`
-            # frame carries buyer/seller *order ids* in `b`/`a`, and reading those
-            # as a bid/ask would fabricate a mid.
-            try:
-                bid = float(message["b"])
-                ask = float(message["a"])
-            except (TypeError, ValueError, KeyError):
-                timeline.malformed += 1
-                continue
-            if not (math.isfinite(bid) and math.isfinite(ask)) or ask < bid or bid <= 0.0:
-                timeline.malformed += 1
-                continue
-            ticker = (bid, ask)
-            mid = book.mid or (bid + ask) / 2.0
-            spread = book.spread_bps or (ask - bid) / mid * 10_000.0
-            if ts_ns is None or not timeline.add(ts_ns, mid, spread):
-                timeline.ignored += 1
-            continue
-
-        timeline.ignored += 1
-
-    return timeline
+    return _TimelineBuilder(symbol=symbol).feed(lines)
 
 
 def build_timeline_from_files(paths: Iterable[Any], *,
                               symbol: Optional[str] = None) -> MarkoutTimeline:
-    """Concatenates capture files (plain or ``.gz``) into one timeline."""
-    timeline: Optional[MarkoutTimeline] = None
+    """Concatenates capture files (plain or ``.gz``) into one timeline.
+
+    Every file is fed through a single :class:`_TimelineBuilder`, so the
+    ``TopOfBook``, ticker and symbol state survive a file boundary: a delta in
+    the second file can still remove a level created in the first, and the
+    resulting mid is computed from the whole ladder rather than from a
+    half-applied one. A file that names a different market is still refused.
+    """
+    builder = _TimelineBuilder(symbol=symbol)
     for raw_path in paths:
         path = Path(raw_path)
         if not path.exists():
             raise FileNotFoundError(f"capture not found: {path}")
-        chunk = build_timeline(iter_capture_lines(path), symbol=symbol)
-        if timeline is None:
-            timeline = chunk
-            continue
-        if chunk.symbol and timeline.symbol and chunk.symbol != timeline.symbol:
+        builder.feed(iter_capture_lines(path))
+        file_symbol = builder.file_symbol
+        timeline_symbol = builder.timeline.symbol
+        if (not builder.explicit and file_symbol and timeline_symbol
+                and file_symbol != timeline_symbol):
             raise ValueError(
-                f"{path} carries {chunk.symbol} but the timeline is "
-                f"{timeline.symbol}; pass --symbol to analyse one market")
-        for ts_ns, mid, spread in chunk.samples():
-            timeline.add(ts_ns, mid, spread)
-        timeline.malformed += chunk.malformed
-        timeline.ignored += chunk.ignored
-    return timeline if timeline is not None else MarkoutTimeline(symbol=symbol)
+                f"{path} carries {file_symbol} but the timeline is "
+                f"{timeline_symbol}; pass --symbol to analyse one market")
+    return builder.timeline
 
 
 def _as_bool(value: Any, *, default: bool) -> bool:
@@ -590,6 +628,11 @@ def parse_fill_payload(payload: Any, *, clock: str = "ms") -> List[MarkoutFill]:
     ``'ns'`` for a steady-clock log. A replay's steady-clock fills cannot be
     marked against a capture at all — pass them through
     :class:`MarkoutReplayer` instead, which never leaves the engine's clock.
+
+    A fill must name its side: defaulting a missing ``side`` to ``BUY`` would
+    invert the markout of every sell. Quantity is read from ``quantity`` or
+    Binance's ``qty``, and the maker flag from ``is_maker`` or the venue's
+    ``maker``, so a ``myTrades`` export classifies taker fills correctly.
     """
     if isinstance(payload, Mapping):
         rows = payload.get("fills")
@@ -604,14 +647,22 @@ def parse_fill_payload(payload: Any, *, clock: str = "ms") -> List[MarkoutFill]:
     for index, row in enumerate(rows):
         if not isinstance(row, Mapping):
             raise ValueError(f"fill {index} is not an object")
+        quantity = row.get("quantity")
+        if quantity in (None, ""):
+            quantity = row.get("qty")
+        maker = row.get("is_maker")
+        if maker is None:
+            maker = row.get("maker")
         try:
             fills.append(
                 MarkoutFill(
                     ts_ns=_fill_ts_ns(row, clock),
-                    side=row.get("side", "BUY"),
+                    # Never guess the side: a BUY default silently inverts the
+                    # sign of every markout for a sell that did not name itself.
+                    side=row["side"],
                     price=float(row["price"]),
-                    quantity=float(row["quantity"]),
-                    is_maker=_as_bool(row.get("is_maker"), default=True),
+                    quantity=float(quantity),
+                    is_maker=_as_bool(maker, default=True),
                     symbol=row.get("symbol") or row.get("s"),
                 )
             )
