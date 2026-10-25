@@ -7,7 +7,7 @@ vendor bill that can quietly start accruing.
 | Reviewer | Responsibility | Trigger | Cost |
 | --- | --- | --- | --- |
 | **CodeRabbit** | Primary review: walkthrough, per-line findings, follow-up chat | automatic on push; `@coderabbitai review` | free for public repos |
-| **Sourcery** | Second opinion on a different model, plus on-demand failover and its security checks | automatic on push; `@sourcery-ai review` | free for public repos |
+| **Sourcery** | Second opinion on a different model, plus a full on-demand review and security checks | automatic on push (partial, capped at five); `@sourcery-ai review` for a complete one | free for public repos |
 
 CodeRabbit is configured in [`.coderabbit.yaml`](../.coderabbit.yaml), which is
 version-controlled, so its instructions change by pull request like any other
@@ -39,11 +39,23 @@ CodeRabbit, in a pull request comment:
 
 Sourcery, in a pull request comment:
 
-- `@sourcery-ai review` — request a review; this also resets the once-per-push limit
-- `@sourcery-ai summary` — PR summary and reviewer's guide
-- `@sourcery-ai guide`, `@sourcery-ai title`
-- `@sourcery-ai resolve` — mark its comments addressed
-- `@sourcery-ai dismiss` — remove its comments from the pull request
+- `@sourcery-ai review` — runs a complete review from scratch and resets the
+  re-review counter
+- `@sourcery-ai summary` — regenerates the summary in the pull request
+  description
+- `@sourcery-ai guide` — regenerates the reviewer's guide comment
+- `@sourcery-ai title` — regenerates the pull request title
+- `@sourcery-ai resolve` — resolves Sourcery's open review comments
+- `@sourcery-ai dismiss` — dismisses the **Sourcery review status check**. It
+  does not remove comments; use `resolve` to clear those.
+
+Sourcery's automatic review after a push is deliberately **partial**: it
+re-checks its existing comments against the new code, resolves the threads the
+new commits address, and re-runs the security scans, but it does not repeat the
+full read or regenerate the summary, guide or inline findings. Those automatic
+re-reviews are capped at five per pull request, after which the check reports
+Skipped. So when a branch is final and worth a real second opinion, say
+`@sourcery-ai review` — that resets the counter and does the whole thing again.
 
 ## Sourcery dashboard setup
 
@@ -60,7 +72,11 @@ config file, so these live here:
 6. **Auto-approve low-risk pull requests: leave OFF.** A bot approval that can
    satisfy a required review is not a control, and this repository can move
    real money.
-7. Keep Sourcery's status check **not required** in branch protection.
+7. Leave Sourcery's `Sourcery review` status check **not required**. The check
+   posts in every state, including Skipped, so requiring it would not block a
+   merge on a rate limit — but it does report Failure when a blocking security
+   finding needs changes, so requiring it would make a third party's opinion
+   merge-blocking. Turn that on deliberately, not by accident.
 
 Then add one review rule per block below (Rules tab: path patterns plus rule
 text). All plans support custom rules; each rule text must stay under 3,000
