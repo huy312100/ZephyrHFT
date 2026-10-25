@@ -599,7 +599,8 @@ Other failure shapes:
 | Engine p99 is host-sensitive | Two runs on the same machine, differing only in background load, move p99 from `1.4 µs` to `11.3 µs` and p999 from `8 µs` to `724 µs` (§3.3). The 5.0 µs budget is only meaningful with the cores and the load characterised |
 | Chaos runs on a fake monotonic clock | Deterministic and fast, but it does not exercise the socket, the TLS stack or the kernel's retransmit timers |
 | The dead-man's switch is driven directly | It proves monitor + kill-switch semantics, not the full live feed loop that must eventually beat into it |
-| No production exchange gateway, persistence or reconciliation exists (the testnet pilot is connectivity/validation only) | The gate cannot and does not certify them |
+| The live layer (`python_analytics/live`, §11) gives a durable order store, reconciliation and a kill path, but it cannot manufacture an edge | It bounds the damage of being wrong; it does not make the strategy right. That is why arming real money is gated on a fresh alpha `GO` rather than on the build verdict |
+| Markout exists (§11.4) but funding accounting and alerting do not | Adverse selection is now measured per fill; a live session that *looks* flat can still be losing to funding or to an unresolved `UNKNOWN` order nobody was paged about |
 | `pip-audit` is a separate CI step | Its result is not part of the GO/NO-GO verdict; read the workflow log (one dev-only advisory is currently ignored) |
 | A report is a point-in-time snapshot | Re-run per release **and per host**; a `GO` from last month on another machine is not evidence about this one |
 
@@ -650,3 +651,154 @@ git commit -m "readiness: GO on <host> $(date -u +%Y-%m-%dT%H:%MZ)"
 If the fit changes, regenerate the lock with `--write-lock` and re-review the
 study — never hand-edit `config/walk_forward_lock.json`. A study that no longer
 matches its lock is not evidence, and the gate will say so.
+
+---
+
+## 11. Live execution layer
+
+`python_analytics/live` turns "the strategy wants a quote" into an order the
+process and the venue agree exists. It is the part that decides whether a bad
+day is a bad day or an unbounded loss.
+
+### 11.1 What it guarantees
+
+| Guarantee | Mechanism |
+| --- | --- |
+| An intent is durable before the venue sees it | `OrderStore.record_intent` commits `INTENT` + `client_order_id` first; a crash mid-submit leaves a row, not a surprise |
+| A timeout is never guessed | After `BinanceTransportError` the order is queried by `clientOrderId`; found → `SUBMITTED`, `-2013` → `LOST`, anything else → `UNKNOWN` |
+| An ambiguous submit is resolved, not rejected | HTTP 5xx, `-1006` and `-1007` all mean "execution status unknown": the row is marked `UNKNOWN` and queried by `clientOrderId`; only an ordinary 4xx is recorded as `REJECTED`. A failed lookup leaves `UNKNOWN` for reconciliation to chase, never `REJECTED` |
+| Terminal states are terminal | `FILLED`, `CANCELLED`, `REJECTED`, `LOST` refuse further transitions (`LiveStoreError`) |
+| Orders this process did not place are adopted, not ignored | `reconcile()` records them as `ADOPTED` — passively; it never cancels a manual order |
+| Orders that vanished are resolved | `reconcile()` queries each stale id and writes the venue's answer |
+| The kill path tells the truth | `panic()` cancels all, flattens only if a position exists, resolves each working order after a successful cancel, reports an order the venue still holds as a failure, leaves an order `UNKNOWN` when the cancel or the follow-up query fails, returns the list of failures |
+| Real money needs evidence, not a flag | `require_alpha_go()` reads `reports/production_readiness_report.json`: every `alpha.*` check must pass, `evidence.alpha.net_pnl > 0`, the timestamp must be within `--max-report-age-hours` |
+
+### 11.2 Running it
+
+```bash
+# testnet: reconcile only (safe, no orders)
+export BINANCE_ENV=testnet BINANCE_API_KEY=... BINANCE_API_SECRET=...
+python3 scripts/run_live_trader.py --store state/live_orders.sqlite3
+
+# testnet: one post-only quote, 5 bps from the mid
+python3 scripts/run_live_trader.py --submit --side BUY --quantity 0.002 --offset-bps 5
+
+# kill switch: cancel the symbol and flatten (works on any environment)
+python3 scripts/run_live_trader.py --cancel-all
+
+# production: refused unless --live AND the alpha gate is green
+python3 scripts/run_live_trader.py --live
+```
+
+Exit codes: `0` done/clean, `1` drift, an unresolved order or a rejected submit
+that was not a post-only cross (`-2010` "would immediately trigger", or the
+futures `-5022` "could not be executed as maker"), `2` configuration or
+environment refusal, `3` the alpha gate refused to arm, `130` interrupted. On
+an interrupt, cancellation and flattening are **attempted**, not guaranteed: a
+failed clock sync, cancel or flatten is logged on the way out, so inspect the
+venue before assuming the book is flat.
+
+### 11.3 What is still missing before this is a business
+
+1. **An edge.** The committed study is `NO-GO`: `net_pnl = -16.47 USDT` over 229
+   fills with `2.0 bps` maker / `5.0 bps` taker charged. Nothing in this layer
+   changes that sign. Real capture + a re-run study is the work.
+2. **~~Markout.~~** Shipped in §11.4. It answers the question item 1 cannot: the
+   study's maker fills are marked at `-0.43 bps` one second after the trade, so
+   the quote is being picked off and the fee is not the only problem.
+3. **Funding.** Perpetual funding is charged every 8h and is currently not in
+   the ledger; a carry-heavy session will drift from the paper model.
+4. **A loop.** `run_live_trader.py` places at most one quote. Re-quoting,
+   inventory limits and a per-session loss cap belong in a supervisor that
+   calls `LiveExecutor`, not in this script.
+5. **Alerting.** `panic()` returns failures; nothing pages a human yet.
+
+Until 1, 3 and 4 exist, a production run is `--cancel-all` plus a manual smoke
+test under `--override-alpha`, and the override sentence is the audit record
+that says so.
+
+### 11.4 Markout: is the quote earning the spread or being run over?
+
+`python_analytics/backtesting/markouts.py` marks every fill against the mid that
+followed it, signed by side and net of the fee it paid:
+
+    markout_bps(h)  = side * (mid(t + h) - fill_price) / fill_price * 10_000
+    net_edge_bps(h) = markout_bps(h) - maker_bps
+
+`h = 0` is spread capture (a maker that rests at the bid should show roughly
+`+half_spread`); longer horizons are adverse selection, the mid leaving before
+inventory can be worked out. `scripts/run_markout.py` reports the distribution
+per horizon, per maker/taker and per maker side, and prints one verdict.
+
+| Verdict | Test | Exit |
+| --- | --- | --- |
+| `GO` | `markout - fee > --min-edge-bps` at the primary horizon with `t >= 1.96` | `0` |
+| `MARGINAL` | positive after fees, `t < 1.96` | `1` |
+| `COSTLY` | the captured spread does not cover the fee | `1` |
+| `ADVERSE_SELECTION` | mean markout `< 0` with `t <= -1.96` | `1` |
+| `INCONCLUSIVE` | fewer than `--min-samples` marked fills | `3` |
+
+Three design decisions matter more than the statistics:
+
+* **Simulated fills are marked in-loop, never joined.** The C++ engine stamps
+  `Fill.timestamp` with `steady_clock`, which has an arbitrary epoch, so a
+  replay fill cannot be looked up in a capture. `MarkoutReplayer` measures it
+  during the replay instead — the mid behind `h = 0` is the book that produced
+  the fill, and later horizons are later frames of the same feed. Venue-clock
+  fills (a real session exported as JSON) go through `--fills` instead, where
+  the join is legitimate because both sides carry the exchange timestamp.
+* **A missing sample is truncated, not interpolated.** A horizon with no sample
+  inside `--tolerance-ms` is counted and excluded. Carrying the last mid forward
+  across a feed outage is how a hole becomes a fake edge.
+* **Units are recovered from the frame, not from the magnitude.** Two clocks
+  reach the hook: `Bbo.exchange_ts` carries the venue's raw `E` in
+  **milliseconds** despite the C++ type being named `Nanos`, while an archive
+  without timestamps advances a synthetic nanosecond counter. The replayer
+  chooses by asking whether `exchange_ts` is non-zero, because a magnitude rule
+  would flip units mid-replay (the synthetic counter passes the millisecond
+  range after 1000 frames). `to_nanos()` never routes a nanosecond value through
+  a float, because `1.7e18` is beyond float64's exact integer range.
+
+#### What the committed study shows
+
+`python3 scripts/run_markout.py` on `data/sample_events.ndjson`, 230 maker fills
+(0 taker), lock `b29a62ed93caf69a`, fee `2.0 bps`:
+
+| horizon | fills | mean bps | median | t | win % | net of fee |
+| --- | --- | --- | --- | --- | --- | --- |
+| 0 s | 230 | −0.434 | −0.434 | n/a (σ≈0) | 0.0% | −2.43 |
+| 1 s | 227 | −0.429 | −0.434 | −6.48 | 36.1% | −2.43 |
+| 10 s | 199 | −0.505 | −0.434 | −2.62 | 42.7% | −2.51 |
+| 60 s | 55 | −0.810 | −1.101 | −1.19 | 45.5% | −2.81 |
+
+Verdict: **`ADVERSE_SELECTION`**. Two readings, both uncomfortable:
+
+* **The quote never captures the spread.** Mean entry offset is `-0.434 bps`
+  against a `0.667 bps` spread, i.e. every fill prints *through* the mid. The
+  paper engine fills a resting quote when the touch crosses it, so a quote that
+  the strategy posted inside the spread is filled only by the move that runs it
+  over. This is also a fidelity gap: live `post_only` (`timeInForce=GTX`) would
+  have rejected such a quote instead of filling it.
+* **It keeps getting worse on the same fills.** Over the 55 fills that have a
+  60 s sample at both ends, the mean moves from `-0.434 bps` to `-0.810 bps`, a
+  `-0.38 bps` drift. Separately, the `1 s` markout totals `-2.92 USDT` against
+  the study's gross PnL of `-2.74 USDT`; that comparison is indicative only —
+  the markout covers 227 of the study's 230 fills and values each at its own
+  1 s mid, while gross PnL uses the study's position accounting and valuation
+  times. The proximity of these totals does not establish a ledger
+  reconciliation; that would require the same fills and valuation time in both
+  calculations.
+
+Neither reading can be fixed by tuning costs. The next study has to post a quote
+that actually rests behind the touch (and model post-only rejection), or find an
+edge large enough to survive being filled adversely.
+
+#### Known limits of the measurement
+
+* Fills are a selected sample: a quote that never filled cannot be marked, and
+  the fills that did are exactly the ones the market chose to give you.
+* Above and beyond the fee, nothing else is priced in — funding, queue position
+  and inventory risk are outside the number.
+* With `--frames-per-hook n`, a fill and its mid are both attributed to the hook
+  that ended the batch, so horizons shorter than `n` frames are not measurable.
+  Keep the study's `--frames-per-hook` when comparing to its report.

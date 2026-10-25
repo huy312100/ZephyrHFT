@@ -53,6 +53,17 @@ used at the orchestration/analytics boundary.
   (HMAC-SHA256, stdlib only), `exchangeInfo` filter validation, balance check,
   L2 depth sample and a dry-run or place → query → cancel order lifecycle against
   the testnet. Refuses to run against production.
+- **Live execution layer** (`python_analytics/live/` + `scripts/run_live_trader.py`):
+  a SQLite book of record written *before* each request, `clientOrderId`-keyed
+  resolution of ambiguous submits, start-up reconciliation that adopts unseen
+  venue orders and resolves vanished ones, one kill path that cancels and
+  flattens, and an arming gate that refuses real money unless the readiness
+  report shows a fresh positive alpha net.
+- **Markout analyzer** (`python_analytics/backtesting/markouts.py` +
+  `scripts/run_markout.py`): marks every fill against the mid 1 s / 10 s / 60 s
+  later, signed by side, subtracts the fee and returns GO / MARGINAL / COSTLY /
+  ADVERSE_SELECTION — the difference between "the fees ate the edge" and "the
+  quote was picked off".
 
 ## Phase status
 
@@ -93,8 +104,10 @@ python3 scripts/generate_readiness_report.py
 ├── scripts/
 │   ├── run_paper_trading.py  # 60s live/mock paper-trading dashboard
 │   ├── run_testnet_pilot.py  # Binance Futures testnet micro-pilot (signed REST)
+│   ├── run_live_trader.py    # live reconcile / one post-only quote / kill switch
 │   ├── ingest_l2.py          # real-time L2 capture -> gzip NDJSON roll files
 │   ├── run_walk_forward.py   # Phase 4 OOS study + parameter lock
+│   ├── run_markout.py        # per-fill markout: spread capture vs adverse selection
 │   ├── generate_readiness_report.py  # Phase 5 GO/NO-GO gate
 │   └── run_benchmark.py      # tick-to-quote latency benchmark
 ├── docs/
@@ -1105,6 +1118,102 @@ Nothing here changes the pilot: it still refuses `BINANCE_ENV=production`, and
 `_request` still has no retry loop, so a failed submit can never be duplicated
 silently.
 
+### Live execution harness
+
+`scripts/run_live_trader.py` is the runtime that turns those primitives into a
+session you can restart: `python_analytics/live` keeps a SQLite book of record,
+resolves ambiguous submits by `clientOrderId`, reconciles at start-up and owns
+the kill path.
+
+```bash
+# Reconcile only: adopt what the venue holds, resolve what vanished
+python3 scripts/run_live_trader.py --store state/live_orders.sqlite3
+
+# One post-only quote, 5 bps from the book mid
+python3 scripts/run_live_trader.py --submit --side BUY --quantity 0.002
+
+# Kill switch: cancel the symbol and flatten the position
+python3 scripts/run_live_trader.py --cancel-all
+```
+
+| Property | How it is enforced |
+| --- | --- |
+| No invisible orders | The intent row is committed before `POST /fapi/v1/order`; `clientOrderId` is the dedupe key |
+| No guessing after a timeout | `BinanceTransportError`, and the `-1006`/`-1007` "execution status unknown" codes, → query by client id → `SUBMITTED` / `LOST` (`-2013`) / `UNKNOWN` |
+| No resurrected orders | `FILLED`/`CANCELLED`/`REJECTED`/`EXPIRED`/`LOST` are terminal in the store |
+| No blind cancels | Reconciliation adopts foreign orders instead of killing them |
+| No silent unwind failure | `panic()` returns the failures it hit; the script logs them and exits non-zero |
+| No real money without evidence | Production needs `--live` **and** a fresh positive alpha in `reports/production_readiness_report.json`; `--cancel-all` is exempt, because the kill switch must not depend on an arming flag |
+
+The last row is the one that matters today: the committed study is `NO-GO`
+(`net_pnl = -16.47 USDT` after fees), so `--live` exits `3` until either the
+study turns green or someone writes `--override-alpha "<reason>"`, which is
+recorded in the order store's audit trail. The remaining gaps — markout,
+funding, a re-quoting loop, alerting — are listed in
+[`docs/phase5_production_readiness.md` §11.3](docs/phase5_production_readiness.md#113-what-is-still-missing-before-this-is-a-business).
+
+### Markout: is the quote being picked off?
+
+PnL cannot tell "the fees ate the edge" from "the queue ran me over", and those
+two failures need opposite fixes. `scripts/run_markout.py` marks every fill
+against the mid that followed it:
+
+```text
+markout_bps(h) = side * (mid(t + h) - fill_price) / fill_price * 10_000
+net_edge_bps(h) = markout_bps(h) - maker_fee_bps
+```
+
+```bash
+# mark the study's own fills, window-for-window, on the engine's event clock
+python3 scripts/run_markout.py
+
+# mark a real session's fills (venue clock, ms) against a capture
+python3 scripts/run_markout.py --fills state/fills.json --source 'data/raw_l2/*.jsonl.gz'
+```
+
+| Verdict | Meaning | Exit |
+| --- | --- | --- |
+| `GO` | markout at the primary horizon clears the fee with `t >= 1.96` | `0` |
+| `MARGINAL` | positive after fees, but not statistically distinguishable from zero | `1` |
+| `COSTLY` | the spread captured does not cover the fee | `1` |
+| `ADVERSE_SELECTION` | the mid moves against the fills, so resting *adds* a cost | `1` |
+| `INCONCLUSIVE` | fewer than `--min-samples` marked fills | `3` |
+
+A simulated fill carries a `steady_clock` stamp, so it cannot be joined to an
+archive afterwards; `MarkoutReplayer` measures it inside the replay instead,
+where the mid behind `h = 0` is the book that produced the fill. Fills missing a
+sample within `--tolerance-ms` are reported as truncated rather than
+interpolated, because an invented price is indistinguishable from an edge once
+it reaches a report.
+
+**What the committed study shows** (`python3 scripts/run_markout.py`):
+
+| horizon | fills | mean bps | t | win % | net of 2 bps fee |
+| --- | --- | --- | --- | --- | --- |
+| 0 s | 230 | −0.434 | n/a (σ≈0) | 0.0% | −2.43 |
+| 1 s | 227 | −0.429 | −6.48 | 36.1% | −2.43 |
+| 10 s | 199 | −0.505 | −2.62 | 42.7% | −2.51 |
+| 60 s | 55 | −0.810 | −1.19 | 45.5% | −2.81 |
+
+Verdict `ADVERSE_SELECTION`: the average resting quote fills 0.43 bps *through*
+the mid (the trade prints better than the quote), so it never captures the
+0.33 bps half-spread it is trying to earn. On the 55 fills that have a 60 s
+sample, the mean drifts from −0.434 to −0.810 bps — a −0.38 bps move on the same
+fills, not a comparison of two different populations.
+
+The 1 s markout totals −2.92 USDT against the study's gross PnL of −2.74 USDT.
+This comparison is indicative only: the markout covers 227 of the study's 230
+fills and values each at its own 1 s mid, while gross PnL uses the study's
+position accounting and valuation times. The proximity of these totals does
+not establish a ledger reconciliation; that would require the same fills and
+valuation time in both calculations.
+
+That is a strategy bug, not a plumbing bug: the paper engine fills a quote that
+was posted inside the touch, while live `post_only` (`timeInForce=GTX`) would
+have rejected it. Whether the quote can be made to rest passively *and* clear 2
+bps is the open question for the next study — markout is what makes it
+answerable.
+
 ### Continuous integration
 
 `.github/workflows/testnet-pilot.yml` runs two jobs:
@@ -1227,11 +1336,15 @@ mirrored to the job summary.
 - Feed sequence gaps are not repaired and there is no snapshot bootstrap:
   `first_update_id`/`final_update_id` are parsed for diagnostics, but the
   operator must reconnect or resynchronise after a gap.
-- There is no persistence, account reconciliation or production exchange order
-  gateway. `python_analytics/exchange/binance_futures.py` adds a signed REST
-  client and `scripts/run_testnet_pilot.py` exercises it against the Binance
-  Futures **testnet** only; no order state is persisted or reconciled across
-  restarts.
+- **C++** ships no exchange gateway; the live path is Python. There is no
+  funding ledger or alerting yet, `scripts/run_live_trader.py` places at most
+  one quote per run, and markout only covers fills you recorded (a quote that
+  never filled is invisible to it). Order state *is* now persisted and
+  reconciled across restarts (`python_analytics/live`,
+  `state/live_orders.sqlite3`), arming real money is gated on the readiness
+  report's alpha net rather than on a flag, and per-fill markout is available
+  from `scripts/run_markout.py` — see
+  `docs/phase5_production_readiness.md` §11.
 - L2 capture is **raw**: `ingest_l2.py` archives exchange payloads but does not
   normalise them into `L2Book` updates or repair sequence gaps, there is no
   snapshot bootstrap, and one process handles one symbol/stream.

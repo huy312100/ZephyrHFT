@@ -54,3 +54,8 @@ data/
 # Generated Backtest Artefacts
 # ==========================================
 reports/
+
+# ==========================================
+# Live Runtime State (order store)
+# ==========================================
+state/
