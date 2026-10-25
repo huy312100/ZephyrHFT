@@ -122,7 +122,8 @@ python3 scripts/generate_readiness_report.py
 ├── data/raw_l2/            # capture output (created on demand, git-ignored)
 ├── reports/                # Phase 4/5 evidence: walk_forward, readiness, benchmark
 ├── tests/python/           # pytest integration tests
-├── .github/workflows/      # ci.yml (build/lint/sanitizers), readiness.yml, codeql.yml
+├── .circleci/config.yml    # per-commit CI: secret scan, build+test (py3.9/3.12), lint, sanitizers
+├── .github/workflows/      # readiness.yml, codeql.yml, testnet-pilot.yml (release/ops gates)
 └── main.py                 # demo / replay CLI
 ```
 
@@ -156,12 +157,44 @@ ctest --test-dir build --output-on-failure
 
 ### Continuous integration
 
-[`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs the same sequence on
-`ubuntu-24.04` for Python 3.9 and 3.12: it installs `build-essential` + `cmake`,
+[`.circleci/config.yml`](.circleci/config.yml) runs the same sequence on
+`ubuntu:24.04` for Python 3.9 and 3.12: it installs `build-essential` + `cmake`,
 then `requirements.txt` (PyYAML, pybind11, pytest, websockets), configures
 `cpp_engine`, builds `hft_native`, and runs `ctest`, `pytest` and
 `python main.py --demo`. The extension is built into the checkout rather than
 installed, so the job must build before it tests.
+
+The image is plain `ubuntu:24.04` rather than a convenience image because the
+engine compiles as C++23 and needs GCC 13; noble is the release that ships it
+(13.3, with CMake 3.28). Python 3.9 is the one interpreter noble does not carry,
+so the compatibility leg installs it from the deadsnakes PPA on that same image
+and keeps the compiler the engine is known to build with.
+
+The gates that are *not* per-commit stay on GitHub Actions because they depend
+on GitHub-only features: `codeql.yml` (GitHub-native analysis),
+`readiness.yml` (environments, required reviewers, tag attestation) and
+`testnet-pilot.yml` (masked testnet credentials).
+
+Secrets are now a per-commit concern as well. The `secret-scan` job installs
+[`ggshield`](https://github.com/GitGuardian/ggshield) and scans exactly the
+commits the pipeline introduces — the whole branch for a pull request, the
+pushed commits for a branch build — so a leaked Binance key fails the build
+before review, and existing history is left to the GitGuardian dashboard rather
+than re-flagged on every push. It needs one project environment variable,
+`GITGUARDIAN_API_KEY` (a personal access token with the `scan` scope from
+*dashboard.gitguardian.com → API*); without it the job **fails** instead of
+passing green, because a scanning gate that cannot run must not look like a
+passing one. The fixtures in `tests/python/test_binance_*.py` use deliberately
+fake credentials (`api_key="test-key-1234"`); if a detector ever trips on one,
+record it under `secret.ignored_matches` in a `.gitguardian.yaml` rather than
+disabling the job.
+
+One-time setup, since CircleCI cannot be configured from inside the repo: add
+the [CircleCI GitHub App](https://github.com/apps/circleci) to the repository,
+then choose **Set Up Project** for this branch on circleci.com. The only secret
+is `GITGUARDIAN_API_KEY` (see above); there are no orbs and no contexts. Enable
+**Auto-cancel redundant workflows** in *Project Settings → Advanced* so the
+push and pull-request pipelines for the same commit do not both finish.
 
 ### Manual extension build (fallback)
 
@@ -291,12 +324,19 @@ Every commit is built, sanitised, linted and measured before it can reach
 
 | Workflow / job | Trigger | What it proves |
 | --- | --- | --- |
-| `ci.yml` → `build + test (py3.9, py3.12)` | push, PR, manual | C++ core + pybind11 extension build on both ends of the supported range, CTest, pytest, CLI smoke test, and coverage ≥ 80 % (measured once, on 3.12) |
-| `ci.yml` → `lint (flake8)` | push, PR, manual | `flake8` over `python_analytics`, `scripts` and `tests` with the repo config in `.flake8` |
-| `ci.yml` → `asan + ubsan (C++ core)` | push, PR, manual | the engine compiled with `-fsanitize=address,undefined` and its suite run under both — a use-after-free or an overflow fails the build (leak reports are advisory until a clean baseline exists) |
+| `config.yml` → `secret-scan` | push, PR | `ggshield` scans the commits this pipeline introduces; a credential added by the branch fails the build before review |
+| `config.yml` → `build-and-test-py39`, `build-and-test-py312` | push, PR | C++ core + pybind11 extension build on both ends of the supported range, CTest, pytest, CLI smoke test, and coverage ≥ 80 % (measured once, on 3.12) |
+| `config.yml` → `lint` | push, PR | `flake8` over `python_analytics`, `scripts` and `tests` with the repo config in `.flake8` |
+| `config.yml` → `sanitizers` | push, PR | the engine compiled with `-fsanitize=address,undefined` and its suite run under both — a use-after-free or an overflow fails the build (leak reports are advisory until a clean baseline exists) |
 | `readiness.yml` → `GO / NO-GO gate` | weekdays 03:17 UTC, tag `v*`, manual | `pip-audit`, clean rebuild, CTest, pytest, replay of the **committed** lock (`--from-lock`), latency benchmark, build verdict + alpha verdict, evidence bundle as an artifact |
 | `readiness.yml` → `attest release verdict` | tag `v*` | refuses to attest a tag unless the report is `GO` for **both** build and alpha; bind the `production` environment to required reviewers to force a human sign-off |
 | `codeql.yml` | push, PR, weekly | CodeQL analysis of the C++ and Python trees |
+
+`config.yml` is the CircleCI pipeline (`.circleci/config.yml`); everything else
+is still a GitHub Actions workflow. Branch protection should require
+`ci/circleci: secret-scan`, `ci/circleci: build-and-test-py39`,
+`ci/circleci: build-and-test-py312`, `ci/circleci: lint` and
+`ci/circleci: sanitizers`.
 
 The same gates locally (the sanitised build deliberately skips the extension,
 so it links `hft_core` directly and compiles in seconds):
