@@ -21,9 +21,11 @@ committed; the text to paste into it is kept below so it is at least reviewable
 and reproducible. If Sourcery's dashboard settings are ever lost, this file is
 the record of what they were.
 
-Both reviewers are **advisory**. CI (`pytest`, `flake8`, CodeQL, GuardDog/GitGuardian)
-decides whether a change is safe to merge. A reviewer that is rate-limited,
-outage-struck, or simply wrong must never be able to block a hotfix.
+Both reviewers are **advisory**. CI decides whether a change is safe to merge:
+CircleCI runs `lint`, `build-and-test-py39`, `build-and-test-py312`, `sanitizers`
+and `secret-scan`; GitHub runs CodeQL and GitGuardian. A reviewer that is
+rate-limited, outage-struck, or simply wrong must never be able to block a
+hotfix.
 
 ## Commands
 
