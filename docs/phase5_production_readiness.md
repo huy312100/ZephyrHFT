@@ -778,9 +778,11 @@ Verdict: **`ADVERSE_SELECTION`**. Two readings, both uncomfortable:
   60 s sample at both ends, the mean moves from `-0.434 bps` to `-0.810 bps`, a
   `-0.38 bps` drift. Separately, the `1 s` markout totals `-2.92 USDT` against
   the study's gross PnL of `-2.74 USDT`; that comparison is indicative only —
-  three fills are truncated at 1 s and a horizon values each fill at a later
-  mid, so it is not a reconciliation — but two independent measurements of the
-  same loss landing 0.2 USDT apart is a useful sanity check on the instrument.
+  the markout covers 227 of the study's 230 fills and values each at its own
+  1 s mid, while gross PnL uses the study's position accounting and valuation
+  times. The proximity of these totals does not establish a ledger
+  reconciliation; that would require the same fills and valuation time in both
+  calculations.
 
 Neither reading can be fixed by tuning costs. The next study has to post a quote
 that actually rests behind the touch (and model post-only rejection), or find an

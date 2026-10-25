@@ -1162,10 +1162,11 @@ sample, the mean drifts from −0.434 to −0.810 bps — a −0.38 bps move on 
 fills, not a comparison of two different populations.
 
 The 1 s markout totals −2.92 USDT against the study's gross PnL of −2.74 USDT.
-That is indicative rather than a reconciliation (three fills are truncated at
-1 s, and a horizon values each fill at a later mid), but two independent
-measurements of the same loss landing 0.2 USDT apart is a reasonable sanity
-check that the instrument is measuring the loss the ledger booked.
+This comparison is indicative only: the markout covers 227 of the study's 230
+fills and values each at its own 1 s mid, while gross PnL uses the study's
+position accounting and valuation times. The proximity of these totals does
+not establish a ledger reconciliation; that would require the same fills and
+valuation time in both calculations.
 
 That is a strategy bug, not a plumbing bug: the paper engine fills a quote that
 was posted inside the touch, while live `post_only` (`timeInForce=GTX`) would
