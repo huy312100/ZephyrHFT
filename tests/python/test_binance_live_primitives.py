@@ -17,6 +17,7 @@ from typing import Any, Dict, List, Tuple
 
 import pytest
 
+from python_analytics.costs import DEFAULT_MAKER_BPS
 from python_analytics.exchange.binance_futures import (
     POST_ONLY_TIME_IN_FORCE,
     BinanceAPIError,
@@ -26,6 +27,7 @@ from python_analytics.exchange.binance_futures import (
     BinanceFuturesConfig,
     BinanceRateLimitError,
     OrderValidationError,
+    parse_commission_rate,
     parse_open_orders,
     parse_positions,
 )
@@ -270,6 +272,85 @@ def test_parse_open_orders_accepts_an_empty_response():
 def test_parse_open_orders_rejects_a_non_list_payload():
     with pytest.raises(BinanceError, match="openOrders"):
         parse_open_orders({"code": -1})
+
+
+# --------------------------------------------------------------------------- #
+# Commission rates: check the cost assumption instead of guessing it
+# --------------------------------------------------------------------------- #
+def test_parse_commission_rate_converts_venue_fractions_to_bps():
+    rate = parse_commission_rate({
+        "symbol": "btcusdt",
+        "makerCommissionRate": "0.0002",
+        "takerCommissionRate": "0.0005",
+    })
+    assert rate.symbol == "BTCUSDT"
+    assert rate.maker_rate == Decimal("0.0002")
+    assert rate.taker_bps == pytest.approx(5.0)
+    assert rate.maker_bps == pytest.approx(DEFAULT_MAKER_BPS)
+    assert rate.is_rebate is False
+    assert "maker=0.0002 (+2.0000 bps)" in rate.describe()
+
+
+def test_parse_commission_rate_flags_a_real_rebate_tier():
+    rate = parse_commission_rate({
+        "symbol": "ETHUSDT",
+        "makerCommissionRate": "-0.000010",
+        "takerCommissionRate": "0.000400",
+    })
+    assert rate.is_rebate is True
+    assert rate.maker_bps == pytest.approx(-0.1)
+    assert rate.describe().endswith("REBATE")
+
+
+def test_parse_commission_rate_refuses_a_missing_rate():
+    """A silent zero would make every strategy look free to run."""
+
+    with pytest.raises(BinanceError, match="takerCommissionRate"):
+        parse_commission_rate({"symbol": "BTCUSDT", "makerCommissionRate": "0.0002"})
+    with pytest.raises(BinanceError, match="not an object"):
+        parse_commission_rate([0.0002, 0.0005])
+
+
+def test_parse_commission_rate_requires_a_symbol():
+    with pytest.raises(BinanceError, match="symbol"):
+        parse_commission_rate({"makerCommissionRate": "0.0002",
+                               "takerCommissionRate": "0.0005"})
+    assert parse_commission_rate({"makerCommissionRate": "0.0002",
+                                  "takerCommissionRate": "0.0005"},
+                                 symbol="btcusdt").symbol == "BTCUSDT"
+
+
+def test_client_fetches_the_signed_commission_rate():
+    transport = FakeTransport([(200, {"symbol": "BTCUSDT",
+                                      "makerCommissionRate": "0.0002",
+                                      "takerCommissionRate": "0.0005"})])
+
+    rate = _client(transport).commission_rate("btcusdt")
+
+    assert _path(transport) == "/fapi/v1/commissionRate"
+    query = _query(transport)
+    assert query["symbol"] == ["BTCUSDT"]
+    assert "signature" in query  # a USER_DATA endpoint, so it must be signed
+    assert rate.maker_bps == pytest.approx(2.0)
+    assert rate.taker_bps == pytest.approx(5.0)
+
+
+def test_parse_commission_rate_rejects_a_symbol_mismatch():
+    """A rate for another market must never be recorded as this one's."""
+
+    with pytest.raises(BinanceError, match="ETHUSDT.*BTCUSDT"):
+        parse_commission_rate({"symbol": "ETHUSDT",
+                               "makerCommissionRate": "0.0002",
+                               "takerCommissionRate": "0.0005"},
+                              symbol="btcusdt")
+
+
+def test_parse_commission_rate_matches_symbols_case_insensitively():
+    rate = parse_commission_rate({"symbol": "btcusdt",
+                                  "makerCommissionRate": "0.0002",
+                                  "takerCommissionRate": "0.0005"},
+                                 symbol="BTCUSDT")
+    assert rate.symbol == "BTCUSDT"
 
 
 # --------------------------------------------------------------------------- #

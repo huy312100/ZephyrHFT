@@ -726,7 +726,7 @@ usage: run_live_paper.py [-h] [--source SOURCE] [--event-limit EVENT_LIMIT]
 | `--center` | `str` (decimal) | `config/settings.yaml → engine.center` (`"30000"`) | quote price | Ladder centre. **Must** sit within ±4096 ticks of the traded price |
 | `--tick-size` | `str` (decimal) | `config/settings.yaml → engine.tick_size` (`"0.50"`) | quote price | Ladder granularity. **Must** divide every incoming price exactly |
 | `--taker-fee-bps` | `float → int` | `5.0` | basis points | Fee charged on aggressive fills (positive = cost) |
-| `--maker-fee-bps` | `float → int` | `0.0` | basis points | Fee on resting fills; **negative = rebate** |
+| `--maker-fee-bps` | `float → int` | `2.0` | basis points | Fee on resting fills (retail VIP 0); **negative = rebate tier** |
 | `--initial-cash` | `float` | `0.0` | quote currency | Opening cash balance (may be negative or zero) |
 | `--order-quantity` | `str` (decimal) | `"0.05"` | base units | Size of each synthetic market order |
 | `--batch-size` | `int` | `64` | lines | NDJSON lines per `ingest_lines` call; also the order-pacing interval |

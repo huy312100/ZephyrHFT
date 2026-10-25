@@ -17,6 +17,7 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
 
 from ..backtesting.metrics import sortino_ratio as _sortino
 from ..backtesting.replay import BulkReplayer
+from ..costs import DEFAULT_MAKER_FEE, DEFAULT_TAKER_FEE
 from ..native import hft_native
 from .config import MarketConfig, MarketType
 from .market_maker import AvellanedaStoikovStrategy
@@ -91,8 +92,8 @@ def backtest_parameters(
     lines: Sequence[str],
     *,
     center: Optional[float] = None,
-    maker_fee: float = -0.0001,
-    taker_fee: float = 0.0005,
+    maker_fee: float = DEFAULT_MAKER_FEE,
+    taker_fee: float = DEFAULT_TAKER_FEE,
     initial_cash: float = 0.0,
     ofi_sensitivity: float = 0.0,
     use_time_spread: bool = True,
@@ -189,8 +190,8 @@ def grid_search(
     center: Optional[float] = None,
     inventory_limit: float = 5.0,
     order_quantity: float = 0.05,
-    maker_fee: float = -0.0001,
-    taker_fee: float = 0.0005,
+    maker_fee: float = DEFAULT_MAKER_FEE,
+    taker_fee: float = DEFAULT_TAKER_FEE,
     initial_cash: float = 0.0,
     use_time_spread: bool = True,
 ) -> OptimizationResult:
@@ -240,8 +241,8 @@ def random_search(
     center: Optional[float] = None,
     inventory_limit: float = 5.0,
     order_quantity: float = 0.05,
-    maker_fee: float = -0.0001,
-    taker_fee: float = 0.0005,
+    maker_fee: float = DEFAULT_MAKER_FEE,
+    taker_fee: float = DEFAULT_TAKER_FEE,
     initial_cash: float = 0.0,
     use_time_spread: bool = True,
 ) -> OptimizationResult:
@@ -287,8 +288,8 @@ def bayesian_search(
     center: Optional[float] = None,
     inventory_limit: float = 5.0,
     order_quantity: float = 0.05,
-    maker_fee: float = -0.0001,
-    taker_fee: float = 0.0005,
+    maker_fee: float = DEFAULT_MAKER_FEE,
+    taker_fee: float = DEFAULT_TAKER_FEE,
     initial_cash: float = 0.0,
     use_time_spread: bool = True,
 ) -> OptimizationResult:

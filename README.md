@@ -43,7 +43,8 @@ used at the orchestration/analytics boundary.
 - **Production readiness gate** (`scripts/generate_readiness_report.py`):
   re-measures the Phase 1–4 promises (ingestion integrity, engine latency and
   ledger coherence, chaos self-healing, dead-man's switch, parameter lock) and
-  prints a GO/NO-GO verdict with JSON + Markdown artefacts.
+  prints **two** verdicts — build readiness and alpha (profitability at retail
+  fees) — with JSON + Markdown artefacts.
 - **Real-time L2 capture** (`scripts/ingest_l2.py`): asyncio WebSocket client
   that stamps every frame with `time.time_ns()`, reports venue-to-host latency
   percentiles and archives the raw payloads as gzip NDJSON roll files with
@@ -62,13 +63,14 @@ used at the orchestration/analytics boundary.
 | 3 | Batch replay, OFI alpha, optimisation, chaos | Complete | [`docs/phase3_backtesting_architecture.md`](docs/phase3_backtesting_architecture.md) |
 | 3.1 / 3.2 | Network chaos injection, heartbeat dead-man's switch | Complete | [Chaos & stress testing](#chaos--stress-testing-phase-31--32) |
 | **4** | **Walk-forward OOS validation, fingerprinted parameter lock** | **Complete / verified** | [`docs/phase4_walk_forward.md`](docs/phase4_walk_forward.md) |
-| **5** | **Production readiness gate, GO / NO-GO verdict** | **Complete / verified (GO, 15/15 gated checks)** | [`docs/phase5_production_readiness.md`](docs/phase5_production_readiness.md) |
+| **5** | **Production readiness gate, build + alpha verdicts** | **Complete / verified (build GO 15/15; alpha NO-GO at retail fees)** | [`docs/phase5_production_readiness.md`](docs/phase5_production_readiness.md) |
 
 The final pre-live check is one command:
 
 ```bash
 python3 scripts/generate_readiness_report.py
-# exit 0 = GO, exit 1 = NO-GO, exit 2 = usage error
+# exit 0 = build GO (alpha printed), exit 1 = build NO-GO,
+# exit 2 = usage error, exit 3 = alpha NO-GO (only with --require-positive-alpha)
 ```
 
 ## Repository layout
@@ -279,8 +281,8 @@ Every commit is built, sanitised, linted and measured before it can reach
 | `ci.yml` → `build + test (py3.9, py3.12)` | push, PR, manual | C++ core + pybind11 extension build on both ends of the supported range, CTest, pytest, CLI smoke test, and coverage ≥ 80 % (measured once, on 3.12) |
 | `ci.yml` → `lint (flake8)` | push, PR, manual | `flake8` over `python_analytics`, `scripts` and `tests` with the repo config in `.flake8` |
 | `ci.yml` → `asan + ubsan (C++ core)` | push, PR, manual | the engine compiled with `-fsanitize=address,undefined` and its suite run under both — a use-after-free or an overflow fails the build (leak reports are advisory until a clean baseline exists) |
-| `readiness.yml` → `GO / NO-GO gate` | weekdays 03:17 UTC, tag `v*`, manual | `pip-audit`, clean rebuild, CTest, pytest, replay of the **committed** lock (`--from-lock`), latency benchmark, Phase 5 verdict, evidence bundle as an artifact |
-| `readiness.yml` → `attest release verdict` | tag `v*` | refuses to attest a tag whose report is not `GO`; bind the `production` environment to required reviewers to force a human sign-off |
+| `readiness.yml` → `GO / NO-GO gate` | weekdays 03:17 UTC, tag `v*`, manual | `pip-audit`, clean rebuild, CTest, pytest, replay of the **committed** lock (`--from-lock`), latency benchmark, build verdict + alpha verdict, evidence bundle as an artifact |
+| `readiness.yml` → `attest release verdict` | tag `v*` | refuses to attest a tag unless the report is `GO` for **both** build and alpha; bind the `production` environment to required reviewers to force a human sign-off |
 | `codeql.yml` | push, PR, weekly | CodeQL analysis of the C++ and Python trees |
 
 The same gates locally (the sanitised build deliberately skips the extension,
@@ -456,7 +458,7 @@ python3 scripts/run_backtest.py \
   --source data/raw_l2/binance_futures_btcusdt_depth_100ms_20261021T173329Z_00001.ndjson.gz \
   --tick-size 0.1 --center 84570 \
   --strategy avellaneda_stoikov --gamma 0.1 --k 5 --ofi-sensitivity 0.5 \
-  --maker-bps -1 --taker-bps 5 --order-quantity 0.01 \
+  --maker-bps 2 --taker-bps 5 --order-quantity 0.01 \
   --report data/backtests/run_001
 
 # Parameter optimisation (grid / random / Bayesian)
@@ -468,7 +470,12 @@ python3 -c "from python_analytics.strategies.optimizer import grid_search; \
 ```
 
 Fee flags are fractional basis points — `--taker-bps 0.5` charges 0.005% and a
-negative `--maker-bps` models a rebate. `--report` accepts an output directory or
+negative `--maker-bps` models a **rebate tier**. The defaults are retail USDⓈ-M
+VIP 0 (`2` / `5` bps, from `python_analytics/costs.py`): a rebate is a privilege
+you have to hold, not a default you get to assume, and assuming one is precisely
+how a losing study reports a profit. Use
+`BinanceFuturesClient.commission_rate(symbol)` to read the rate your account
+actually pays. `--report` accepts an output directory or
 a `.json` path (resolved to its parent directory), and `--plot` adds
 `equity.png` when `matplotlib` is installed.
 
@@ -575,7 +582,8 @@ python3 scripts/run_paper_trading.py --duration 60
 
 Useful flags: `--duration`, `--interval` (dashboard cadence), `--gamma`,
 `--sigma`, `--k`, `--order-quantity`, `--inventory-limit`, `--maker-fee-bps`
-(default `-1` = 0.01% rebate), `--taker-fee-bps` (default `5` = 0.05%),
+(default `2` = 0.02%, retail VIP 0; negative = rebate tier), `--taker-fee-bps`
+(default `5` = 0.05%),
 `--self-trade-prevention` and `--trades-out` (see below).
 Press `Ctrl-C` to stop cleanly: the loop cancels open orders and prints a
 summary (total trades, win rate, Sharpe approximation, final PnL, max
@@ -886,22 +894,27 @@ python3 scripts/run_walk_forward.py --source data/raw_l2/*.ndjson.gz \
 
 ## Production readiness gate (Phase 5)
 
-> **Status: complete and verified — `GO`, 15/15 gated checks.**
+> **Status: build complete and verified — `GO`, 15/15 gated checks; alpha
+> `NO-GO` at retail fees (2 bps maker / 5 bps taker).**
 >
 > Gate inventory, thresholds, latency-budget policy, chaos/heartbeat invariants,
-> report schema and per-check NO-GO troubleshooting:
+> report schema, the build/alpha split and per-check NO-GO troubleshooting:
 > [`docs/phase5_production_readiness.md`](docs/phase5_production_readiness.md).
 
 `scripts/generate_readiness_report.py` re-measures every Phase 1–4 promise and
-prints a GO/NO-GO verdict against explicit thresholds, so "is this build
-shippable?" is a command, not an opinion.
+prints two verdicts against explicit thresholds — build readiness (does the
+machinery keep its promises?) and alpha (does *this* parameter set earn after the
+fees a retail account actually pays?) — so "is this build shippable?" and "is
+this strategy worth running?" are separate commands with separate exit codes,
+not opinions.
 
 ```bash
-# The pre-live gate: JSON + Markdown under reports/, exit 0 (GO) / 1 (NO-GO) / 2 (usage)
+# The pre-live gate: JSON + Markdown under reports/, exit 0 (build GO) / 1 / 2
 python3 scripts/generate_readiness_report.py
 
-# Console verdict only, plus the opt-in profitability gate
+# Console verdict only, plus the opt-in profitability gates
 python3 scripts/generate_readiness_report.py --no-report --min-oos-sharpe 0.5
+python3 scripts/generate_readiness_report.py --no-report --require-positive-alpha
 
 # Acceptance run on the trading host, at the production latency budget
 python3 scripts/generate_readiness_report.py \
@@ -911,16 +924,20 @@ python3 scripts/generate_readiness_report.py \
 python3 scripts/generate_readiness_report.py --recompute-walk-forward
 ```
 
-Sample verdict (`GO`):
+Sample verdict — the honest combination at retail fees:
 
 ```text
 ==============================================================================
-  PRODUCTION READINESS: GO
-  verdict: GO (15/15 gated checks passed)
+  BUILD READINESS:     GO
+  ALPHA (PROFITABILITY): NO-GO
+  BUILD: GO (15/15 gated checks passed)
+  ALPHA: NO-GO (1/2 profitability checks passed at 2.0 / 5.0 bps maker/taker)
+    ALPHA FAIL alpha.net_pnl: -16.4743 USDT (-0.0165%); -2.7413 before +13.7330 of fees
     Phase 1 - data ingestion               3/3 checks
     Phase 2 - paper execution              6/6 checks
     Phase 3 - resilience                   3/3 checks
     Phase 4 - out-of-sample validation     5/5 checks
+    Alpha - profitability at modelled fees 1/2 checks
 ==============================================================================
 ```
 
@@ -930,14 +947,17 @@ Sample verdict (`GO`):
 | 2 — execution | engine p99 ≤ 50 µs, p999 ≤ 500 µs, replay ≥ 1,000 depth events/s, equity-vs-PnL ledger residual ≤ 1e-2, `0` rejected orders, fill activity > 0 % |
 | 3 — resilience | disconnect storm self-heals (`reconnects == outages`, every frame accounted for), latency injection spikes but never exceeds its ceiling, dead-man's switch trips on silence, blocks orders, releases only on an explicit reset and can trip again |
 | 4 — validation | parameter lock re-verified, look-ahead chronology verified on every boundary, aggregate ledger residual ≤ 2e-2, ≥ 2 OOS windows, optional `--min-oos-sharpe` |
+| alpha | `net_pnl >= 0` after modelled fees, and `maker_bps >= 0` (no rebate assumed) — reported on every run, gating only with `--require-positive-alpha` |
 
 Engine, chaos and walk-forward evidence come from a seeded synthetic book
 (`--evidence-events`, `--seed`), so every deterministic check reproduces on any
 machine (latency is the exception — see the budget note below);
 `reports/walk_forward.json` is reused when present (`--recompute-walk-forward`
-forces a fresh study). Profitability is deliberately opt-in: a build can be
-production-ready while the alpha is not, and conflating the two hides which one
-is broken. Artefacts: `reports/production_readiness_report.{json,md}`.
+forces a fresh study). Build and alpha are never merged: a green build with a
+losing parameter set is the *expected* state of this repository at retail fees
+(`alpha.net_pnl` is `-16.47 USDT` on the committed lock, `-2.74` even at zero
+fees), and printing both is what keeps a cost assumption from laundering a red
+strategy into a green one. Artefacts: `reports/production_readiness_report.{json,md}`.
 
 **Latency budget tiers.** The 50 µs default is a machine-tolerant tripwire for
 shared runners, not the performance target. The budget a co-located trading host
@@ -949,8 +969,9 @@ for the measured bands, the p999 noise caveat and the reasoning.
 
 **Promotion sequence:** tests green →
 `run_walk_forward.py --from-lock --lock-file config/walk_forward_lock.json`
-exit 0 → readiness `GO` → readiness `GO` at the 5.0 µs budget on the trading
-host → tag, with the `production` environment reviewer signing the attestation.
+exit 0 → readiness build `GO` at the 5.0 µs budget on the trading host →
+readiness alpha `GO` (tag attestation requires both) → tag, with the
+`production` environment reviewer signing the attestation.
 The copy-pasteable checklist lives in
 [`docs/phase5_production_readiness.md` §10](docs/phase5_production_readiness.md#10-pre-live-promotion-checklist).
 

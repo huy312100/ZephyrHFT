@@ -79,8 +79,9 @@ def test_green_run_is_go_and_gates_every_phase(green) -> None:
     report = green[1]
     assert report.verdict == "GO", report.summary_lines()
     assert {check.id for check in report.gated} == GATED
+    # Alpha rides alongside the four build phases but is never part of ``gated``.
     assert {check.phase for check in report.checks} == {"phase1", "phase2",
-                                                        "phase3", "phase4"}
+                                                        "phase3", "phase4", "alpha"}
 
 
 def test_green_run_reports_measurements_not_booleans(green) -> None:
@@ -185,7 +186,8 @@ def test_written_artefacts_round_trip(gate, green, tmp_path) -> None:
     assert len(payload["checks"]) == len(report.checks)
     assert payload["evidence"]["engine"]["events"] == 400
     text = md_path.read_text(encoding="utf-8")
-    assert "## Verdict: **GO**" in text
+    assert "## Build verdict: **GO**" in text
+    assert f"## Alpha verdict: **{report.alpha_verdict}**" in text
     for phase in report.PHASES:
         assert f"## {phase[1]}" in text
 
@@ -193,6 +195,7 @@ def test_written_artefacts_round_trip(gate, green, tmp_path) -> None:
 def test_existing_walk_forward_artefact_is_reused(gate, green, tmp_path) -> None:
     args, recomputed = green
     assert recomputed.inputs["walk_forward_origin"].startswith("computed")
+    locked = gate.build_parameters(args, gate.load_settings())
     artefact = tmp_path / "walk_forward.json"
     artefact.write_text(json.dumps({
         "report": "phase4_walk_forward",
@@ -208,7 +211,8 @@ def test_existing_walk_forward_artefact_is_reused(gate, green, tmp_path) -> None
             "ledger_residual": 1e-9, "window_hit_rate_pct": 75.0,
         },
         "validation": {
-            "parameter_lock": {"fingerprint": "deadbeef", "checks": 4},
+            "parameter_lock": {"fingerprint": "deadbeef", "checks": 4,
+                               "parameters": locked.as_dict()},
             "look_ahead": {"verified": True, "chronology_verified": True,
                            "chronology_checks": 3, "windows_checked": 4},
             "ledger": {"residual": 1e-9, "tolerance": 0.02},
@@ -230,6 +234,51 @@ def test_existing_walk_forward_artefact_is_reused(gate, green, tmp_path) -> None
     assert walk["lock_fingerprint"] == "deadbeef"
 
 
+def test_artefact_with_a_different_fee_assumption_is_recomputed(
+    gate, green, tmp_path
+) -> None:
+    """An old study's PnL must never be reported under today's fee labels."""
+
+    args, _ = green
+    locked = gate.build_parameters(args, gate.load_settings()).as_dict()
+    locked["costs"]["maker_bps"] = -1.0
+    artefact = tmp_path / "walk_forward_rebate.json"
+    artefact.write_text(json.dumps({
+        "report": "phase4_walk_forward",
+        "aggregate": {"windows": 2, "events": 800, "net_pnl": 4.1251},
+        "validation": {"parameter_lock": {"checks": 4,
+                                          "parameters": locked}},
+    }), encoding="utf-8")
+    reused = gate.parse_args([
+        "--source", args.source,
+        "--evidence-events", "400",
+        "--chaos-frames", "100",
+        "--walk-forward-json", str(artefact),
+        "--no-report",
+    ])
+    report = gate.build_report(reused)
+    origin = report.inputs["walk_forward_origin"]
+    assert origin.startswith("computed")
+    assert "ignored" in origin
+    assert report.evidence["walk_forward"]["windows"] == 4  # freshly studied
+    assert any("costs.maker_bps" in item
+               for item in report.inputs["walk_forward_drift"])
+
+
+def test_locked_parameter_drift_compares_grids_numerically(gate, green) -> None:
+    """``"0.5"`` and ``"0.50"`` are the same grid, but a fee change is drift."""
+
+    args, _ = green
+    parameters = gate.build_parameters(args, gate.load_settings())
+    block = parameters.as_dict()
+    block["venue"]["tick_size"] = "0.5"
+    payload = {"validation": {"parameter_lock": {"parameters": block}}}
+    assert gate.locked_parameter_drift(payload, parameters) == []
+    block["costs"]["maker_bps"] = -1.0
+    drift = gate.locked_parameter_drift(payload, parameters)
+    assert len(drift) == 1 and "costs.maker_bps" in drift[0]
+
+
 def test_no_artefacts_without_consent(gate, green, tmp_path) -> None:
     args, _ = green
     assert gate.main([
@@ -239,3 +288,77 @@ def test_no_artefacts_without_consent(gate, green, tmp_path) -> None:
         "--no-report", "--report-dir", str(tmp_path),
     ]) == gate.EXIT_GO
     assert list(tmp_path.iterdir()) == []
+
+
+# --------------------------------------------------------------------------- #
+# Alpha: profitability is measured separately and never flatters the build
+# --------------------------------------------------------------------------- #
+ALPHA = {"alpha.net_pnl", "alpha.fee_assumption"}
+
+
+def test_alpha_is_always_measured_but_never_gated(gate, green) -> None:
+    report = green[1]
+    assert {check.id for check in report.checks if check.phase == gate.ALPHA_PHASE} == ALPHA
+    # The build verdict must not inherit a losing strategy: a GO build with a
+    # NO-GO alpha is the honest, most useful combination.
+    assert report.verdict == "GO"
+    assert ALPHA.isdisjoint({check.id for check in report.failures})
+    assert gate.ALPHA_PHASE in {check.phase for check in report.checks}
+    assert "ALPHA" in "\n".join(report.summary_lines())
+
+
+def test_alpha_verdict_matches_its_own_checks(gate, green) -> None:
+    report = green[1]
+    assert [check.id for check in report.alpha_failures] == [
+        check.id for check in report.checks
+        if check.phase == gate.ALPHA_PHASE and not check.passed]
+    assert report.alpha_verdict == ("NO-GO" if report.alpha_failures else "GO")
+
+
+def test_alpha_gate_only_changes_the_exit_code(gate, green) -> None:
+    args, report = green
+    argv = [
+        "--source", args.source, "--evidence-events", "400",
+        "--chaos-frames", "100", "--recompute-walk-forward",
+        "--walk-forward-json", args.walk_forward_json, "--no-report",
+    ]
+    # Default: alpha is reported but never masks a build regression in CI.
+    assert gate.main(argv) == gate.EXIT_GO
+    graded = gate.main(argv + ["--require-positive-alpha"])
+    expected = gate.EXIT_ALPHA_NO_GO if report.alpha_failures else gate.EXIT_GO
+    assert graded == expected
+
+
+def test_measure_alpha_backs_fees_out_of_net_pnl(gate) -> None:
+    """Fees sit inside realized/unrealized PnL, so the pre-fee number adds them back."""
+
+    payload = {"aggregate": {"net_pnl": -16.4743, "net_pnl_pct": -0.0165,
+                             "gross_pnl": -16.4743, "fees_paid": 13.733,
+                             "fills": 105}}
+    checks, evidence = gate.measure_alpha(payload, maker_bps=2.0, taker_bps=5.0)
+    assert evidence["pnl_before_fees"] == pytest.approx(-2.7413, abs=1e-4)
+    assert evidence["pre_fee_profitable"] is False
+    assert evidence["round_trip_cost_bps"] == pytest.approx(4.0)
+    failing = next(check for check in checks if check.id == "alpha.net_pnl")
+    assert failing.passed is False
+    assert "-2.7413 before +13.7330 of fees" in failing.measured
+
+
+def test_measure_alpha_rejects_a_rebate_assumption(gate) -> None:
+    """A negative maker fee turns every passive fill into free money; refuse it."""
+
+    payload = {"aggregate": {"net_pnl": 4.0, "net_pnl_pct": 0.004,
+                             "gross_pnl": 4.0, "fees_paid": -6.5, "fills": 105}}
+    checks, evidence = gate.measure_alpha(payload, maker_bps=-1.0, taker_bps=5.0)
+    assert [check.id for check in checks if not check.passed] == ["alpha.fee_assumption"]
+    assert evidence["rebate_assumed"] is True
+    assert evidence["pnl_before_fees"] == pytest.approx(-2.5)
+    assert evidence["pre_fee_profitable"] is False
+
+
+def test_measure_alpha_passes_a_genuinely_profitable_run(gate) -> None:
+    payload = {"aggregate": {"net_pnl": 12.5, "net_pnl_pct": 0.0125,
+                             "gross_pnl": 12.5, "fees_paid": 8.0, "fills": 60}}
+    checks, evidence = gate.measure_alpha(payload, maker_bps=2.0, taker_bps=5.0)
+    assert all(check.passed for check in checks), [c.measured for c in checks]
+    assert evidence["pre_fee_profitable"] is True

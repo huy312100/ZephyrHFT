@@ -94,7 +94,7 @@ Additions (existing `replay_lines`/`replay_file` untouched):
 
 ```python
 class BulkReplayer:
-    def __init__(self, *, tick_size, center, maker_bps=-1.0, taker_bps=5.0,
+    def __init__(self, *, tick_size, center, maker_bps=2.0, taker_bps=5.0,
                  initial_cash=0.0, batch_size=64, frames_per_hook=1,
                  seed=None, order_quantity="0.05"): ...
     def reset(self) -> None
@@ -104,7 +104,9 @@ class BulkReplayer:
 
 * `maker_bps`/`taker_bps` are **fractional** basis points (`0.5` ⇒ 0.5 bps). They are
   never rounded in Python; the C++ ledger freezes them into micro-bps so the fill path
-  stays integer-only. Negative `maker_bps` is a rebate.
+  stays integer-only. The defaults are the retail USDⓈ-M VIP 0 rates (`2`/`5` bps) from
+  `python_analytics/costs.py`; a negative `maker_bps` is a rebate and must be passed
+  explicitly, because assuming one is how a losing study reports a profit.
 
 * `iter_gzip_ndjson` already streams gzip line-by-line (no full-file materialisation).
 * `frames_per_hook == 1` ⇒ one-line `ingest_lines([line])` batches, strategy runs per
@@ -244,7 +246,7 @@ python3 scripts/run_backtest.py \
   --tick-size 0.1 --center 84570 \
   --strategy avellaneda_stoikov \
   --gamma 0.1 --sigma 0.02 --k 1.5 --ofi-sensitivity 0.5 \
-  --maker-bps -1 --taker-bps 5 --order-quantity 0.01 \
+  --maker-bps 2 --taker-bps 5 --order-quantity 0.01 \
   --report data/backtests/run_001
 
 # 3. Parameter optimisation (grid)

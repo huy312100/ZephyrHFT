@@ -202,8 +202,8 @@ repository.
 {
   "phase": 4,
   "kind": "walk_forward_parameter_lock",
-  "written_at": "2026-10-24T07:56:58+00:00",
-  "fingerprint": "a3aa7022dbbbab72",
+  "written_at": "2026-10-24T17:00:02+00:00",
+  "fingerprint": "b29a62ed93caf69a",
   "parameters": {
     "strategy": {
       "gamma": 0.1, "sigma": 0.02, "k": 5.0, "time_horizon": 60.0,
@@ -211,7 +211,7 @@ repository.
       "ofi_decay": 0.95, "ofi_cap": 3.0, "use_time_spread": true
     },
     "venue":  { "tick_size": "0.50", "center": "30000", "market_type": "CRYPTO" },
-    "costs":  { "maker_bps": -1.0, "taker_bps": 5.0 },
+    "costs":  { "maker_bps": 2.0, "taker_bps": 5.0 },
     "sizing": { "initial_cash": 100000.0, "order_quantity": "0.01" }
   },
   "metadata": { "source": ["data/sample_events.ndjson"], "window_events": 400 }
@@ -227,7 +227,7 @@ is deliberately no second configuration path: `WalkForwardRunner` reads only the
 | --- | --- | --- |
 | `strategy` | 9 fields | Directly shape the reservation price and spread; re-read from the live object |
 | `venue` | `tick_size`, `center`, `market_type` | Change the price grid and adapter semantics, and therefore the fills |
-| `costs` | `maker_bps`, `taker_bps` | Negative maker = rebate; unmodelled costs are how losing studies look profitable |
+| `costs` | `maker_bps`, `taker_bps` | Retail USDⓈ-M rates (2 / 5 bps); a negative maker is a rebate tier, and unmodelled costs are how losing studies look profitable |
 | `sizing` | `initial_cash`, `order_quantity` | Set risk per quote and the equity scale every ratio is measured on |
 
 `from_dict()` rejects unknown fields and missing fields inside each section, so a
@@ -383,7 +383,10 @@ python3 scripts/run_walk_forward.py \
 ```
 
 This is the command that produced the committed fit: two 400-event windows,
-fingerprint `a3aa7022dbbbab72`, artefacts `reports/walk_forward.{json,md}`.
+fingerprint `b29a62ed93caf69a`, artefacts `reports/walk_forward.{json,md}`.
+The command omits `--maker-bps`/`--taker-bps`, so it runs at the retail USDⓈ-M
+VIP 0 defaults (`2`/`5` bps) defined in `python_analytics.costs` — not at a
+rebate tier.
 
 > It **overwrites** those two artefacts (the `generated_at` stamp changes even
 > when every number reproduces), so re-run it deliberately and review
@@ -478,7 +481,7 @@ mistaken for *"the measurement is broken"*.
 | `--no-time-spread` | off | Disables the `γσ²(T−t)` spread term |
 | `--market-type` | `CRYPTO` | `CRYPTO` / `STOCK` / `COMMODITIES` |
 | `--tick-size`, `--center` | from `config/settings.yaml` | Venue grid |
-| `--maker-bps`, `--taker-bps` | `-1.0`, `5.0` | Fractional bps; negative maker = rebate |
+| `--maker-bps`, `--taker-bps` | `2.0`, `5.0` | Fractional bps; retail VIP 0 (negative maker = rebate tier) |
 | `--initial-cash`, `--order-quantity` | `100000.0`, `0.01` | Sizing |
 | `--batch-size`, `--frames-per-hook` | `64`, `1` | Replay batching; `1` = strategy per frame |
 | `--periods-per-year` | `252.0` | Sharpe/Sortino annualisation |
@@ -530,23 +533,31 @@ tick 0.50):
 | Metric | Value |
 | --- | --- |
 | Windows / events | 2 / 800 |
-| Parameter lock | `a3aa7022dbbbab72`, 4 checks (2 pre + 2 post) |
+| Parameter lock | `b29a62ed93caf69a`, 4 checks (2 pre + 2 post) |
 | Chronology checks | 1 (one boundary) |
-| Net PnL | `+4.1251` (`+0.0041%`) |
-| Realized / boundary / unrealized | `+4.4875` / `-0.4291` / `-0.3624` |
-| Fees paid | `-6.87` on `68,664.89` notional |
+| Net PnL | `-16.4743` (`-0.0165%`) |
+| Realized / boundary / unrealized | `-16.1119` / `-0.4291` / `-0.3624` |
+| Fees paid | `+13.73` on `68,664.89` notional (2 bps maker, 5 bps taker) |
 | Fills / round trips | 229 / 105 |
 | Win rate / profit factor | `30.48%` / `0.387` |
-| Sharpe / Sortino | `1.127` / `1.784` |
-| Max drawdown | `0.001%` |
+| Sharpe / Sortino | `-4.132` / `-4.469` |
+| Max drawdown | `0.0166%` |
 | Fill ratio | `15.51%` |
-| Window hit rate | `100%` (2 positive, 0 negative) |
+| Window hit rate | `0%` (0 positive, 2 negative) |
 | Ledger residual | `+1.4e-7` (tolerance `2.0e-2`) |
 
+> **This is a red result, and it is reported as one.** The same 800 events at the
+> rebate tier this repository used to default to (`maker_bps = -1.0`) report
+> `+4.1251` net; at retail fees they report `-16.4743`. Nothing in the strategy
+> changed — only the cost assumption did, which is exactly why the assumption is
+> now a tested gate rather than a default. At *zero* fees the study still loses
+> `2.74`, so the quoting logic does not earn on this book either; the param set
+> needs signal work before it can be promoted.
+
 > **Read this as machinery evidence, not alpha.** The bundled sample is a
-> synthetic walk, so a positive Sharpe here proves the pipeline reports what it
-> measured — not that the strategy is profitable. Judging an alpha requires a
-> real capture and `--min-sharpe`.
+> synthetic walk: the point of the table is that the pipeline reports what it
+> measured — including a loss — not that the strategy works. Judging an alpha
+> requires a real capture and `--min-sharpe`.
 
 ---
 

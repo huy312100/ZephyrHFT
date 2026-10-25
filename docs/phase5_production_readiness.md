@@ -25,19 +25,23 @@ python3 scripts/generate_readiness_report.py
 
 It re-measures every promise the earlier phases made — ingestion integrity, engine
 latency, ledger coherence, chaos self-healing, dead-man's switch behaviour,
-parameter locking, look-ahead prevention and OOS coverage — and prints a single
-verdict against **explicit, named thresholds**:
+parameter locking, look-ahead prevention and OOS coverage — and prints **two
+verdicts** against **explicit, named thresholds**:
 
 ```text
 ==============================================================================
-  PRODUCTION READINESS: GO
-  generated 2026-10-24T09:41:10+00:00
+  BUILD READINESS:     GO
+  ALPHA (PROFITABILITY): NO-GO
+  generated 2026-10-24T16:30:57+00:00
 ------------------------------------------------------------------------------
-  verdict: GO (15/15 gated checks passed)
+  BUILD: GO (15/15 gated checks passed)
+  ALPHA: NO-GO (1/2 profitability checks passed at 2.0 / 5.0 bps maker/taker)
+    ALPHA FAIL alpha.net_pnl: -16.4743 USDT (-0.0165%); -2.7413 before +13.7330 of fees (required >= 0 after modelled fees)
     Phase 1 - data ingestion               3/3 checks
     Phase 2 - paper execution              6/6 checks
     Phase 3 - resilience                   3/3 checks
     Phase 4 - out-of-sample validation     5/5 checks
+    Alpha - profitability at modelled fees 1/2 checks
 ------------------------------------------------------------------------------
   wrote: reports/production_readiness_report.json
   wrote: reports/production_readiness_report.md
@@ -45,6 +49,9 @@ verdict against **explicit, named thresholds**:
 ```
 
 "Shippable?" is a command with an exit code, not an opinion in a chat thread.
+The answer is deliberately split in two, because "the machinery works" and "this
+parameter set makes money" are different claims and one can be true while the
+other is false (§1.3).
 
 ### 1.1 Design principles
 
@@ -52,7 +59,7 @@ verdict against **explicit, named thresholds**:
 | --- | --- |
 | **Measure, do not assert** | Every check re-runs the invariant and reports the measured value next to the threshold |
 | **Determinism** | Engine, chaos and OOS *ledger* evidence come from a seeded synthetic book (`--evidence-events`, `--seed`), so the ledger, chaos and OOS counts reproduce on any machine; only Phase 1 integrity reads the real archive, while engine **latency and replay throughput** are host-sensitive (§3.3) |
-| **Machinery ≠ alpha** | Profitability is opt-in (`--min-oos-sharpe`); a build can be production-ready while the alpha is not, and conflating the two hides which one is broken |
+| **Machinery ≠ alpha** | Profitability is measured on every run but gated separately (§1.3): a build can be production-ready while the alpha is not, and conflating the two hides which one is broken |
 | **Fail loud, fail closed** | A failed check is named in `summary.blocking`, echoed as `BLOCKING …` on stderr, and returns exit `1` |
 | **Evidence over logs** | The JSON report carries every raw measurement, so an auditor can recompute the verdict without re-running the study |
 
@@ -60,20 +67,52 @@ verdict against **explicit, named thresholds**:
 
 | Exit | Meaning |
 | --- | --- |
-| `0` | **GO** — every gated check passed |
+| `0` | **GO** — every gated build check passed (alpha is reported but does not vote) |
 | `1` | **NO-GO** — at least one gated check failed, or validation raised (`ParameterLockError`, `LookAheadError`, `WalkForwardError`) |
 | `2` | Usage error: missing archive, unreadable settings, invalid argument |
+| `3` | **ALPHA NO-GO** — build is `GO` but the parameter set does not make money at the modelled fees; returned **only** with `--require-positive-alpha` |
 
 The gate writes `reports/production_readiness_report.json` and `.md` unless
 `--no-report` is passed.
+
+### 1.3 Two verdicts: build readiness vs alpha
+
+A single "GO" cannot answer two different questions, so the gate answers both and
+never lets one impersonate the other:
+
+| Verdict | Answers | Gates the exit code by default | Contains |
+| --- | --- | --- | --- |
+| **BUILD** | Does the machinery keep the promises of phases 1–4? | yes (`0` / `1`) | the 15 gated build checks, plus informational rows |
+| **ALPHA** | Does *this* parameter set earn after the fees a retail account actually pays? | no — only with `--require-positive-alpha` (`3`) | `alpha.net_pnl`, `alpha.fee_assumption` |
+
+Both are always measured and both are printed; `summary.blocking` (build) and
+`summary.alpha_blocking` (alpha) are separate keys, and a failing alpha check can
+never appear in `summary.blocking`. That split is what stops a red strategy from
+being excused as a red build — and stops a green build from laundering a red
+strategy. CI therefore gates the build by default (a strategy regression should
+not mask a broken engine), while the tag attestation requires **both** (§7).
+
+The alpha block is deliberately blunt about costs:
+
+| ID | Measures | Passes when |
+| --- | --- | --- |
+| `alpha.net_pnl` | Phase 4 aggregate `net_pnl` after fees, plus the same number with fees added back | `>= 0` after modelled fees |
+| `alpha.fee_assumption` | The fee assumption itself (maker/taker bps, round-trip cost) | `maker_bps >= 0` — a rebate is not a retail rate |
+
+Fees are already inside realized/unrealized PnL (both come from the cash ledger),
+so `pnl_before_fees = net_pnl + fees_paid` reports what the study would have earned
+for free. When *that* number is also negative, no cost-model change will rescue
+the strategy — the quoting logic itself does not earn, and the honest fix is the
+signal, not the fee tier.
 
 ---
 
 ## 2. Gate inventory
 
-15 gated checks by default across 17 table rows (15 gates + 2 informational
-rows); enabling `--min-oos-sharpe` adds one gate for 16 gated checks across 18
-rows.
+15 gated build checks by default across 17 table rows (15 gates + 2
+informational rows); enabling `--min-oos-sharpe` adds one gate for 16 gated
+checks across 18 rows. The two alpha checks (§1.3) are reported alongside these
+but are gated separately, so they are not counted here.
 
 ### 2.1 Phase 1 — data ingestion
 
@@ -131,8 +170,17 @@ By default the gate consumes the committed `reports/walk_forward.json`, so it
 verifies the study that was reviewed. `--recompute-walk-forward` runs a fresh
 study in-process instead (and `--window-events` then controls its slicing).
 
+A reused artefact is trusted only when its recorded lock matches the parameters
+the gate is actually running with. A study produced at another fee tier — or on
+a different strategy/venue grid — is ignored and a fresh one is computed, with
+the mismatched fields listed in `inputs.walk_forward_drift`; reporting an old
+study's net PnL under today's fee labels would be exactly the dishonesty the
+alpha checks exist to prevent. Decimal-string fields (`tick_size`, `center`,
+`order_quantity`) are compared numerically, so `"0.5"` and `"0.50"` are the same
+grid, while a fee change is always drift.
+
 > **The two studies are not interchangeable.** The committed artefact is the
-> bundled-sample study (Sharpe `1.127`); a recompute runs over the *synthetic
+> bundled-sample study (Sharpe `-4.132`); a recompute runs over the *synthetic
 > evidence book*, which is a zero-drift random walk and therefore scores ~`0.18`.
 > Recomputing is how you check that the pipeline still produces a valid study —
 > it is not how you re-derive a market edge. Gate profitability
@@ -367,8 +415,8 @@ proof would be vacuous.
 | --- | --- | --- |
 | Evidence | `--source`, `--evidence-events`, `--seed`, `--chaos-frames`, `--window-events`, `--min-windows` | `data/sample_events.ndjson`, `2000`, `7`, `200`, `0`, `2` |
 | Frozen parameters | `--gamma`, `--sigma`, `--k`, `--time-horizon`, `--inventory-limit`, `--ofi-sensitivity`, `--ofi-decay`, `--ofi-cap` | `0.1`, `0.02`, `5.0`, `60.0`, `5.0`, `0.0`, `0.95`, `3.0` |
-| Venue / costs | `--market-type`, `--tick-size`, `--center`, `--maker-bps`, `--taker-bps`, `--initial-cash`, `--order-quantity` | `CRYPTO`, settings, settings, `-1.0`, `5.0`, `100000.0`, `0.01` |
-| Gates | `--max-engine-p99-us`, `--max-engine-p999-us`, `--min-throughput-fps`, `--ledger-tolerance`, `--min-oos-sharpe` | `50.0`, `500.0`, `1000`, `1e-2`, `None` |
+| Venue / costs | `--market-type`, `--tick-size`, `--center`, `--maker-bps`, `--taker-bps`, `--initial-cash`, `--order-quantity` | `CRYPTO`, settings, settings, `2.0`, `5.0`, `100000.0`, `0.01` |
+| Gates | `--max-engine-p99-us`, `--max-engine-p999-us`, `--min-throughput-fps`, `--ledger-tolerance`, `--min-oos-sharpe`, `--require-positive-alpha` | `50.0`, `500.0`, `1000`, `1e-2`, `None`, off |
 | Walk-forward evidence | `--walk-forward-json`, `--recompute-walk-forward` | `reports/walk_forward.json`, off |
 | Output | `--report-dir`, `--stem`, `--no-report`, `--log-level` | `reports`, `production_readiness_report`, off, `ERROR` |
 
@@ -377,6 +425,14 @@ proof would be vacuous.
 > defaults to `k = 1.5`. This keeps a reused `reports/walk_forward.json` consistent
 > with the parameters the gate would have used; override both together or not at
 > all.
+>
+> **Fee defaults are the retail rate, not a rebate.** `--maker-bps` defaults to
+> `2.0` and `--taker-bps` to `5.0` (USDⓈ-M VIP 0), matching
+> `python_analytics.costs` and every script default. A negative maker fee is a
+> liquidity-provider rebate that a retail account does not receive; passing one
+> makes `alpha.fee_assumption` fail on purpose. Use
+> `BinanceFuturesClient.commission_rate(symbol)` to record what the account
+> actually pays instead of assuming a tier.
 
 ---
 
@@ -384,14 +440,22 @@ proof would be vacuous.
 
 ### 6.1 Markdown
 
-`reports/production_readiness_report.md` opens with the verdict, the gated-check
-count, the evidence source and the walk-forward origin, then repeats the checks
-grouped by phase. When something is blocking, a **Blocking failures** table is
-inserted before the phase sections, so a reader never has to diff PASS/FAIL rows
-to find the reason for a NO-GO:
+`reports/production_readiness_report.md` opens with both verdicts, the
+gated-check count, the evidence source and the walk-forward origin, then repeats
+the checks grouped by phase. When something is blocking, a **Blocking failures**
+table is inserted before the phase sections, so a reader never has to diff
+PASS/FAIL rows to find the reason for a NO-GO:
 
 ```markdown
-## Verdict: **NO-GO**
+## Build verdict: **GO**
+
+## Alpha verdict: **NO-GO**
+
+### Alpha failures
+
+| Check | Measured | Required |
+| --- | --- | --- |
+| `alpha.net_pnl` | -16.4743 USDT (-0.0165%); -2.7413 before +13.7330 of fees | >= 0 after modelled fees |
 
 ### Blocking failures
 
@@ -410,13 +474,14 @@ mistaken for gates.
 
 | Key | Content |
 | --- | --- |
-| `verdict` | `"GO"` / `"NO-GO"` |
+| `verdict` | Build verdict: `"GO"` / `"NO-GO"` |
+| `alpha_verdict` | Alpha verdict: `"GO"` / `"NO-GO"` (never merged into `verdict`) |
 | `generated_at` | ISO-8601 UTC |
-| `summary` | `checks`, `gated`, `passed`, `failed`, `blocking[]` (check IDs) |
-| `thresholds` | The exact ceilings in force for this run (§2.5) |
-| `inputs` | Source archive, evidence description, parameter fingerprint, walk-forward origin |
-| `checks[]` | One object per check: `id`, `phase`, `title`, `measured`, `threshold`, `passed`, `gated`, `note` |
-| `evidence` | Raw measurements: `configuration`, `ingestion`, `engine`, `chaos`, `deadman`, `walk_forward` |
+| `summary` | `checks`, `gated`, `passed`, `failed`, `blocking[]` (build check IDs), `alpha_checks`, `alpha_failed`, `alpha_blocking[]` |
+| `thresholds` | The exact ceilings in force for this run (§2.5), including `maker_bps`, `taker_bps`, `round_trip_cost_bps` and `require_positive_alpha` |
+| `inputs` | Source archive, evidence description, parameter fingerprint, walk-forward origin (plus `walk_forward_drift` when a reused artefact was rejected), `costs` |
+| `checks[]` | One object per check: `id`, `phase`, `title`, `measured`, `threshold`, `passed`, `gated`, `note` (`phase: "alpha"` marks profitability) |
+| `evidence` | Raw measurements: `configuration`, `ingestion`, `engine`, `chaos`, `deadman`, `walk_forward`, `alpha` |
 
 `summary.blocking` is the machine-readable form of the same fact the console
 prints, so a pipeline can gate on the JSON without parsing prose:
@@ -427,24 +492,33 @@ python3 - <<'PY'
 import json, pathlib
 report = json.loads(pathlib.Path("/tmp/gate/production_readiness_report.json").read_text())
 print(report["verdict"], report["summary"]["blocking"])
+print(report["alpha_verdict"], report["summary"]["alpha_blocking"])
 PY
 ```
 
 ### 6.3 Committed baseline (development host)
 
-Produced by `python3 scripts/generate_readiness_report.py` on the bundled sample
-before the pre-live review:
+Produced by `python3 scripts/generate_readiness_report.py` on the bundled sample,
+reading the committed `reports/walk_forward.json` (retail fees: 2 bps maker /
+5 bps taker):
 
 | Phase | Representative measurement | Status |
 | --- | --- | --- |
-| 1 — ingestion | `0` malformed / `0` gaps in 800 lines; ~31.7 k lines/s | PASS |
-| 2 — execution | p99 `11.3 µs`, p999 `93.2 µs` (a loaded run — see §3.3), `6,516` depth events/s, residual `-1.1e-7`, `0/3480` rejected, fills `16.4 %` | PASS |
+| 1 — ingestion | `0` malformed / `0` gaps in 800 lines; ~496 k lines/s | PASS |
+| 2 — execution | p99 `1.7 µs`, p999 `10.8 µs` (host-dependent — §3.3), `16.7 k` depth events/s, residual `-1.1e-7`, `0/3480` rejected, fills `16.4 %` | PASS |
 | 3 — resilience | 2 outages / 2 reconnects / 2 frames dropped; 36 spikes, max `19.8 ms`; switch tripped on `heartbeat_timeout: silence=600ms>=limit=500ms` | PASS |
-| 4 — validation | lock `a3aa7022dbbbab72` (4 checks); 1 chronology check across 2 windows; residual `+1.4e-7`; 2 windows / 800 events; Sharpe `1.127` (info) | PASS |
-| **Verdict** | **15/15 gated checks passed** | **GO** |
+| 4 — validation | lock `b29a62ed93caf69a` (4 checks); 1 chronology check across 2 windows; residual `+1.4e-7`; 2 windows / 800 events | PASS |
+| **Build verdict** | **15/15 gated checks passed** | **GO** |
+| Alpha (profitability) | `-16.4743 USDT` (`-2.7413` before `+13.7330` of fees) at 2/5 bps; Sharpe `-4.132` (info); `0/2` windows positive | **NO-GO (1/2)** |
 
-Latency and throughput vary per run (§3.3); the ledger, window, lock and chaos
-counts are deterministic.
+Read that last row as the headline: **the machinery is ready and the strategy is
+not**. At the rebate assumption this branch removed (`maker_bps = -1.0`) the same
+800 events reported `+4.13 USDT`; the fee change alone was worth ~`20.6 USDT`, and
+even at *zero* fees the run loses `2.74 USDT`. That is the honest state of the
+alpha workstream, and no fee-tier editing can turn it green.
+
+Latency and throughput vary per run (§3.3); the ledger, window, lock, chaos and
+alpha counts are deterministic.
 
 ---
 
@@ -456,7 +530,7 @@ unattended. `.github/workflows/readiness.yml` does:
 | Trigger | Purpose |
 | --- | --- |
 | Weekdays `03:17 UTC` (cron) | Nightly rehearsal against the committed lock and sample archive |
-| Tag `v*` | Release evidence: the tag cannot be attested without a `GO` |
+| Tag `v*` | Release evidence: the tag cannot be attested without a `GO` build **and** a `GO` alpha |
 | `workflow_dispatch` | Manual run with `source`, `evidence-events`, `max-engine-p99-us`, `min-oos-sharpe` and `recompute-walk-forward` inputs |
 
 The `GO / NO-GO gate` job runs, in order: `pip-audit` over the runtime
@@ -468,8 +542,11 @@ artefact (30-day retention). Concurrency is non-cancelling, so a scheduled run
 cannot be silenced by a push.
 
 The `attest release verdict` job (tags only) downloads that artefact and fails
-unless the verdict is `GO`. Binding the `production` environment to required
-reviewers turns tag attestation into a human sign-off rather than a rubber stamp.
+unless **both** headlines say `GO`: a release ships the strategy, not just the
+engine, so a green build is not sufficient evidence for a tag. To gate a
+non-tag pipeline on alpha as well, pass `--require-positive-alpha` (exit `3`).
+Binding the `production` environment to required reviewers turns tag attestation
+into a human sign-off rather than a rubber stamp.
 
 > The evidence bundle — not the console log — is the audit trail. Export it if
 > retention longer than 30 days is required.
@@ -499,6 +576,8 @@ Map the ID to the action:
 | `phase4.ledger_residual` | Boundary settlement mismatch across windows | Recompute the study (`--recompute-walk-forward`); inspect `boundary_settled_pnl` |
 | `phase4.window_coverage` | Fewer windows than `--min-windows` | Lower `--window-events`, add archives, or lower `--min-windows` deliberately |
 | `phase4.oos_sharpe` | Opt-in profitability gate not met | This is the alpha talking, not the machinery: do not weaken the threshold to ship |
+| `alpha.net_pnl` (alpha block, never build-blocking) | The frozen parameter set loses money after modelled fees | Read `evidence.alpha.pnl_before_fees`: if it is also negative the quoting logic does not earn and the signal needs work; if it is positive, the spread is merely smaller than the fee — widen it or stop quoting that book. Never fix this by assuming a rebate |
+| `alpha.fee_assumption` | `--maker-bps` is negative (a rebate tier) | Pass the retail rate (`2.0`) or the account's real `commissionRate`; a negative maker fee flatters every passive fill |
 
 Other failure shapes:
 
@@ -506,6 +585,7 @@ Other failure shapes:
 | --- | --- | --- |
 | `error: source archive not found: …` | `2` | `--source` path is wrong — no partial verdict is produced |
 | `validation failure: …` | `1` | The Phase 4 study itself raised (`ParameterLockError` / `LookAheadError`); the gate refuses to grade an invalid study |
+| `ALPHA NO-GO: the machinery is ready but this parameter set does not make money…` | `0` (or `3` with `--require-positive-alpha`) | Build is fine, strategy is not. Expected at retail fees; do not promote the parameter set |
 | `ModuleNotFoundError: hft_native` | — | Build the extension first (`cmake -S cpp_engine -B build -DHFT_BUILD_PYTHON=ON && cmake --build build`) |
 
 ---
@@ -515,7 +595,7 @@ Other failure shapes:
 | Limitation | Consequence |
 | --- | --- |
 | Engine, chaos and OOS evidence come from a **synthetic book** | The verdict proves the machinery, not a market edge. `--source` only drives the Phase 1 integrity check, so judging alpha requires a Phase 4 study over a real capture (`run_walk_forward.py --source <capture> ...`) passed explicitly with `--walk-forward-json <path>` — do not rely on the default `reports/walk_forward.json` — plus an explicit `--min-oos-sharpe` |
-| The synthetic book is a zero-drift random walk | Expect Sharpe ≈ 0 with a fee drag; the reported `1.127` comes from the bundled sample's drift, not from alpha |
+| The synthetic book is a zero-drift random walk | Expect Sharpe ≈ 0 with a fee drag; the committed sample reports `-4.132` (negative because it is charged 2 bps of maker fees on both sides), which is a cost-model statement, not a market verdict |
 | Engine p99 is host-sensitive | Two runs on the same machine, differing only in background load, move p99 from `1.4 µs` to `11.3 µs` and p999 from `8 µs` to `724 µs` (§3.3). The 5.0 µs budget is only meaningful with the cores and the load characterised |
 | Chaos runs on a fake monotonic clock | Deterministic and fast, but it does not exercise the socket, the TLS stack or the kernel's retransmit timers |
 | The dead-man's switch is driven directly | It proves monitor + kill-switch semantics, not the full live feed loop that must eventually beat into it |

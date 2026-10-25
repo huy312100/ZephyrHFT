@@ -1,5 +1,5 @@
 {
-  "fingerprint": "a3aa7022dbbbab72",
+  "fingerprint": "b29a62ed93caf69a",
   "kind": "walk_forward_parameter_lock",
   "metadata": {
     "source": [
@@ -9,7 +9,7 @@
   },
   "parameters": {
     "costs": {
-      "maker_bps": -1.0,
+      "maker_bps": 2.0,
       "taker_bps": 5.0
     },
     "sizing": {
@@ -34,5 +34,5 @@
     }
   },
   "phase": 4,
-  "written_at": "2026-10-24T07:56:58+00:00"
+  "written_at": "2026-10-24T17:00:02+00:00"
 }
