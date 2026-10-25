@@ -493,7 +493,22 @@ class BulkReplayer:
         self._equity_curve.append(float(account.equity()))
         self._position_curve.append(float(account.net_quantity()))
         self._slippage.append(abs(float(self._engine.last_slippage())))
+        before = len(self._native_fills)
         self._drain_native_fills()
+        if len(self._native_fills) > before:
+            self.on_frame(event_ns, self._native_fills[before:])
+        else:
+            self.on_frame(event_ns, ())
+
+    def on_frame(self, event_ns: int, new_fills: Sequence["hft_native.Fill"]) -> None:
+        """Hook invoked after every strategy hook, with the frame's new fills.
+
+        Subclasses measure execution quality here (see
+        :class:`~python_analytics.backtesting.markouts.MarkoutReplayer`): the
+        engine's event clock and its post-match book are both available at this
+        point, which is the only place a simulated fill can be paired with the
+        mid that produced it. The default implementation does nothing.
+        """
 
     def _next_synth_ns(self) -> int:
         """Deterministic 100 ms/frame clock for timestamp-less archives."""
