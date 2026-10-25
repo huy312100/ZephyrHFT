@@ -11,7 +11,12 @@ vendor bill that can quietly start accruing.
 
 CodeRabbit is configured in [`.coderabbit.yaml`](../.coderabbit.yaml), which is
 version-controlled, so its instructions change by pull request like any other
-file. **Sourcery's configuration lives only in its dashboard** and cannot be
+file. CodeRabbit reads it from the pull request's own branch — when the file was
+introduced, `@coderabbitai configuration` reported it as the entry file at that
+commit — so tuning applies to the pull request that makes it rather than only
+after a merge to `main`.
+
+**Sourcery's configuration lives only in its dashboard** and cannot be
 committed; the text to paste into it is kept below so it is at least reviewable
 and reproducible. If Sourcery's dashboard settings are ever lost, this file is
 the record of what they were.

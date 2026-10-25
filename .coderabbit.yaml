@@ -1,12 +1,13 @@
 # CodeRabbit configuration for ZephyrHFT.
 #
 # CodeRabbit is free for public repositories; this file is the entire setup.
-# It is read from the base branch, so changes here govern pull requests opened
-# after they land on `main`, not the one that introduced them.
+# It is picked up from the pull request's own branch, so a change here takes
+# effect on the pull request that makes it, and on everything after it merges.
 #
-# Validate with `@coderabbitai configuration` on any pull request: it echoes
-# the effective config and says where each value came from. `@coderabbitai help`
-# lists the available commands.
+# `@coderabbitai configuration` on a pull request is the authority on what is
+# actually in force: it echoes every effective value and marks each one as
+# coming from this file or from a default. `@coderabbitai help` lists the
+# available commands.
 #
 # The point of this file is to stop the reviewer re-deriving advice this
 # codebase has already settled in docs/. Every instruction below names the
