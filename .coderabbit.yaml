@@ -1,0 +1,113 @@
+# CodeRabbit configuration for ZephyrHFT.
+#
+# CodeRabbit is free for public repositories; this file is the entire setup.
+# It is read from the base branch, so changes here govern pull requests opened
+# after they land on `main`, not the one that introduced them.
+#
+# Validate with `@coderabbitai configuration` on any pull request: it echoes
+# the effective config and says where each value came from. `@coderabbitai help`
+# lists the available commands.
+#
+# The point of this file is to stop the reviewer re-deriving advice this
+# codebase has already settled in docs/. Every instruction below names the
+# invariant that actually matters, so findings are about correctness rather
+# than style.
+
+language: "en-US"
+
+reviews:
+  # "chill" reports what would break something. The default profile
+  # ("assertive") re-raises formatting and docstring advice that flake8 and
+  # this repository's own review pass already cover.
+  profile: "chill"
+
+  # Comments stay advisory. Merging is gated by CI (pytest, flake8, CodeQL),
+  # not by a review bot whose availability we do not control.
+  request_changes_workflow: false
+
+  high_level_summary: true
+  review_status: true
+  collapse_walkthrough: true
+  poem: false
+  sequence_diagrams: false
+
+  path_filters:
+    - "!build/**"
+    - "!**/__pycache__/**"
+    - "!data/**"
+    - "!reports/**"
+    - "!trades.json"
+
+  path_instructions:
+    - path: "python_analytics/live/**"
+      instructions: |
+        This is the live execution layer: it spends real money and the
+        invariants it holds are argued in docs/phase5_production_readiness.md.
+        Review against them, not against general Python taste.
+
+        - An order intent is persisted with its client order id before the
+          request is sent, because that id is the only handle the venue and
+          reconcile() share. Flag any path that sends before it records, or
+          that generates a second id for a retry of the same intent.
+        - AMBIGUOUS_SUBMIT_CODES (-1006, -1007) and HTTP 5xx mean execution
+          status unknown, never rejection: the venue may hold a live order.
+          Flag anything that records them as a clean failure, drops the
+          intent, or retries without first resolving through the venue by
+          client order id. That path is how one intent becomes two fills.
+        - UNKNOWN is not CANCELLED. CANCELLED is terminal and drops the row
+          from active_orders(), so reconcile() can no longer chase it. Flag
+          any write of a terminal status for a state the venue never
+          confirmed, and any write of an ACTIVE status over a TERMINAL one
+          (mark_status refuses the latter; do not let a new path bypass it).
+        - mark_status() takes BEGIN IMMEDIATE and writes the audit event in
+          the same transaction. A status that commits without its event is
+          unreadable after the fact. Flag any new status or event write that
+          opens its own transaction or commits separately.
+    - path: "scripts/**"
+      instructions: |
+        Operator-facing entry points; a mistake here spends money unattended.
+
+        - Exit codes are a contract documented in docs/ (0 clean, 1 drift or
+          unresolved order, 2 configuration refusal, 3 alpha gate refused,
+          130 interrupted). Flag any change that reports success while an
+          order is unresolved or the kill path did not complete.
+        - A post-only cross is only a safe, expected rejection when the code
+          proves it: -5022 is futures-only and self-proving, while -2010 is
+          the generic new-order rejection and must be confirmed by its text.
+          Flag any other rejection code being swallowed as benign.
+        - Flag logging of API keys, listen keys or signatures, and any retry
+          after an ambiguous submit that does not resolve first.
+    - path: "tests/**"
+      instructions: |
+        A test must fail when the behaviour it names is removed. Flag tests
+        over python_analytics/live/ that would still pass if the ambiguity
+        resolution, the terminal-state guard or the atomic status+event write
+        were deleted, and tests that assert on internals instead of the
+        observable order-store state.
+    - path: "cpp_engine/**"
+      instructions: |
+        Latency-critical C++. Flag heap allocation or lock acquisition on the
+        hot path, and any change that could move the published p99 latency
+        ceiling without a matching readiness re-run.
+    - path: ".github/workflows/**"
+      instructions: |
+        Flag third-party actions that are not pinned to a commit SHA,
+        pull_request_target on workflows that check out pull request code,
+        and any secret echoed to logs.
+
+  auto_review:
+    enabled: true
+    auto_incremental_review: true
+    drafts: false
+    base_branches:
+      - "main"
+
+  tools:
+    # The repository is linted by flake8 against .flake8 (max-line-length 100).
+    # Ruff's default line length is 88, so leaving it on reports hundreds of
+    # style findings that contradict the config the project actually uses.
+    ruff:
+      enabled: false
+
+chat:
+  auto_reply: true
