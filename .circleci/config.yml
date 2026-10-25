@@ -1,0 +1,358 @@
+version: 2.1
+
+# CI for ZephyrHFT.
+#
+# This replaces .github/workflows/ci.yml, which is deleted in the same commit.
+# Four gates live here: a GitGuardian secret scan over the commits under review,
+# build + test on both ends of the supported Python range, flake8, and an
+# ASan + UBSan pass over the C++ core.
+#
+# The workflows that stay on GitHub Actions do not port, and are not duplicated
+# here: `codeql.yml` is a GitHub-native analyser, while `readiness.yml` and
+# `testnet-pilot.yml` are release/operator gates that depend on GitHub
+# Environments (required reviewers, masked secrets, tag-scoped attestation).
+#
+# The base image is plain `ubuntu:24.04` rather than a convenience image
+# because cpp_engine sets `CMAKE_CXX_STANDARD 23`: that needs GCC >= 13, and
+# noble is the release that ships it (13.3) together with CMake 3.28. The
+# Python 3.9 interpreter is the one thing not in noble's archive, so it comes
+# from the deadsnakes PPA on the same image -- the compiler stays the version
+# that is known to build this engine.
+#
+# One-time setup, because CircleCI cannot be configured from inside the repo:
+# github.com/apps/circleci -> add ZephyrHFT, then circleci.com -> Projects ->
+# Set Up Project with this branch. The one secret is GITGUARDIAN_API_KEY, which
+# the `secret-scan` job requires and refuses to run without; everything else
+# needs no orbs, no contexts and no credentials.
+
+executors:
+  linux:
+    docker:
+      - image: ubuntu:24.04
+    resource_class: medium
+    working_directory: ~/project
+    environment:
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+      PYTHONUNBUFFERED: "1"
+      # apt-get must never stop on a configuration prompt.
+      DEBIAN_FRONTEND: noninteractive
+
+
+commands:
+  # The stock ubuntu image ships neither git nor ssh, and `checkout` needs both,
+  # so the bootstrap has to happen before the special step.
+  checkout-source:
+    description: Install git, then check the repository out.
+    steps:
+      - run:
+          name: Install git
+          command: |
+            apt-get update -qq
+            apt-get install -y --no-install-recommends \
+              git openssh-client ca-certificates
+      - checkout
+
+  # GCC 13 + CMake 3.28, the pair the previous workflow pinned ubuntu-24.04 for.
+  install-cxx-toolchain:
+    description: Install and report the C++ toolchain.
+    steps:
+      - run:
+          name: Install GCC 13 and CMake
+          command: |
+            apt-get install -y --no-install-recommends build-essential cmake
+            g++ --version | head -n 1
+            cmake --version | head -n 1
+
+  # Python lives in a venv so the interpreter version is explicit and the pip
+  # cache has one obvious home. `deps: dev` additionally pulls flake8 and
+  # pytest-cov, which is why the lint job needs no C++ toolchain at all.
+  install-python:
+    description: Install a Python interpreter, a venv and the dependencies.
+    parameters:
+      version:
+        type: string
+      deps:
+        type: enum
+        enum: ["runtime", "dev"]
+        default: "dev"
+    steps:
+      - restore_cache:
+          name: Restore the pip cache
+          keys:
+            - pip-v1-<< parameters.version >>-{{ checksum "requirements.txt" }}-{{ checksum "requirements-dev.txt" }}
+            - pip-v1-<< parameters.version >>-
+      - run:
+          name: Install Python << parameters.version >> and create the venv
+          command: |
+            if [ "<< parameters.version >>" = "3.12" ]; then
+              apt-get install -y --no-install-recommends \
+                python3.12 python3.12-venv python3.12-dev
+              base=python3.12
+            else
+              # noble carries only 3.12; deadsnakes publishes 3.7-3.11 (+3.13)
+              # for noble, so the compatibility leg gets a real 3.9 rather than
+              # being quietly dropped from the matrix. The package name is built
+              # The package name is assembled in a variable rather than written
+              # inline, because the placeholder is unparseable shell until
+              # CircleCI substitutes it.
+              pkg="python<< parameters.version >>"
+              apt-get install -y --no-install-recommends software-properties-common
+              add-apt-repository -y ppa:deadsnakes/ppa
+              apt-get update -qq
+              apt-get install -y --no-install-recommends \
+                "${pkg}-dev" "${pkg}-venv" "$pkg"
+              base="$pkg"
+            fi
+            "$base" --version
+            "$base" -m venv ~/venv
+            echo 'export PATH=$HOME/venv/bin:$PATH' >> "$BASH_ENV"
+      - run:
+          name: Install dependencies (<< parameters.deps >>)
+          command: |
+            python -m pip install --upgrade pip
+            if [ "<< parameters.deps >>" = "dev" ]; then
+              python -m pip install -r requirements-dev.txt
+            else
+              python -m pip install -r requirements.txt
+            fi
+            python -m pip list
+      - save_cache:
+          name: Save the pip cache
+          key: pip-v1-<< parameters.version >>-{{ checksum "requirements.txt" }}-{{ checksum "requirements-dev.txt" }}
+          paths:
+            - ~/.cache/pip
+
+  # ggshield is deliberately absent from requirements-dev.txt: it is a scanner,
+  # not something the engine or the tests import, so it gets its own venv and
+  # the test environment stays exactly what the developer installs. The version
+  # is pinned here because this file is the only place CircleCI reads; bump it
+  # by hand when a GitGuardian release matters.
+  install-ggshield:
+    description: Install the pinned GitGuardian scanner in its own venv.
+    parameters:
+      version:
+        type: string
+        default: "1.56.0"
+    steps:
+      - run:
+          name: Install ggshield << parameters.version >>
+          command: |
+            apt-get install -y --no-install-recommends python3-venv
+            python3 -m venv ~/ggvenv
+            ~/ggvenv/bin/pip install --quiet "ggshield==<< parameters.version >>"
+            ~/ggvenv/bin/ggshield --version
+
+jobs:
+  # The extension is written into python_analytics/native (it is not
+  # pip-installable), so the build has to happen before the tests: a green
+  # pytest run against a stale .so would prove nothing.
+  build-and-test:
+    parameters:
+      python_version:
+        type: string
+      # Coverage is measured once, on the newest interpreter: it is a property
+      # of the code, not of the interpreter, and rerunning it per leg only
+      # burns credits.
+      coverage:
+        type: boolean
+        default: false
+    executor: linux
+    steps:
+      - checkout-source
+      - install-cxx-toolchain
+      - install-python:
+          version: << parameters.python_version >>
+          deps: dev
+      - run:
+          name: Configure CMake
+          command: |
+            cmake -S cpp_engine -B build \
+              -DCMAKE_BUILD_TYPE=Release \
+              -Dpybind11_DIR="$(python -m pybind11 --cmakedir)"
+      - run:
+          name: Build C++ core and extension
+          command: cmake --build build --parallel
+          no_output_timeout: 20m
+      - run:
+          name: Verify the native extension loads
+          command: |
+            python -c "from python_analytics.native import hft_native; print('hft_native ->', hft_native.__file__)"
+      - run:
+          name: Run C++ tests (CTest)
+          command: ctest --test-dir build --output-on-failure
+      - when:
+          condition: << parameters.coverage >>
+          steps:
+            - run:
+                # The floor is the measured baseline minus a safety margin
+                # (~85 % today), so a new module cannot land untested.
+                name: Run Python tests with coverage (pytest-cov)
+                command: |
+                  python -m pytest --cov=python_analytics \
+                    --cov-report=term-missing --cov-fail-under=80
+      - unless:
+          condition: << parameters.coverage >>
+          steps:
+            - run:
+                name: Run Python tests (pytest)
+                command: python -m pytest
+      - run:
+          name: Smoke test the CLI
+          command: python main.py --demo
+
+  # Cheap (seconds), no build needed, and it catches the class of defect the
+  # test suite cannot see: unused imports, dead f-strings, stray whitespace and
+  # lines that only look aligned in one editor.
+  lint:
+    executor: linux
+    steps:
+      - checkout-source
+      - install-python:
+          version: "3.12"
+          deps: dev
+      - run:
+          name: flake8
+          command: |
+            python -m flake8 --count --statistics \
+              python_analytics scripts tests main.py
+
+  # Memory-safety gate for the C++ core. A use-after-free on the book ladder or
+  # a signed overflow in the fixed-point maths does not fail a release build on
+  # a quiet day; it fails in production, on the day it matters. The native
+  # extension is skipped here (the test binary links hft_core directly), so the
+  # sanitised build costs seconds rather than a full pybind11 compile.
+  sanitizers:
+    executor: linux
+    environment:
+      # halt_on_error: the first report is the finding; keep going and the log
+      # buries it. Leak reporting is enabled but non-fatal (exitcode=0) until
+      # there is a clean baseline to gate on -- change it to 23 to make leaks
+      # fail the build.
+      ASAN_OPTIONS: halt_on_error=1:detect_leaks=1:abort_on_error=1
+      LSAN_OPTIONS: exitcode=0
+      UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+    steps:
+      - checkout-source
+      - install-cxx-toolchain
+      - run:
+          name: Configure CMake (sanitised, no extension)
+          command: |
+            cmake -S cpp_engine -B build/sanitize \
+              -DCMAKE_BUILD_TYPE=Debug \
+              -DHFT_BUILD_PYTHON=OFF \
+              -DHFT_ENABLE_NATIVE=OFF \
+              -DHFT_ENABLE_LTO=OFF \
+              -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer -g"
+      - run:
+          name: Build sanitised test binary
+          command: cmake --build build/sanitize --parallel
+          no_output_timeout: 20m
+      - run:
+          name: Run C++ tests under ASan + UBSan
+          command: ctest --test-dir build/sanitize --output-on-failure
+
+  # A committed credential is exposed the moment it is pushed: by the time a
+  # reviewer spots it in the diff, the only open question is how long it stayed
+  # valid. This gate scans exactly the commits the pipeline introduces -- the
+  # whole branch for a pull request, the pushed commits for a branch build -- so
+  # it fails on what this branch adds and never on what the repository already
+  # contains (that is the GitGuardian dashboard's job, and re-flagging it here
+  # would train reviewers to ignore the gate).
+  secret-scan:
+    executor: linux
+    steps:
+      - checkout-source
+      - install-ggshield
+      # A scanning gate that cannot run must not report success: without a key
+      # this job fails and says what to do, rather than passing silently green.
+      - run:
+          name: Check the GitGuardian API key
+          command: |
+            if [ -z "${GITGUARDIAN_API_KEY:-}" ]; then
+              echo "GITGUARDIAN_API_KEY is not set, so this branch cannot be scanned."
+              echo "Add it once: Project Settings -> Environment Variables (or a context)."
+              echo "Value: dashboard.gitguardian.com -> API -> personal access token, 'scan' scope."
+              exit 1
+            fi
+      # CircleCI exposes no "pull request base branch" variable, and its checkout
+      # is not guaranteed to hold the base commit, so fetch the branches and work
+      # the range out here: the pushed commits when CIRCLE_BEFORE_SHA is present
+      # (it is all zeros on a branch's first build), otherwise everything the
+      # branch adds on top of main.
+      - run:
+          name: Resolve the commits under review
+          command: |
+            git fetch --no-tags --prune origin "+refs/heads/*:refs/remotes/origin/*"
+            base=""
+            if [ -n "${CIRCLE_BEFORE_SHA:-}" ] &&
+              git cat-file -e "${CIRCLE_BEFORE_SHA}^{commit}" 2>/dev/null; then
+              base="$CIRCLE_BEFORE_SHA"
+            elif git rev-parse --verify -q refs/remotes/origin/main >/dev/null; then
+              base="$(git merge-base refs/remotes/origin/main HEAD || true)"
+            fi
+            head="$(git rev-parse HEAD)"
+            if [ -n "$base" ]; then
+              range="$base..$head"
+            else
+              # Nothing to compare against (orphan or renamed default branch):
+              # scanning the head commit is still better than scanning nothing.
+              range="$head"
+            fi
+            count="$(git rev-list --count "$range")"
+            echo "Commits under review: $range ($count commit(s))"
+            if [ "$count" -eq 0 ]; then
+              echo "Nothing new to scan."
+              : > /tmp/gg-range
+            else
+              printf '%s' "$range" > /tmp/gg-range
+            fi
+      - run:
+          name: Scan for secrets (GitGuardian)
+          command: |
+            range="$(cat /tmp/gg-range)"
+            if [ -z "$range" ]; then
+              echo "No new commits in this pipeline: nothing to scan."
+              exit 0
+            fi
+            ~/ggvenv/bin/ggshield secret scan commit-range "$range"
+
+workflows:
+  # Every branch, every push, every pull request. The GitHub workflow this
+  # replaces filtered to main/feat/**/fix/**, but a gate that silently does not
+  # run is worse than one that runs twice, and CircleCI cancellations cover the
+  # duplicate push+branch pipelines (enable "Auto-cancel redundant workflows"
+  # in Project Settings -> Advanced).
+  #
+  # Tags are ignored: `readiness.yml` owns releases, and rebuilding a tag only
+  # spends credits. The status-check names in branch protection are
+  # `ci/circleci: secret-scan`, `ci/circleci: build-and-test-py39`,
+  # `ci/circleci: build-and-test-py312`, `ci/circleci: lint` and
+  # `ci/circleci: sanitizers`.
+  ci:
+    jobs:
+      - secret-scan:
+          filters:
+            tags:
+              ignore: /.*/
+      - lint:
+          filters:
+            tags:
+              ignore: /.*/
+      - build-and-test:
+          name: build-and-test-py39
+          python_version: "3.9"
+          filters:
+            tags:
+              ignore: /.*/
+      - build-and-test:
+          name: build-and-test-py312
+          python_version: "3.12"
+          coverage: true
+          filters:
+            tags:
+              ignore: /.*/
+      - sanitizers:
+          filters:
+            tags:
+              ignore: /.*/
+

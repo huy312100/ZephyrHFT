@@ -587,7 +587,7 @@ tick 0.50):
 | Lock round-trip, fingerprint derivation, tamper detection | `LockedParameters` / `read_lock_file` unit tests |
 | Look-ahead detection | Slice-accounting and chronology tests |
 | Consumption by the readiness gate | `tests/python/test_production_readiness.py` (Phase 4 checks) |
-| CI | `ci.yml` runs the suite on py3.9 and py3.12; `readiness.yml` replays the committed lock with `--from-lock` nightly and on every `v*` tag |
+| CI | `.circleci/config.yml` scans the commits under review for secrets with `ggshield` and runs the suite on py3.9 and py3.12; `readiness.yml` replays the committed lock with `--from-lock` nightly and on every `v*` tag |
 
 Observed on the committed baseline: `pytest` 232 passed; the study reproduces to
 the last digit on the bundled sample; exit codes match §6.6 (`0` success, `2` lock
