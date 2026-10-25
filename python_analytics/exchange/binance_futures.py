@@ -832,6 +832,10 @@ def parse_commission_rate(payload: Any, *, symbol: Optional[str] = None) -> Comm
     The endpoint answers ``{"symbol": ..., "makerCommissionRate": "0.0002",
     "takerCommissionRate": "0.0005"}``. A missing rate is an error rather than a
     silent zero: charging nobody would make every strategy look profitable.
+
+    When both the caller and the payload name a symbol they must agree: a rate
+    that belongs to another market would otherwise be recorded as this one's and
+    every cost assumption built on it would be wrong.
     """
 
     if not isinstance(payload, Mapping):
@@ -839,11 +843,16 @@ def parse_commission_rate(payload: Any, *, symbol: Optional[str] = None) -> Comm
     for key in ("makerCommissionRate", "takerCommissionRate"):
         if payload.get(key) in (None, ""):
             raise BinanceError(f"commissionRate payload has no {key}")
-    resolved = symbol or str(payload.get("symbol") or "").strip().upper()
+    caller_symbol = str(symbol or "").strip().upper()
+    payload_symbol = str(payload.get("symbol") or "").strip().upper()
+    if caller_symbol and payload_symbol and caller_symbol != payload_symbol:
+        raise BinanceError(
+            f"commissionRate payload is for {payload_symbol}, not {caller_symbol}")
+    resolved = caller_symbol or payload_symbol
     if not resolved:
         raise BinanceError("commissionRate payload has no symbol")
     return CommissionRate(
-        symbol=resolved.upper(),
+        symbol=resolved,
         maker_rate=_decimal_field(payload, "makerCommissionRate"),
         taker_rate=_decimal_field(payload, "takerCommissionRate"),
     )

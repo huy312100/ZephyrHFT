@@ -39,8 +39,9 @@ import sys
 import tempfile
 import time
 from dataclasses import dataclass, field
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Mapping, Optional
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -661,6 +662,62 @@ def build_parameters(args: argparse.Namespace, settings: Any) -> LockedParameter
     )
 
 
+#: Locked fields stored as decimal *strings* so a grid is never silently
+#: re-rounded. ``LockedParameters.diff`` compares them as text (by design), so
+#: the artefact check below normalises them numerically instead: ``"0.5"`` and
+#: ``"0.50"`` describe the same tick grid and must not force a recompute.
+_DECIMAL_FIELDS = frozenset({
+    ("venue", "tick_size"),
+    ("venue", "center"),
+    ("sizing", "order_quantity"),
+})
+
+
+def _decimal_key(value: Any) -> str:
+    """Canonical text for a decimal-string lock field (``"0.50"`` -> ``"0.5"``)."""
+    try:
+        return format(Decimal(str(value)).normalize(), "f")
+    except (InvalidOperation, TypeError, ValueError):
+        return str(value)
+
+
+def locked_parameter_drift(payload: Mapping[str, Any],
+                           parameters: LockedParameters) -> List[str]:
+    """Mismatches between a reused study's frozen lock and the current settings.
+
+    A committed ``walk_forward.json`` carries the parameters that produced its
+    PnL. Reusing it while the gate runs with different fees (or a different
+    strategy/venue set) would report an old study's net PnL under today's labels,
+    which is exactly the dishonesty this gate exists to prevent -- so any drift
+    means the artefact cannot be reused for alpha and must be recomputed.
+
+    An artefact that records no parameters is treated as drift too: an
+    unverifiable fee assumption is not evidence.
+    """
+    lock = payload.get("validation")
+    block = lock.get("parameter_lock") if isinstance(lock, Mapping) else None
+    recorded = block.get("parameters") if isinstance(block, Mapping) else None
+    if not isinstance(recorded, Mapping):
+        return ["validation.parameter_lock.parameters is missing"]
+    try:
+        locked = LockedParameters.from_dict(recorded)
+    except (ParameterLockError, TypeError, ValueError) as exc:
+        return [f"validation.parameter_lock.parameters is unreadable: {exc}"]
+
+    mine, theirs = parameters.as_dict(), locked.as_dict()
+    drift: List[str] = []
+    for section, fields in mine.items():
+        for name, value in fields.items():
+            other = theirs.get(section, {}).get(name)
+            if (section, name) in _DECIMAL_FIELDS:
+                same = _decimal_key(value) == _decimal_key(other)
+            else:
+                same = value == other
+            if not same:
+                drift.append(f"{section}.{name}: {value!r} != {other!r}")
+    return drift
+
+
 def measure_alpha(payload: Dict[str, Any], *, maker_bps: float,
                   taker_bps: float) -> tuple[List[Check], Dict[str, Any]]:
     """Profitability: does the frozen parameter set earn at honest costs?
@@ -757,8 +814,17 @@ def build_report(args: argparse.Namespace) -> ReadinessReport:
     evidence["deadman"] = measured
 
     artifact = Path(args.walk_forward_json)
-    if artifact.is_file() and not args.recompute_walk_forward:
-        payload = json.loads(artifact.read_text(encoding="utf-8"))
+    payload: Dict[str, Any] = {}
+    drift: List[str] = []
+    reused = artifact.is_file() and not args.recompute_walk_forward
+    if reused:
+        candidate = json.loads(artifact.read_text(encoding="utf-8"))
+        # Only a study run at *these* parameters can be priced at these fees.
+        drift = locked_parameter_drift(candidate, parameters)
+        reused = not drift
+        if reused:
+            payload = candidate
+    if reused:
         origin = f"artifact {artifact}"
     else:
         window_events = args.window_events or max(1, args.evidence_events // 4)
@@ -767,6 +833,12 @@ def build_report(args: argparse.Namespace) -> ReadinessReport:
                                        window_events=window_events,
                                        workdir=Path(workdir))
         origin = f"computed in-process ({window_events} events/window)"
+        if drift:
+            # Name the rejection: grading a study priced at another fee tier and
+            # labelling it with today's would be exactly the dishonesty the
+            # alpha checks exist to prevent.
+            origin += f"; ignored {artifact}: {len(drift)} locked field(s) differ"
+            inputs["walk_forward_drift"] = drift
     inputs["walk_forward_origin"] = origin
     found, measured = measure_validation(
         payload, origin, min_windows=args.min_windows,

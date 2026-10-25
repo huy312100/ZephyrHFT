@@ -202,8 +202,8 @@ repository.
 {
   "phase": 4,
   "kind": "walk_forward_parameter_lock",
-  "written_at": "2026-10-24T16:28:29+00:00",
-  "fingerprint": "699407a809d589a9",
+  "written_at": "2026-10-24T17:00:02+00:00",
+  "fingerprint": "b29a62ed93caf69a",
   "parameters": {
     "strategy": {
       "gamma": 0.1, "sigma": 0.02, "k": 5.0, "time_horizon": 60.0,
@@ -383,7 +383,7 @@ python3 scripts/run_walk_forward.py \
 ```
 
 This is the command that produced the committed fit: two 400-event windows,
-fingerprint `699407a809d589a9`, artefacts `reports/walk_forward.{json,md}`.
+fingerprint `b29a62ed93caf69a`, artefacts `reports/walk_forward.{json,md}`.
 The command omits `--maker-bps`/`--taker-bps`, so it runs at the retail USDⓈ-M
 VIP 0 defaults (`2`/`5` bps) defined in `python_analytics.costs` — not at a
 rebate tier.
@@ -533,7 +533,7 @@ tick 0.50):
 | Metric | Value |
 | --- | --- |
 | Windows / events | 2 / 800 |
-| Parameter lock | `699407a809d589a9`, 4 checks (2 pre + 2 post) |
+| Parameter lock | `b29a62ed93caf69a`, 4 checks (2 pre + 2 post) |
 | Chronology checks | 1 (one boundary) |
 | Net PnL | `-16.4743` (`-0.0165%`) |
 | Realized / boundary / unrealized | `-16.1119` / `-0.4291` / `-0.3624` |

@@ -31,10 +31,11 @@ def round_trip_cost_bps(maker_bps: float = DEFAULT_MAKER_BPS, *,
     """Cost of opening and closing one position, in fractional basis points.
 
     ``both_sides_maker=True`` models a market maker that is passive on the way in
-    *and* out; ``False`` models a taker entry with a taker exit. Negative values
-    mean the round trip is paid for by a rebate.
+    *and* out; ``False`` models a taker entry with a taker exit, where neither
+    fill rested and the taker rate is therefore paid twice. Negative values mean
+    the round trip is paid for by a rebate.
     """
 
     if both_sides_maker:
         return 2.0 * float(maker_bps)
-    return float(maker_bps) + float(taker_bps)
+    return 2.0 * float(taker_bps)

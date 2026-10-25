@@ -170,8 +170,17 @@ By default the gate consumes the committed `reports/walk_forward.json`, so it
 verifies the study that was reviewed. `--recompute-walk-forward` runs a fresh
 study in-process instead (and `--window-events` then controls its slicing).
 
+A reused artefact is trusted only when its recorded lock matches the parameters
+the gate is actually running with. A study produced at another fee tier — or on
+a different strategy/venue grid — is ignored and a fresh one is computed, with
+the mismatched fields listed in `inputs.walk_forward_drift`; reporting an old
+study's net PnL under today's fee labels would be exactly the dishonesty the
+alpha checks exist to prevent. Decimal-string fields (`tick_size`, `center`,
+`order_quantity`) are compared numerically, so `"0.5"` and `"0.50"` are the same
+grid, while a fee change is always drift.
+
 > **The two studies are not interchangeable.** The committed artefact is the
-> bundled-sample study (Sharpe `1.127`); a recompute runs over the *synthetic
+> bundled-sample study (Sharpe `-4.132`); a recompute runs over the *synthetic
 > evidence book*, which is a zero-drift random walk and therefore scores ~`0.18`.
 > Recomputing is how you check that the pipeline still produces a valid study —
 > it is not how you re-derive a market edge. Gate profitability
@@ -470,7 +479,7 @@ mistaken for gates.
 | `generated_at` | ISO-8601 UTC |
 | `summary` | `checks`, `gated`, `passed`, `failed`, `blocking[]` (build check IDs), `alpha_checks`, `alpha_failed`, `alpha_blocking[]` |
 | `thresholds` | The exact ceilings in force for this run (§2.5), including `maker_bps`, `taker_bps`, `round_trip_cost_bps` and `require_positive_alpha` |
-| `inputs` | Source archive, evidence description, parameter fingerprint, walk-forward origin, `costs` |
+| `inputs` | Source archive, evidence description, parameter fingerprint, walk-forward origin (plus `walk_forward_drift` when a reused artefact was rejected), `costs` |
 | `checks[]` | One object per check: `id`, `phase`, `title`, `measured`, `threshold`, `passed`, `gated`, `note` (`phase: "alpha"` marks profitability) |
 | `evidence` | Raw measurements: `configuration`, `ingestion`, `engine`, `chaos`, `deadman`, `walk_forward`, `alpha` |
 
@@ -498,7 +507,7 @@ reading the committed `reports/walk_forward.json` (retail fees: 2 bps maker /
 | 1 — ingestion | `0` malformed / `0` gaps in 800 lines; ~496 k lines/s | PASS |
 | 2 — execution | p99 `1.7 µs`, p999 `10.8 µs` (host-dependent — §3.3), `16.7 k` depth events/s, residual `-1.1e-7`, `0/3480` rejected, fills `16.4 %` | PASS |
 | 3 — resilience | 2 outages / 2 reconnects / 2 frames dropped; 36 spikes, max `19.8 ms`; switch tripped on `heartbeat_timeout: silence=600ms>=limit=500ms` | PASS |
-| 4 — validation | lock `699407a809d589a9` (4 checks); 1 chronology check across 2 windows; residual `+1.4e-7`; 2 windows / 800 events | PASS |
+| 4 — validation | lock `b29a62ed93caf69a` (4 checks); 1 chronology check across 2 windows; residual `+1.4e-7`; 2 windows / 800 events | PASS |
 | **Build verdict** | **15/15 gated checks passed** | **GO** |
 | Alpha (profitability) | `-16.4743 USDT` (`-2.7413` before `+13.7330` of fees) at 2/5 bps; Sharpe `-4.132` (info); `0/2` windows positive | **NO-GO (1/2)** |
 

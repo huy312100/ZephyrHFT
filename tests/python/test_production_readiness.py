@@ -195,6 +195,7 @@ def test_written_artefacts_round_trip(gate, green, tmp_path) -> None:
 def test_existing_walk_forward_artefact_is_reused(gate, green, tmp_path) -> None:
     args, recomputed = green
     assert recomputed.inputs["walk_forward_origin"].startswith("computed")
+    locked = gate.build_parameters(args, gate.load_settings())
     artefact = tmp_path / "walk_forward.json"
     artefact.write_text(json.dumps({
         "report": "phase4_walk_forward",
@@ -210,7 +211,8 @@ def test_existing_walk_forward_artefact_is_reused(gate, green, tmp_path) -> None
             "ledger_residual": 1e-9, "window_hit_rate_pct": 75.0,
         },
         "validation": {
-            "parameter_lock": {"fingerprint": "deadbeef", "checks": 4},
+            "parameter_lock": {"fingerprint": "deadbeef", "checks": 4,
+                               "parameters": locked.as_dict()},
             "look_ahead": {"verified": True, "chronology_verified": True,
                            "chronology_checks": 3, "windows_checked": 4},
             "ledger": {"residual": 1e-9, "tolerance": 0.02},
@@ -230,6 +232,51 @@ def test_existing_walk_forward_artefact_is_reused(gate, green, tmp_path) -> None
     assert walk["fill_ratio_pct"] == pytest.approx(12.0)
     assert walk["windows_positive"] == 3
     assert walk["lock_fingerprint"] == "deadbeef"
+
+
+def test_artefact_with_a_different_fee_assumption_is_recomputed(
+    gate, green, tmp_path
+) -> None:
+    """An old study's PnL must never be reported under today's fee labels."""
+
+    args, _ = green
+    locked = gate.build_parameters(args, gate.load_settings()).as_dict()
+    locked["costs"]["maker_bps"] = -1.0
+    artefact = tmp_path / "walk_forward_rebate.json"
+    artefact.write_text(json.dumps({
+        "report": "phase4_walk_forward",
+        "aggregate": {"windows": 2, "events": 800, "net_pnl": 4.1251},
+        "validation": {"parameter_lock": {"checks": 4,
+                                          "parameters": locked}},
+    }), encoding="utf-8")
+    reused = gate.parse_args([
+        "--source", args.source,
+        "--evidence-events", "400",
+        "--chaos-frames", "100",
+        "--walk-forward-json", str(artefact),
+        "--no-report",
+    ])
+    report = gate.build_report(reused)
+    origin = report.inputs["walk_forward_origin"]
+    assert origin.startswith("computed")
+    assert "ignored" in origin
+    assert report.evidence["walk_forward"]["windows"] == 4  # freshly studied
+    assert any("costs.maker_bps" in item
+               for item in report.inputs["walk_forward_drift"])
+
+
+def test_locked_parameter_drift_compares_grids_numerically(gate, green) -> None:
+    """``"0.5"`` and ``"0.50"`` are the same grid, but a fee change is drift."""
+
+    args, _ = green
+    parameters = gate.build_parameters(args, gate.load_settings())
+    block = parameters.as_dict()
+    block["venue"]["tick_size"] = "0.5"
+    payload = {"validation": {"parameter_lock": {"parameters": block}}}
+    assert gate.locked_parameter_drift(payload, parameters) == []
+    block["costs"]["maker_bps"] = -1.0
+    drift = gate.locked_parameter_drift(payload, parameters)
+    assert len(drift) == 1 and "costs.maker_bps" in drift[0]
 
 
 def test_no_artefacts_without_consent(gate, green, tmp_path) -> None:

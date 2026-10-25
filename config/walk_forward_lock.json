@@ -1,9 +1,9 @@
 {
-  "fingerprint": "699407a809d589a9",
+  "fingerprint": "b29a62ed93caf69a",
   "kind": "walk_forward_parameter_lock",
   "metadata": {
     "source": [
-      "/Users/nguyenngocduchuy/Projects/ZephyrHFT/data/sample_events.ndjson"
+      "data/sample_events.ndjson"
     ],
     "window_events": 400
   },
@@ -30,9 +30,9 @@
     "venue": {
       "center": "30000",
       "market_type": "CRYPTO",
-      "tick_size": "0.5"
+      "tick_size": "0.50"
     }
   },
   "phase": 4,
-  "written_at": "2026-10-24T16:28:29+00:00"
+  "written_at": "2026-10-24T17:00:02+00:00"
 }

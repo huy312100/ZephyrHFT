@@ -335,6 +335,24 @@ def test_client_fetches_the_signed_commission_rate():
     assert rate.taker_bps == pytest.approx(5.0)
 
 
+def test_parse_commission_rate_rejects_a_symbol_mismatch():
+    """A rate for another market must never be recorded as this one's."""
+
+    with pytest.raises(BinanceError, match="ETHUSDT.*BTCUSDT"):
+        parse_commission_rate({"symbol": "ETHUSDT",
+                               "makerCommissionRate": "0.0002",
+                               "takerCommissionRate": "0.0005"},
+                              symbol="btcusdt")
+
+
+def test_parse_commission_rate_matches_symbols_case_insensitively():
+    rate = parse_commission_rate({"symbol": "btcusdt",
+                                  "makerCommissionRate": "0.0002",
+                                  "takerCommissionRate": "0.0005"},
+                                 symbol="BTCUSDT")
+    assert rate.symbol == "BTCUSDT"
+
+
 # --------------------------------------------------------------------------- #
 # Order semantics a real-money session depends on
 # --------------------------------------------------------------------------- #
