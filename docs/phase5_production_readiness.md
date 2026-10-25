@@ -599,7 +599,8 @@ Other failure shapes:
 | Engine p99 is host-sensitive | Two runs on the same machine, differing only in background load, move p99 from `1.4 µs` to `11.3 µs` and p999 from `8 µs` to `724 µs` (§3.3). The 5.0 µs budget is only meaningful with the cores and the load characterised |
 | Chaos runs on a fake monotonic clock | Deterministic and fast, but it does not exercise the socket, the TLS stack or the kernel's retransmit timers |
 | The dead-man's switch is driven directly | It proves monitor + kill-switch semantics, not the full live feed loop that must eventually beat into it |
-| No production exchange gateway, persistence or reconciliation exists (the testnet pilot is connectivity/validation only) | The gate cannot and does not certify them |
+| The live layer (`python_analytics/live`, §11) gives a durable order store, reconciliation and a kill path, but it cannot manufacture an edge | It bounds the damage of being wrong; it does not make the strategy right. That is why arming real money is gated on a fresh alpha `GO` rather than on the build verdict |
+| No markout, funding accounting or alerting yet | Adverse selection on the quote is unmeasured, so a live session that *looks* flat may still be leaking (see §11.3) |
 | `pip-audit` is a separate CI step | Its result is not part of the GO/NO-GO verdict; read the workflow log (one dev-only advisory is currently ignored) |
 | A report is a point-in-time snapshot | Re-run per release **and per host**; a `GO` from last month on another machine is not evidence about this one |
 
@@ -650,3 +651,63 @@ git commit -m "readiness: GO on <host> $(date -u +%Y-%m-%dT%H:%MZ)"
 If the fit changes, regenerate the lock with `--write-lock` and re-review the
 study — never hand-edit `config/walk_forward_lock.json`. A study that no longer
 matches its lock is not evidence, and the gate will say so.
+
+---
+
+## 11. Live execution layer
+
+`python_analytics/live` turns "the strategy wants a quote" into an order the
+process and the venue agree exists. It is the part that decides whether a bad
+day is a bad day or an unbounded loss.
+
+### 11.1 What it guarantees
+
+| Guarantee | Mechanism |
+| --- | --- |
+| An intent is durable before the venue sees it | `OrderStore.record_intent` commits `INTENT` + `client_order_id` first; a crash mid-submit leaves a row, not a surprise |
+| A timeout is never guessed | After `BinanceTransportError` the order is queried by `clientOrderId`; found → `SUBMITTED`, `-2013` → `LOST`, anything else → `UNKNOWN` |
+| Terminal states are terminal | `FILLED`, `CANCELLED`, `REJECTED`, `LOST` refuse further transitions (`LiveStoreError`) |
+| Orders this process did not place are adopted, not ignored | `reconcile()` records them as `ADOPTED` — passively; it never cancels a manual order |
+| Orders that vanished are resolved | `reconcile()` queries each stale id and writes the venue's answer |
+| The kill path tells the truth | `panic()` cancels all, flattens only if a position exists, downgrades working orders to `UNKNOWN` when the cancel fails, returns the list of failures |
+| Real money needs evidence, not a flag | `require_alpha_go()` reads `reports/production_readiness_report.json`: every `alpha.*` check must pass, `evidence.alpha.net_pnl > 0`, the timestamp must be within `--max-report-age-hours` |
+
+### 11.2 Running it
+
+```bash
+# testnet: reconcile only (safe, no orders)
+export BINANCE_ENV=testnet BINANCE_API_KEY=... BINANCE_API_SECRET=...
+python3 scripts/run_live_trader.py --store state/live_orders.sqlite3
+
+# testnet: one post-only quote, 5 bps from the mid
+python3 scripts/run_live_trader.py --submit --side BUY --quantity 0.002 --offset-bps 5
+
+# kill switch: cancel the symbol and flatten (works on any environment)
+python3 scripts/run_live_trader.py --cancel-all
+
+# production: refused unless --live AND the alpha gate is green
+python3 scripts/run_live_trader.py --live
+```
+
+Exit codes: `0` done/clean, `1` drift or an unresolved order, `2` configuration
+or environment refusal, `3` the alpha gate refused to arm, `130` interrupted
+(orders already cancelled and flattened).
+
+### 11.3 What is still missing before this is a business
+
+1. **An edge.** The committed study is `NO-GO`: `net_pnl = -16.47 USDT` over 229
+   fills with `2.0 bps` maker / `5.0 bps` taker charged. Nothing in this layer
+   changes that sign. Real capture + a re-run study is the work.
+2. **Markout.** Profit and loss per fill measured 1s / 10s / 60s *after* the
+   fill, signed by side. Without it a flat-looking session can be bleeding
+   through adverse selection.
+3. **Funding.** Perpetual funding is charged every 8h and is currently not in
+   the ledger; a carry-heavy session will drift from the paper model.
+4. **A loop.** `run_live_trader.py` places at most one quote. Re-quoting,
+   inventory limits and a per-session loss cap belong in a supervisor that
+   calls `LiveExecutor`, not in this script.
+5. **Alerting.** `panic()` returns failures; nothing pages a human yet.
+
+Until 1–3 exist, a production run is `--cancel-all` plus a manual smoke test
+under `--override-alpha`, and the override sentence is the audit record that
+says so.

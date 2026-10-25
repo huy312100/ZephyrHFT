@@ -53,6 +53,12 @@ used at the orchestration/analytics boundary.
   (HMAC-SHA256, stdlib only), `exchangeInfo` filter validation, balance check,
   L2 depth sample and a dry-run or place → query → cancel order lifecycle against
   the testnet. Refuses to run against production.
+- **Live execution layer** (`python_analytics/live/` + `scripts/run_live_trader.py`):
+  a SQLite book of record written *before* each request, `clientOrderId`-keyed
+  resolution of ambiguous submits, start-up reconciliation that adopts unseen
+  venue orders and resolves vanished ones, one kill path that cancels and
+  flattens, and an arming gate that refuses real money unless the readiness
+  report shows a fresh positive alpha net.
 
 ## Phase status
 
@@ -93,6 +99,7 @@ python3 scripts/generate_readiness_report.py
 ├── scripts/
 │   ├── run_paper_trading.py  # 60s live/mock paper-trading dashboard
 │   ├── run_testnet_pilot.py  # Binance Futures testnet micro-pilot (signed REST)
+│   ├── run_live_trader.py    # live reconcile / one post-only quote / kill switch
 │   ├── ingest_l2.py          # real-time L2 capture -> gzip NDJSON roll files
 │   ├── run_walk_forward.py   # Phase 4 OOS study + parameter lock
 │   ├── generate_readiness_report.py  # Phase 5 GO/NO-GO gate
@@ -1065,6 +1072,40 @@ Nothing here changes the pilot: it still refuses `BINANCE_ENV=production`, and
 `_request` still has no retry loop, so a failed submit can never be duplicated
 silently.
 
+### Live execution harness
+
+`scripts/run_live_trader.py` is the runtime that turns those primitives into a
+session you can restart: `python_analytics/live` keeps a SQLite book of record,
+resolves ambiguous submits by `clientOrderId`, reconciles at start-up and owns
+the kill path.
+
+```bash
+# Reconcile only: adopt what the venue holds, resolve what vanished
+python3 scripts/run_live_trader.py --store state/live_orders.sqlite3
+
+# One post-only quote, 5 bps from the book mid
+python3 scripts/run_live_trader.py --submit --side BUY --quantity 0.002
+
+# Kill switch: cancel the symbol and flatten the position
+python3 scripts/run_live_trader.py --cancel-all
+```
+
+| Property | How it is enforced |
+| --- | --- |
+| No invisible orders | The intent row is committed before `POST /fapi/v1/order`; `clientOrderId` is the dedupe key |
+| No guessing after a timeout | `BinanceTransportError` → query by client id → `SUBMITTED` / `LOST` (`-2013`) / `UNKNOWN` |
+| No resurrected orders | `FILLED`/`CANCELLED`/`REJECTED`/`EXPIRED`/`LOST` are terminal in the store |
+| No blind cancels | Reconciliation adopts foreign orders instead of killing them |
+| No silent unwind failure | `panic()` returns the failures it hit; the script logs them and exits non-zero |
+| No real money without evidence | Production needs `--live` **and** a fresh positive alpha in `reports/production_readiness_report.json` |
+
+The last row is the one that matters today: the committed study is `NO-GO`
+(`net_pnl = -16.47 USDT` after fees), so `--live` exits `3` until either the
+study turns green or someone writes `--override-alpha "<reason>"`, which is
+recorded in the order store's audit trail. The remaining gaps — markout,
+funding, a re-quoting loop, alerting — are listed in
+[`docs/phase5_production_readiness.md` §11.3](docs/phase5_production_readiness.md#113-what-is-still-missing-before-this-is-a-business).
+
 ### Continuous integration
 
 `.github/workflows/testnet-pilot.yml` runs two jobs:
@@ -1187,11 +1228,13 @@ mirrored to the job summary.
 - Feed sequence gaps are not repaired and there is no snapshot bootstrap:
   `first_update_id`/`final_update_id` are parsed for diagnostics, but the
   operator must reconnect or resynchronise after a gap.
-- There is no persistence, account reconciliation or production exchange order
-  gateway. `python_analytics/exchange/binance_futures.py` adds a signed REST
-  client and `scripts/run_testnet_pilot.py` exercises it against the Binance
-  Futures **testnet** only; no order state is persisted or reconciled across
-  restarts.
+- **C++** ships no exchange gateway; the live path is Python. There is no
+  markout, funding ledger or alerting yet, and `scripts/run_live_trader.py`
+  places at most one quote per run. Order state *is* now persisted and
+  reconciled across restarts (`python_analytics/live`,
+  `state/live_orders.sqlite3`), and arming real money is gated on the readiness
+  report's alpha net rather than on a flag — see
+  `docs/phase5_production_readiness.md` §11.
 - L2 capture is **raw**: `ingest_l2.py` archives exchange payloads but does not
   normalise them into `L2Book` updates or repair sequence gaps, there is no
   snapshot bootstrap, and one process handles one symbol/stream.
