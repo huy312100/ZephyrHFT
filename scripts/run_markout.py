@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 import time
 from pathlib import Path
@@ -82,6 +83,8 @@ def parse_horizons(text: str) -> Tuple[float, ...]:
         except ValueError as exc:
             raise ValueError(
                 f"bad horizon {chunk!r}; expected seconds like 1 or 0.5") from exc
+        if not math.isfinite(value):
+            raise ValueError(f"horizon {chunk!r} is not a finite number")
         if value < 0.0:
             raise ValueError(f"horizon {value} is negative")
         horizons.append(value)
@@ -187,20 +190,35 @@ def markouts_from_replay(args: argparse.Namespace, parameters: LockedParameters,
 
 def markouts_from_files(args: argparse.Namespace,
                         config: MarkoutConfig) -> Tuple[List[Any], List[Dict[str, Any]]]:
-    """Marks venue-timestamped fills against the capture on the venue clock."""
-    fills = load_fills(args.fills, clock=args.clock)
+    """Marks venue-timestamped fills against the capture on the venue clock.
+
+    A fill export may cover several markets; only the fills whose symbol matches
+    the timeline's are marked, and the number dropped is reported. Marking a BTC
+    fill against an ETH mid would produce a confident, meaningless number.
+    """
     timeline = build_timeline_from_files(resolve_sources(args.source),
                                          symbol=args.symbol)
+    loaded = load_fills(args.fills, clock=args.clock)
+    market = (timeline.symbol or "").upper()
+    fills = loaded
+    dropped = 0
+    if market:
+        fills = [fill for fill in loaded
+                 if fill.symbol is None or fill.symbol == market]
+        dropped = len(loaded) - len(fills)
     rows = resolve_markouts(fills, timeline, config)
     info = {
         "label": str(args.fills),
         "events": 0,
+        "timeline_symbol": timeline.symbol,
         "timeline_samples": len(timeline),
         "timeline_span_s": timeline.span_s,
         "timeline_max_gap_s": timeline.max_gap_s,
         "timeline_first_ts_ns": timeline.first_ts_ns,
         "timeline_last_ts_ns": timeline.last_ts_ns,
         "timeline_ignored_frames": timeline.ignored,
+        "fills_loaded": len(loaded),
+        "fills_dropped_other_symbol": dropped,
         "fills": len(fills),
         "marked": sum(1 for row in rows if row.matched),
         "unmatched": sum(1 for row in rows if not row.matched),
@@ -276,6 +294,11 @@ def run(args: argparse.Namespace) -> int:
     summary = summarize_markouts(rows, config)
     verdict = markout_verdict(summary, config)
     fills = summary["fills"]
+    if args.fills:
+        dropped = int(windows[0].get("fills_dropped_other_symbol", 0) or 0)
+        if dropped:
+            print(f"  dropped       : {dropped} fill(s) for a market other than "
+                  f"{windows[0].get('timeline_symbol')}")
     print(f"  fills         : {fills['total']} total, {fills['maker']} maker, "
           f"{fills['taker']} taker, {fills['unmatched']} without a mid")
     print(f"  entry         : maker spread {summary['maker']['entry_spread_bps']:.3f} bps, "

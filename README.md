@@ -1157,10 +1157,15 @@ it reaches a report.
 
 Verdict `ADVERSE_SELECTION`: the average resting quote fills 0.43 bps *through*
 the mid (the trade prints better than the quote), so it never captures the
-0.33 bps half-spread it is trying to earn, and the mid drifts a further 0.38 bps
-against it over the next minute. The 1 s markout totals −2.92 USDT against the
-study's own gross PnL of −2.74 USDT, which is the cross-check that the
-instrument measures the same thing the ledger does.
+0.33 bps half-spread it is trying to earn. On the 55 fills that have a 60 s
+sample, the mean drifts from −0.434 to −0.810 bps — a −0.38 bps move on the same
+fills, not a comparison of two different populations.
+
+The 1 s markout totals −2.92 USDT against the study's gross PnL of −2.74 USDT.
+That is indicative rather than a reconciliation (three fills are truncated at
+1 s, and a horizon values each fill at a later mid), but two independent
+measurements of the same loss landing 0.2 USDT apart is a reasonable sanity
+check that the instrument is measuring the loss the ledger booked.
 
 That is a strategy bug, not a plumbing bug: the paper engine fills a quote that
 was posted inside the touch, while live `post_only` (`timeInForce=GTX`) would

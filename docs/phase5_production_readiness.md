@@ -745,11 +745,14 @@ Three design decisions matter more than the statistics:
 * **A missing sample is truncated, not interpolated.** A horizon with no sample
   inside `--tolerance-ms` is counted and excluded. Carrying the last mid forward
   across a feed outage is how a hole becomes a fake edge.
-* **Units are recovered explicitly.** `Bbo.exchange_ts` carries the venue's raw
-  `E` in **milliseconds** despite the C++ type being named `Nanos`, while a
-  timestamp-less archive advances a synthetic nanosecond clock;
-  `engine_ts_nanos()` normalises both. `to_nanos()` never routes a nanosecond
-  value through a float, because `1.7e18` exceeds float64's exact integer range.
+* **Units are recovered from the frame, not from the magnitude.** Two clocks
+  reach the hook: `Bbo.exchange_ts` carries the venue's raw `E` in
+  **milliseconds** despite the C++ type being named `Nanos`, while an archive
+  without timestamps advances a synthetic nanosecond counter. The replayer
+  chooses by asking whether `exchange_ts` is non-zero, because a magnitude rule
+  would flip units mid-replay (the synthetic counter passes the millisecond
+  range after 1000 frames). `to_nanos()` never routes a nanosecond value through
+  a float, because `1.7e18` is beyond float64's exact integer range.
 
 #### What the committed study shows
 
@@ -771,10 +774,13 @@ Verdict: **`ADVERSE_SELECTION`**. Two readings, both uncomfortable:
   the strategy posted inside the spread is filled only by the move that runs it
   over. This is also a fidelity gap: live `post_only` (`timeInForce=GTX`) would
   have rejected such a quote instead of filling it.
-* **It keeps getting worse.** The mean drifts a further `-0.38 bps` between 0 s
-  and 60 s, and the `1 s` markout totals `-2.92 USDT` against the study's own
-  gross PnL of `-2.74 USDT` — the instrument reproduces the ledger, which is the
-  cross-check that it measures the same thing.
+* **It keeps getting worse on the same fills.** Over the 55 fills that have a
+  60 s sample at both ends, the mean moves from `-0.434 bps` to `-0.810 bps`, a
+  `-0.38 bps` drift. Separately, the `1 s` markout totals `-2.92 USDT` against
+  the study's gross PnL of `-2.74 USDT`; that comparison is indicative only —
+  three fills are truncated at 1 s and a horizon values each fill at a later
+  mid, so it is not a reconciliation — but two independent measurements of the
+  same loss landing 0.2 USDT apart is a useful sanity check on the instrument.
 
 Neither reading can be fixed by tuning costs. The next study has to post a quote
 that actually rests behind the touch (and model post-only rejection), or find an

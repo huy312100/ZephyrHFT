@@ -132,33 +132,6 @@ def to_nanos(value: Any) -> int:
     return exact if exact >= _NANOS_THRESHOLD else exact * NANOS_PER_MS
 
 
-#: Below this, a stamp is a synthetic frame counter rather than a venue time.
-#: The paper engine's synthetic clock starts at zero and advances 100 ms per
-#: frame, so it stays far below any real millisecond epoch.
-_VENUE_MS_FLOOR = 1e11
-
-
-def engine_ts_nanos(value: Any) -> int:
-    """Normalises the engine's event stamp — which is not always nanoseconds.
-
-    ``Bbo.exchange_ts`` carries the venue's raw ``E`` field, i.e. **milliseconds**
-    on a timestamped archive, even though the C++ type is called ``Nanos``. A
-    timestamp-less archive instead advances :meth:`BulkReplayer._next_synth_ns`,
-    which is genuinely nanoseconds from zero. Both reach the strategy hook as
-    ``now_ns``, so the unit is recovered from magnitude here — once, explicitly,
-    and documented — rather than assumed.
-    """
-    stamp = float(value)
-    if not math.isfinite(stamp) or stamp < 0:
-        raise ValueError(f"unusable engine timestamp {value!r}")
-    exact = _integer(value)
-    if exact >= _NANOS_THRESHOLD:
-        return exact
-    if exact >= _VENUE_MS_FLOOR:
-        return exact * NANOS_PER_MS
-    return exact
-
-
 @dataclass(frozen=True)
 class MarkoutConfig:
     """What to measure, how strictly, and what counts as an edge.
@@ -221,13 +194,19 @@ class MarkoutConfig:
 
 @dataclass(frozen=True)
 class MarkoutFill:
-    """One fill, stamped on the same clock as the timeline it is marked against."""
+    """One fill, stamped on the same clock as the timeline it is marked against.
+
+    ``symbol`` is optional because a replay fill has no venue symbol to report,
+    but when both the fill and the timeline name a market they must agree: a
+    BTC fill marked against an ETH mid is a number nobody can defend.
+    """
 
     ts_ns: int
     side: str
     price: float
     quantity: float
     is_maker: bool = True
+    symbol: Optional[str] = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "side", side_name(self.side))
@@ -241,6 +220,8 @@ class MarkoutFill:
         object.__setattr__(self, "quantity", quantity)
         object.__setattr__(self, "ts_ns", int(self.ts_ns))
         object.__setattr__(self, "is_maker", bool(self.is_maker))
+        object.__setattr__(self, "symbol",
+                           None if self.symbol in (None, "") else str(self.symbol).upper())
 
     @property
     def sign(self) -> float:
@@ -426,7 +407,8 @@ def _message_ts_ns(message: Mapping[str, Any]) -> Optional[int]:
             continue
         try:
             if key.endswith("_ns"):
-                return int(float(raw))
+                exact = _integer(raw)
+                return None if exact < 0 else exact
             return to_nanos(raw)
         except (TypeError, ValueError):
             return None
@@ -517,8 +499,12 @@ def build_timeline(lines: Iterable[str], *,
                 timeline.ignored += 1
             continue
 
-        if kind == "bookTicker" or (isinstance(message.get("b"), (str, float, int))
+        if kind == "bookTicker" or (not kind
+                                    and isinstance(message.get("b"), (str, float, int))
                                     and isinstance(message.get("a"), (str, float, int))):
+            # The type-based branch must not run for a known kind: a spot `trade`
+            # frame carries buyer/seller *order ids* in `b`/`a`, and reading those
+            # as a bid/ask would fabricate a mid.
             try:
                 bid = float(message["b"])
                 ask = float(message["a"])
@@ -626,6 +612,7 @@ def parse_fill_payload(payload: Any, *, clock: str = "ms") -> List[MarkoutFill]:
                     price=float(row["price"]),
                     quantity=float(row["quantity"]),
                     is_maker=_as_bool(row.get("is_maker"), default=True),
+                    symbol=row.get("symbol") or row.get("s"),
                 )
             )
         except (KeyError, TypeError, ValueError) as exc:
@@ -695,7 +682,12 @@ def resolve_markouts(fills: Sequence[MarkoutFill], timeline: MarkoutTimeline,
     labels = [horizon_label(horizon) for horizon in config.horizons_s]
     rows: List[MarkoutRow] = []
 
+    timeline_symbol = (timeline.symbol or "").upper()
     for fill in fills:
+        if timeline_symbol and fill.symbol and fill.symbol != timeline_symbol:
+            raise ValueError(
+                f"fill at {fill.ts_ns} ns is {fill.symbol} but the timeline is "
+                f"{timeline_symbol}; mark each market against its own capture")
         entry = timeline.at_or_before(fill.ts_ns)
         entry_gap = None if entry is None else fill.ts_ns - entry[0]
         if entry is None or entry_gap > tolerance_ns:
@@ -822,6 +814,7 @@ def _block(rows: Sequence[MarkoutRow], config: MarkoutConfig) -> Dict[str, Any]:
         "notional": sum(row.notional for row in rows),
         "entry_spread_bps": _mean(spreads),
         "entry_offset_bps": _mean(offsets),
+        "decay": _decay(rows, config),
         "horizons": {
             horizon_label(horizon): _horizon_stats(rows, horizon_label(horizon))
             for horizon in config.horizons_s
@@ -873,21 +866,39 @@ def summarize_markouts(rows: Sequence[MarkoutRow],
 _SIGNIFICANT_T = 1.96
 
 
-def _decay(block: Mapping[str, Any],
-           config: MarkoutConfig) -> Optional[Tuple[float, str, str]]:
-    """Markout drift from the shortest to the longest horizon with samples."""
-    horizons = block.get("horizons") or {}
-    populated = [
-        (horizon_label(horizon), horizons.get(horizon_label(horizon), {}))
-        for horizon in config.horizons_s
-    ]
-    populated = [(label, stats) for label, stats in populated
-                 if int(stats.get("samples", 0) or 0) > 0]
-    if len(populated) < 2:
+def _decay(rows: Sequence[MarkoutRow],
+           config: MarkoutConfig) -> Optional[Dict[str, Any]]:
+    """Markout drift between the first and last horizon, on the *same* fills.
+
+    Comparing the 0 s mean (every fill) with the 60 s mean (only the fills old
+    enough to have one) compares two populations, and the difference between them
+    is not a drift. Only fills with a sample at both ends are used here, and that
+    count is reported next to the number.
+    """
+    if len(config.horizons_s) < 2:
         return None
-    first_label, first = populated[0]
-    last_label, last = populated[-1]
-    return (float(last["mean_bps"]) - float(first["mean_bps"]), first_label, last_label)
+    first_label = horizon_label(config.horizons_s[0])
+    last_label = horizon_label(config.horizons_s[-1])
+    if first_label == last_label:
+        return None
+    pairs = [
+        (row.markouts_bps[first_label], row.markouts_bps[last_label])
+        for row in rows
+        if row.markouts_bps.get(first_label) is not None
+        and row.markouts_bps.get(last_label) is not None
+    ]
+    if not pairs:
+        return None
+    start = _mean([pair[0] for pair in pairs])
+    end = _mean([pair[1] for pair in pairs])
+    return {
+        "bps": end - start,
+        "from": first_label,
+        "to": last_label,
+        "from_bps": start,
+        "to_bps": end,
+        "samples": len(pairs),
+    }
 
 
 def markout_verdict(summary: Mapping[str, Any],
@@ -943,12 +954,13 @@ def markout_verdict(summary: Mapping[str, Any],
             f"markout of {mean:+.2f} bps leaves {net:+.2f} bps after the "
             f"{fee:.2f} bps fee at t={t_stat:+.2f}")
 
-    drift = _decay(block, config)
-    if drift is not None:
-        value, first_label, last_label = drift
+    drift = block.get("decay")
+    if drift:
         reasons.append(
-            f"mean markout moves {value:+.2f} bps between {first_label} and "
-            f"{last_label} (a negative drift is adverse selection, not decay)")
+            f"mean markout moves {float(drift['bps']):+.2f} bps between "
+            f"{drift['from']} and {drift['to']} over the same "
+            f"{int(drift['samples'])} fills (a negative drift is adverse "
+            f"selection, not decay)")
     dispersion = float(stats.get("stdev_bps", 0.0) or 0.0)
     if samples and dispersion < 0.01:
         reasons.append(
@@ -968,7 +980,8 @@ def markout_verdict(summary: Mapping[str, Any],
         "t_stat": t_stat,
         "win_rate_pct": float(stats.get("win_rate_pct", 0.0) or 0.0),
         "usdt_per_fill": float(stats.get("usdt_per_fill", 0.0) or 0.0),
-        "decay_bps": None if drift is None else drift[0],
+        "decay_bps": None if not drift else float(drift["bps"]),
+        "decay_samples": None if not drift else int(drift["samples"]),
         "reasons": reasons,
     }
 
@@ -1118,8 +1131,15 @@ class MarkoutReplayer(BulkReplayer):
 
     def on_frame(self, event_ns: int, new_fills: Sequence[Any]) -> None:
         """Samples the mid and records any fill discovered in this frame."""
-        frame_ts_ns = engine_ts_nanos(event_ns)
         bbo = self.engine.bbo()
+        exchange_ts = int(bbo.exchange_ts)
+        # Two clocks reach this hook. Bbo.exchange_ts carries the venue's raw
+        # `E` in milliseconds; _next_synth_ns counts nanoseconds from zero for an
+        # archive without timestamps. Which one applies is decided by the frame,
+        # not by the magnitude of the value: the synthetic counter passes 1e11
+        # (100 s) after 1000 frames and 1.7e12 after ~17,000, so a magnitude rule
+        # would silently switch units mid-replay and truncate every horizon.
+        frame_ts_ns = exchange_ts * NANOS_PER_MS if exchange_ts > 0 else int(event_ns)
         bid = float(bbo.bid_price)
         ask = float(bbo.ask_price)
         if bid > 0.0 and ask >= bid:

@@ -7,6 +7,7 @@ engine's own clock.
 """
 from __future__ import annotations
 
+import importlib.util
 import json
 import math
 from pathlib import Path
@@ -21,7 +22,6 @@ from python_analytics.backtesting.markouts import (
     TopOfBook,
     build_timeline,
     build_timeline_from_files,
-    engine_ts_nanos,
     horizon_label,
     load_fills,
     markout_verdict,
@@ -36,6 +36,8 @@ from python_analytics.backtesting.markouts import (
 from python_analytics.backtesting.replay import BulkReplayer
 from python_analytics.backtesting.walk_forward import LockedParameters
 from python_analytics.simulator.paper_engine import synthetic_depth_messages
+
+SCRIPT = Path(__file__).resolve().parents[2] / "scripts" / "run_markout.py"
 
 SECOND = 1_000_000_000
 BASE_MS = 1_700_000_000_000
@@ -73,20 +75,11 @@ def _flat_rows(values, *, side: str = "BUY", price: float = 100.0,
 # --------------------------------------------------------------------------- #
 # Clocks
 # --------------------------------------------------------------------------- #
-def test_engine_ts_nanos_recovers_the_units_the_engine_actually_uses() -> None:
-    # Bbo.exchange_ts is the venue's raw E: milliseconds, despite the Nanos type.
-    assert engine_ts_nanos(BASE_MS) == BASE_NS
-    # An archive without timestamps uses a synthetic clock that is already ns.
-    assert engine_ts_nanos(800_000_000) == 800_000_000
-    # Already-nanosecond venue stamps pass through untouched.
-    assert engine_ts_nanos(BASE_NS) == BASE_NS
-    with pytest.raises(ValueError):
-        engine_ts_nanos(-1)
-
-
 def test_to_nanos_distinguishes_milliseconds_from_nanoseconds() -> None:
     assert to_nanos(BASE_MS) == BASE_NS
-    assert to_nanos(str(BASE_NS)) == BASE_NS
+    # Exact: 1.7e18 is outside float64's integer range, so this must not round.
+    assert to_nanos(BASE_NS + 10) == BASE_NS + 10
+    assert to_nanos(str(BASE_NS + 10)) == BASE_NS + 10
     assert horizon_label(1.0) == "1s"
     assert horizon_label(0.0) == "0s"
     with pytest.raises(ValueError):
@@ -204,6 +197,29 @@ def test_build_timeline_never_blends_two_symbols() -> None:
     assert len(timeline) == 1
     assert timeline.ignored == 1
     assert timeline.symbol == "BTCUSDT"
+
+
+def test_a_typed_trade_frame_is_not_mistaken_for_a_quote() -> None:
+    # A spot trade carries buyer/seller *order ids* in `b`/`a`; reading those as
+    # a bid/ask would fabricate a mid far away from the price.
+    lines = [
+        json.dumps({"e": "trade", "E": BASE_MS, "s": "BTCUSDT", "p": "100.0",
+                    "q": "1", "b": 123456789, "a": 987654321}),
+    ]
+    timeline = build_timeline(lines)
+
+    assert len(timeline) == 0
+    assert timeline.malformed == 0
+    assert timeline.ignored == 1
+
+
+def test_explicit_nanosecond_timestamps_survive_build_timeline_exactly() -> None:
+    lines = [json.dumps({"e": "depthUpdate", "ts_ns": BASE_NS + 7, "s": "BTCUSDT",
+                         "b": [["100.0", "1"]], "a": [["101.0", "1"]]})]
+
+    timeline = build_timeline(lines)
+
+    assert timeline.first_ts_ns == BASE_NS + 7
 
 
 def test_build_timeline_from_files_merges_captures_and_checks_the_market(
@@ -438,7 +454,43 @@ def test_verdict_reports_the_decay_between_horizons() -> None:
     verdict = markout_verdict(summarize_markouts(rows, config), config)
 
     assert verdict["decay_bps"] == pytest.approx(-10.0)
+    assert verdict["decay_samples"] == 3
     assert any("moves" in reason for reason in verdict["reasons"])
+
+
+def test_decay_compares_the_same_fills_not_two_populations() -> None:
+    config = MarkoutConfig(horizons_s=(0.0, 1.0), min_samples=1, maker_bps=0.0)
+    # One fill has a 1 s sample (+5 bps -> -5 bps); the other is truncated there
+    # and sits exactly at the mid. Averaging each horizon separately would give
+    # ((5 + 0) / 2) - (-5) = -7.5 bps, which no fill experienced.
+    rows = resolve_markouts([_fill(0.0, "BUY", 100.0)],
+                            _timeline([(0.0, 100.05), (1.0, 99.95)]), config)
+    rows.extend(resolve_markouts([_fill(0.0, "BUY", 100.0)],
+                                 _timeline([(0.0, 100.0)]), config))
+    summary = summarize_markouts(rows, config)
+
+    assert summary["maker"]["horizons"]["1s"]["samples"] == 1
+    assert summary["maker"]["decay"]["samples"] == 1
+    assert summary["maker"]["decay"]["bps"] == pytest.approx(-10.0)
+    verdict = markout_verdict(summary, config)
+    assert verdict["decay_bps"] == pytest.approx(-10.0)
+    assert verdict["decay_samples"] == 1
+
+
+def test_a_fill_from_another_market_is_refused() -> None:
+    timeline = _timeline([(0.0, 100.0)], symbol="BTCUSDT")
+    fill = MarkoutFill(ts_ns=BASE_NS, side="BUY", price=100.0, quantity=1.0,
+                       symbol="ETHUSDT")
+
+    with pytest.raises(ValueError, match="ETHUSDT"):
+        resolve_markouts([fill], timeline, MarkoutConfig())
+
+
+def test_parse_fill_payload_keeps_the_venue_symbol() -> None:
+    fills = parse_fill_payload([{"symbol": "btcusdt", "timestamp": BASE_MS,
+                                 "side": "buy", "price": 1.0, "quantity": 1.0}])
+
+    assert fills[0].symbol == "BTCUSDT"
 
 
 def test_verdict_flags_a_degenerate_sample_instead_of_trusting_the_t_stat() -> None:
@@ -559,6 +611,32 @@ def test_markout_replayer_prices_the_last_fills_as_truncated() -> None:
     assert summary["fills"]["truncated"]["0s"] == 0
 
 
+def test_markout_replayer_handles_a_synthetic_clock_past_1000_frames() -> None:
+    # A timestamp-less archive advances a nanosecond counter that passes 1e11
+    # after 1000 frames. Any magnitude-based unit guess would flip to
+    # "milliseconds" there and rescale the rest of the replay by 1e6.
+    generator = synthetic_depth_messages(mid=100.0, tick=0.5, seed=3)
+    lines = []
+    for _ in range(1200):
+        message = json.loads(next(generator))
+        message.pop("E", None)
+        lines.append(json.dumps(message))
+
+    replayer = _markout_replayer()
+    replayer.replay_lines(lines, _parameters().build_strategy())
+
+    diagnostics = replayer.diagnostics()
+    rows = replayer.markout_rows()
+    measured = [row for row in rows if row.markouts_bps["1s"] is not None]
+
+    assert diagnostics["timeline_samples"] == 1200
+    assert diagnostics["timeline_span_s"] == pytest.approx(119.9)
+    assert rows, "the fixture must fill something"
+    assert measured, "the synthetic clock was rescaled mid-replay"
+    stamps = [row.fill.ts_ns for row in rows]
+    assert stamps == sorted(stamps)
+
+
 def test_markout_replayer_reset_forgets_the_previous_window() -> None:
     replayer = _markout_replayer()
     replayer.replay_lines(_synthetic_lines(), _parameters().build_strategy())
@@ -623,3 +701,30 @@ def test_config_output_is_json_safe() -> None:
     json.dumps(payload)
     assert payload["horizons_s"] == [0.0, 1.0]
     assert payload["primary_horizon_s"] == 1.0
+
+
+# --------------------------------------------------------------------------- #
+# CLI argument handling
+# --------------------------------------------------------------------------- #
+def _load_cli():
+    spec = importlib.util.spec_from_file_location("run_markout_cli", SCRIPT)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_cli_horizons_are_parsed_and_bad_values_are_usage_errors() -> None:
+    cli = _load_cli()
+
+    assert cli.parse_horizons("0, 1,60") == (0.0, 1.0, 60.0)
+    for bad in ("inf", "nan", "-1", "x", ""):
+        with pytest.raises(ValueError):
+            cli.parse_horizons(bad)
+
+
+def test_cli_rejects_horizons_before_any_replay_runs() -> None:
+    cli = _load_cli()
+
+    assert cli.main(["--horizons", "inf", "--no-report"]) == cli.EXIT_USAGE
+    assert cli.main(["--horizons", "-1", "--no-report"]) == cli.EXIT_USAGE
