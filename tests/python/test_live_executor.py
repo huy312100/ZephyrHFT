@@ -218,6 +218,38 @@ def test_events_are_returned_newest_first(store: OrderStore) -> None:
     assert kinds == ["second", "first"]
 
 
+def test_a_status_change_can_carry_its_audit_event(store: OrderStore) -> None:
+    store.record_intent(
+        client_order_id="c", symbol="BTCUSDT", side="BUY", price="1", quantity="1"
+    )
+
+    store.mark_status(
+        "c",
+        "UNKNOWN",
+        note="venue said nothing",
+        event_kind="ambiguous_submit",
+        event_detail="c: -1006",
+    )
+
+    events = store.events()
+    assert [event["kind"] for event in events] == ["ambiguous_submit"]
+    assert events[0]["detail"] == "c: -1006"
+
+
+def test_a_refused_status_change_writes_no_event(store: OrderStore) -> None:
+    store.record_intent(
+        client_order_id="dead", symbol="BTCUSDT", side="BUY", price="1", quantity="1"
+    )
+    store.mark_status("dead", "FILLED")
+
+    with pytest.raises(LiveStoreError):
+        store.mark_status("dead", "SUBMITTED", event_kind="order_resolved")
+
+    # The write was refused, so its event must be rolled back with it: an audit
+    # trail that records changes that never happened is worse than none.
+    assert store.events() == []
+
+
 # --------------------------------------------------------------------------- #
 # Submit: the ambiguous-failure paths
 # --------------------------------------------------------------------------- #
@@ -311,11 +343,14 @@ def test_server_error_submit_is_resolved_not_rejected(store: OrderStore) -> None
     assert "order_rejected" not in kinds
 
 
-def test_backend_timeout_code_is_ambiguous_not_rejected(store: OrderStore) -> None:
+@pytest.mark.parametrize("code", [-1006, -1007])
+def test_unknown_execution_status_codes_are_resolved_not_rejected(
+    store: OrderStore, code: int
+) -> None:
+    # -1006 ("unexpected response from the message bus") and -1007 (backend
+    # timeout) both mean "execution status unknown", so neither is a rejection.
     client = FakeClient()
-    client.new_order_error = BinanceAPIError(
-        "timeout waiting for response from backend", code=-1007
-    )
+    client.new_order_error = BinanceAPIError("execution status unknown", code=code)
     client.query_result = BinanceAPIError("order does not exist", code=-2013)
     executor, _ = _executor(store, client)
 
@@ -547,6 +582,25 @@ def test_panic_does_not_flatten_a_flat_book(store: OrderStore) -> None:
     errors = executor.panic("startup check")
     assert errors == []
     assert client.flattened == 0
+
+
+def test_panic_keeps_an_order_it_could_not_resolve_unknown(
+    store: OrderStore,
+) -> None:
+    client = FakeClient()
+    executor, _ = _executor(store, client)
+    result = executor.submit_post_only(side="BUY", quantity="0.002", price="79980")
+    client.query_result = BinanceTransportError("query timed out")
+
+    errors = executor.panic("adverse event")
+
+    # The cancel returned but the venue will not say what happened. UNKNOWN
+    # keeps the row chasable; CANCELLED is terminal and would hide a resting
+    # quote from reconciliation for good.
+    assert any("resolve" in error for error in errors)
+    row = store.get(result.client_order_id)
+    assert row is not None
+    assert row["status"] == "UNKNOWN"
 
 
 def test_panic_reports_a_failed_cancel_and_keeps_orders_unknown(

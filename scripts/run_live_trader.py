@@ -71,11 +71,14 @@ DEFAULT_REPORT = "reports/production_readiness_report.json"
 DEFAULT_QUANTITY = "0.002"
 DEFAULT_OFFSET_BPS = 5.0
 
-#: Binance's post-only rejection: ``-2010`` with "Order would immediately
-#: trigger". It means GTX refused to cross, so nothing rested and nothing is
-#: owed. Any other rejection needs an operator, not a success code.
+#: Binance's post-only rejections. ``-2010`` is the generic new-order rejection
+#: that also covers spot GTX ("Order would immediately trigger"), so the text
+#: has to confirm it. ``-5022`` exists *only* for a USDⓈ-M futures post-only
+#: order that could not rest as maker, so the code alone is proof. Either way
+#: nothing rested and nothing is owed; every other rejection needs an operator.
 POST_ONLY_REJECTION_CODE = -2010
 POST_ONLY_REJECTION_TEXT = "would immediately trigger"
+POST_ONLY_MAKER_REJECTION_CODES = frozenset({-5022})
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -190,10 +193,15 @@ def _post_only_crossing_rejected(result: SubmissionResult) -> bool:
 
     GTX refusing to cross means nothing rested, so the run is clean. Every other
     rejection — filters, margin, an unknown code — leaves the operator with a
-    question and must exit non-zero.
+    question and must exit non-zero. ``-5022`` is the futures post-only code and
+    is unambiguous; ``-2010`` is generic, so its text has to agree.
     """
 
-    if result.status != "REJECTED" or result.code != POST_ONLY_REJECTION_CODE:
+    if result.status != "REJECTED":
+        return False
+    if result.code in POST_ONLY_MAKER_REJECTION_CODES:
+        return True
+    if result.code != POST_ONLY_REJECTION_CODE:
         return False
     return POST_ONLY_REJECTION_TEXT in (result.note or "").lower()
 

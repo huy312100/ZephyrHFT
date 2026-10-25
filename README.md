@@ -1139,7 +1139,7 @@ python3 scripts/run_live_trader.py --cancel-all
 | Property | How it is enforced |
 | --- | --- |
 | No invisible orders | The intent row is committed before `POST /fapi/v1/order`; `clientOrderId` is the dedupe key |
-| No guessing after a timeout | `BinanceTransportError` → query by client id → `SUBMITTED` / `LOST` (`-2013`) / `UNKNOWN` |
+| No guessing after a timeout | `BinanceTransportError`, and the `-1006`/`-1007` "execution status unknown" codes, → query by client id → `SUBMITTED` / `LOST` (`-2013`) / `UNKNOWN` |
 | No resurrected orders | `FILLED`/`CANCELLED`/`REJECTED`/`EXPIRED`/`LOST` are terminal in the store |
 | No blind cancels | Reconciliation adopts foreign orders instead of killing them |
 | No silent unwind failure | `panic()` returns the failures it hit; the script logs them and exits non-zero |

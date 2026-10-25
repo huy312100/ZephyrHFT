@@ -666,11 +666,11 @@ day is a bad day or an unbounded loss.
 | --- | --- |
 | An intent is durable before the venue sees it | `OrderStore.record_intent` commits `INTENT` + `client_order_id` first; a crash mid-submit leaves a row, not a surprise |
 | A timeout is never guessed | After `BinanceTransportError` the order is queried by `clientOrderId`; found → `SUBMITTED`, `-2013` → `LOST`, anything else → `UNKNOWN` |
-| An ambiguous submit is resolved, not rejected | HTTP 5xx and `-1007` mean "I do not know": the row is marked `UNKNOWN` and queried by `clientOrderId`; only an ordinary 4xx is recorded as `REJECTED`. A failed lookup leaves `UNKNOWN` for reconciliation to chase, never `REJECTED` |
+| An ambiguous submit is resolved, not rejected | HTTP 5xx, `-1006` and `-1007` all mean "execution status unknown": the row is marked `UNKNOWN` and queried by `clientOrderId`; only an ordinary 4xx is recorded as `REJECTED`. A failed lookup leaves `UNKNOWN` for reconciliation to chase, never `REJECTED` |
 | Terminal states are terminal | `FILLED`, `CANCELLED`, `REJECTED`, `LOST` refuse further transitions (`LiveStoreError`) |
 | Orders this process did not place are adopted, not ignored | `reconcile()` records them as `ADOPTED` — passively; it never cancels a manual order |
 | Orders that vanished are resolved | `reconcile()` queries each stale id and writes the venue's answer |
-| The kill path tells the truth | `panic()` cancels all, flattens only if a position exists, resolves each working order after a successful cancel, reports an order the venue still holds as a failure, downgrades working orders to `UNKNOWN` when the cancel fails, returns the list of failures |
+| The kill path tells the truth | `panic()` cancels all, flattens only if a position exists, resolves each working order after a successful cancel, reports an order the venue still holds as a failure, leaves an order `UNKNOWN` when the cancel or the follow-up query fails, returns the list of failures |
 | Real money needs evidence, not a flag | `require_alpha_go()` reads `reports/production_readiness_report.json`: every `alpha.*` check must pass, `evidence.alpha.net_pnl > 0`, the timestamp must be within `--max-report-age-hours` |
 
 ### 11.2 Running it
@@ -691,11 +691,12 @@ python3 scripts/run_live_trader.py --live
 ```
 
 Exit codes: `0` done/clean, `1` drift, an unresolved order or a rejected submit
-that was not a post-only cross, `2` configuration or environment refusal, `3` the
-alpha gate refused to arm, `130` interrupted. On an interrupt, cancellation and
-flattening are **attempted**, not guaranteed: a failed clock sync, cancel or
-flatten is logged on the way out, so inspect the venue before assuming the book
-is flat.
+that was not a post-only cross (`-2010` "would immediately trigger", or the
+futures `-5022` "could not be executed as maker"), `2` configuration or
+environment refusal, `3` the alpha gate refused to arm, `130` interrupted. On
+an interrupt, cancellation and flattening are **attempted**, not guaranteed: a
+failed clock sync, cancel or flatten is logged on the way out, so inspect the
+venue before assuming the book is flat.
 
 ### 11.3 What is still missing before this is a business
 

@@ -141,8 +141,16 @@ class OrderStore:
         *,
         venue_order_id: Optional[int] = None,
         note: Optional[str] = None,
+        event_kind: Optional[str] = None,
+        event_detail: Optional[str] = None,
     ) -> None:
-        """Moves an order to ``status``, refusing to resurrect a dead order."""
+        """Moves an order to ``status``, refusing to resurrect a dead order.
+
+        ``event_kind`` writes the matching audit event inside the same
+        transaction as the status change. Two separate commits could leave a
+        row that moved with no event to explain it, which is worst exactly
+        where this layer matters: the ambiguous-submit paths.
+        """
 
         normalised = str(status or "").strip().upper()
         if normalised not in KNOWN_STATUSES:
@@ -179,6 +187,11 @@ class OrderStore:
                     str(client_order_id),
                 ),
             )
+            if event_kind is not None:
+                self._conn.execute(
+                    "INSERT INTO events (at_ms, kind, detail) VALUES (?, ?, ?)",
+                    (self._now_ms(), str(event_kind), event_detail),
+                )
 
     def record_event(self, kind: str, detail: Optional[str] = None) -> None:
         with self._conn:

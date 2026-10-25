@@ -80,6 +80,19 @@ def test_only_a_confirmed_post_only_crossing_counts_as_success() -> None:
     unresolved = SubmissionResult("cid", "UNKNOWN", note="would immediately trigger")
     assert not script._post_only_crossing_rejected(unresolved)
 
+    # USDⓈ-M futures refuse a crossing GTX order with -5022, not -2010. That code
+    # exists only for a post-only order that could not rest as maker, so the
+    # code alone is proof; the same code on a non-rejection still is not.
+    futures = SubmissionResult(
+        "cid",
+        "REJECTED",
+        code=-5022,
+        note="venue rejected: the post only order will be rejected",
+    )
+    assert script._post_only_crossing_rejected(futures)
+    unresolved_futures = SubmissionResult("cid", "UNKNOWN", code=-5022)
+    assert not script._post_only_crossing_rejected(unresolved_futures)
+
 
 # --------------------------------------------------------------------------- #
 # --cancel-all: the kill path must run even when the clock cannot sync
