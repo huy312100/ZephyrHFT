@@ -288,8 +288,9 @@ class LiveExecutor:
             )
         except BinanceAPIError as exc:
             if _is_ambiguous_api_error(exc):
-                # A 5xx or -1007 means the matcher may hold the order. Marking
-                # it REJECTED would silently drop a live quote, so resolve it.
+                # A 5xx, -1006 or -1007 means the matcher may hold the order.
+                # Marking it REJECTED would silently drop a live quote, so
+                # resolve it.
                 note = f"ambiguous venue response: {exc}"
                 self._store.mark_status(
                     cid,
