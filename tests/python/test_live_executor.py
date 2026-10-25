@@ -8,6 +8,7 @@ the assertions are about *behaviour under ambiguity* rather than about HTTP.
 from __future__ import annotations
 
 import json
+import sqlite3
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -250,6 +251,36 @@ def test_a_refused_status_change_writes_no_event(store: OrderStore) -> None:
     assert store.events() == []
 
 
+def test_a_status_change_rolls_back_when_its_event_cannot_be_written(
+    store: OrderStore,
+) -> None:
+    store.record_intent(
+        client_order_id="c", symbol="BTCUSDT", side="BUY", price="1", quantity="1"
+    )
+
+    # Break the event insert from a second connection, so the guard has to be
+    # in mark_status rather than in the caller. If the status committed before
+    # the event were attempted, the row would have moved and nothing would
+    # explain it -- the exact failure the single transaction exists to prevent.
+    other = sqlite3.connect(str(store.path))
+    try:
+        other.execute(
+            "CREATE TRIGGER refuse_events BEFORE INSERT ON events "
+            "BEGIN SELECT RAISE(ABORT, 'event log is closed'); END"
+        )
+        other.commit()
+    finally:
+        other.close()
+
+    with pytest.raises(sqlite3.IntegrityError):
+        store.mark_status("c", "SUBMITTED", event_kind="order_sent")
+
+    row = store.get("c")
+    assert row is not None
+    assert row["status"] == "INTENT"
+    assert store.events() == []
+
+
 # --------------------------------------------------------------------------- #
 # Submit: the ambiguous-failure paths
 # --------------------------------------------------------------------------- #
@@ -314,9 +345,11 @@ def test_transport_error_whose_lookup_fails_stays_unknown(store: OrderStore) -> 
     result = executor.submit_post_only(side="BUY", quantity="0.002", price="79980")
 
     # The lookup failed too. Guessing either way is worse than leaving a row
-    # that reconciliation will chase.
+    # that reconciliation will chase, and "retryable" would be a lie here:
+    # resubmitting an order the matcher may be holding is how one intent
+    # becomes two fills.
     assert result.status == "UNKNOWN"
-    assert result.retryable
+    assert not result.retryable
     row = store.get(result.client_order_id)
     assert row is not None
     assert row["status"] == "UNKNOWN"
@@ -371,7 +404,7 @@ def test_server_error_whose_lookup_fails_stays_unknown(store: OrderStore) -> Non
     result = executor.submit_post_only(side="BUY", quantity="0.002", price="79980")
 
     assert result.status == "UNKNOWN"
-    assert result.retryable
+    assert not result.retryable, "an order the venue may hold is never safe to resubmit"
     row = store.get(result.client_order_id)
     assert row is not None
     assert row["status"] == "UNKNOWN"

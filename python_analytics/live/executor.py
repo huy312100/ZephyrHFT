@@ -277,10 +277,11 @@ class LiveExecutor:
             if status is None:
                 # The lookup failed too. UNKNOWN is the honest answer and
                 # reconciliation can chase it; REJECTED would lose the order.
+                # Deliberately not "retryable": the matcher may be holding this
+                # order, so placing it again is a second fill. Resolve it.
                 return SubmissionResult(
                     cid,
                     "UNKNOWN",
-                    retryable=True,
                     note=f"transport error and the venue lookup failed: {exc}",
                 )
             return SubmissionResult(
@@ -301,10 +302,11 @@ class LiveExecutor:
                 )
                 status = self._resolve_after_ambiguity(cid)
                 if status is None:
+                    # Same reasoning as the transport path: unknown is not a
+                    # licence to resubmit, it is a prompt to resolve.
                     return SubmissionResult(
                         cid,
                         "UNKNOWN",
-                        retryable=True,
                         note=note + "; venue lookup also failed",
                     )
                 return SubmissionResult(
@@ -539,7 +541,16 @@ class LiveExecutor:
                         )
             else:
                 status = "UNKNOWN"
-            self._store.mark_status(cid, status, note=f"panic: {reason}")
+            # The status lands with its event in one transaction: a kill path
+            # that leaves rows moving with no explanation is unreadable after
+            # the fact, which is exactly when someone will be reading it.
+            self._store.mark_status(
+                cid,
+                status,
+                note=f"panic: {reason}",
+                event_kind="panic_status",
+                event_detail=f"{cid}: {reason} -> {status}",
+            )
 
         self._store.record_event(
             "panic_complete", f"{reason}: errors={errors or 'none'}"
