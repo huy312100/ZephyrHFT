@@ -18,9 +18,11 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_CONFIG_PATH = PROJECT_ROOT / "config" / "settings.yaml"
 
 # Public market-data WebSocket endpoints keyed by the ``data_ingestion.exchange``
-# value. The stream URL is built as ``<endpoint>/<symbol>@<stream_type>``, so any
-# Binance-compatible venue that follows the same naming scheme can be added here
-# (or overridden per run with ``data_ingestion.ws_base_url``).
+# value. The stream URL is built as ``<endpoint>/<symbol>@<stream_type>`` for a
+# single stream, or ``<endpoint>/stream?streams=a/b`` when auxiliary streams are
+# configured (``data_ingestion.aux_streams``), so any Binance-compatible venue
+# that follows the same naming scheme can be added here (or overridden per run
+# with ``data_ingestion.ws_base_url``).
 EXCHANGE_ENDPOINTS: Dict[str, str] = {
     "binance_futures": "wss://fstream.binance.com/ws",
     "binance_futures_testnet": "wss://stream.binancefuture.com/ws",
@@ -132,6 +134,9 @@ class DataIngestionSettings:
 
     ``exchange`` selects the WebSocket endpoint (see ``EXCHANGE_ENDPOINTS``),
     ``symbol`` and ``stream_type`` are joined into ``<endpoint>/<symbol>@<type>``.
+    ``aux_streams`` adds more streams on the *same* socket (the combined-stream
+    form), so prints land in the archive interleaved with the depth frames they
+    moved: without the tape a backtest cannot tell a fill from a book crossing.
     ``storage_path`` is resolved against the repository root, so a relative value
     keeps captures inside the project; ``compression`` is ``gzip`` or ``none``.
     ``flush_interval_ms`` bounds how long a record sits in the write buffer, and
@@ -143,6 +148,7 @@ class DataIngestionSettings:
     exchange: str = "binance_futures"
     symbol: str = "btcusdt"
     stream_type: str = "depth@100ms"
+    aux_streams: Tuple[str, ...] = ()
     storage_path: str = "data/raw_l2"
     compression: str = "gzip"
     compression_level: int = 1
@@ -164,8 +170,34 @@ class DataIngestionSettings:
         return EXCHANGE_ENDPOINTS[self.exchange]
 
     @property
+    def stream_tags(self) -> Tuple[str, ...]:
+        """Stream suffixes on the subscription, depth first."""
+        return (self.stream_type, *self.aux_streams)
+
+    @property
+    def combined_stream_url(self) -> Optional[str]:
+        """Combined-stream URL for ``stream_tags``, or ``None`` for one stream.
+
+        Binance multiplexes several ``<symbol>@<type>`` streams on a single
+        socket only through ``<endpoint>/stream?streams=a/b``; each frame then
+        arrives wrapped as ``{"stream": .., "data": ..}``.
+        """
+        tags = self.stream_tags
+        if len(tags) < 2:
+            return None
+        base = self.endpoint
+        # ``/ws`` is the single-stream endpoint; the multiplexed one is sibling
+        # ``/stream`` on every Binance environment (spot, futures, testnet).
+        base = base[: -len("/ws")] if base.endswith("/ws") else base
+        streams = "/".join(f"{self.symbol}@{tag}" for tag in tags)
+        return f"{base}/stream?streams={streams}"
+
+    @property
     def stream_url(self) -> str:
         """Full subscription URL, e.g. ``wss://fstream.binance.com/ws/btcusdt@depth@100ms``."""
+        combined = self.combined_stream_url
+        if combined is not None:
+            return combined
         return f"{self.endpoint}/{self.symbol}@{self.stream_type}"
 
     @property
@@ -378,6 +410,32 @@ def _build_kill_switch(raw: Mapping[str, Any]) -> KillSwitchSettings:
     )
 
 
+def parse_stream_names(
+    value: Any, section: str = "data_ingestion.aux_streams"
+) -> Tuple[str, ...]:
+    """Validates auxiliary stream names, preserving their case.
+
+    Binance stream names are case-sensitive (``aggTrade``, ``markPrice@1s``),
+    so unlike ``_pattern`` this must not lower-case the value. Order is
+    preserved and duplicates are dropped.
+    """
+    if value is None:
+        return ()
+    if isinstance(value, (str, bytes)) or not isinstance(value, Sequence):
+        raise ConfigError(f"'{section}' must be a list of stream names")
+    names: list = []
+    for item in value:
+        text = str(item).strip()
+        if not re.fullmatch(r"[A-Za-z]{1,16}(@[A-Za-z0-9]{1,12})?", text):
+            raise ConfigError(
+                f"'{section}' entries must look like 'aggTrade' or 'markPrice@1s': "
+                f"{item!r}"
+            )
+        if text not in names:
+            names.append(text)
+    return tuple(names)
+
+
 def _build_data_ingestion(raw: Mapping[str, Any]) -> DataIngestionSettings:
     defaults = DataIngestionSettings()
     exchange = _choice(
@@ -418,6 +476,10 @@ def _build_data_ingestion(raw: Mapping[str, Any]) -> DataIngestionSettings:
             "data_ingestion.stream_type",
             r"[a-z0-9]{1,20}(@[a-z0-9]{1,12})?",
             "must look like 'depth@100ms'",
+        ),
+        aux_streams=parse_stream_names(
+            raw.get("aux_streams", defaults.aux_streams),
+            "data_ingestion.aux_streams",
         ),
         storage_path=storage_path,
         compression=_choice(

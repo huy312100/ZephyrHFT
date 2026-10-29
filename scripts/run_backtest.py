@@ -65,6 +65,10 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     # Replay controls.
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--frames-per-hook", type=int, default=1)
+    parser.add_argument("--fill-model", default="touch",
+                        choices=("touch", "queue", "trade"),
+                        help="how a resting maker order earns a fill (default: touch, "
+                             "the legacy book-crossing model)")
     parser.add_argument("--event-limit", type=int, default=0)
     # Reporting.
     parser.add_argument("--report", type=str, default=None,
@@ -119,6 +123,7 @@ def run(args: argparse.Namespace) -> int:
         batch_size=args.batch_size,
         frames_per_hook=args.frames_per_hook,
         order_quantity=args.order_quantity,
+        fill_model=args.fill_model,
     )
 
     if any(char in args.source for char in "*?["):

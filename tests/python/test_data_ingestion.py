@@ -17,6 +17,7 @@ from typing import Any, Dict, List, Sequence
 import pytest
 import yaml
 
+from python_analytics.native import hft_native
 from python_analytics.utils.config import (
     EXCHANGE_ENDPOINTS,
     ConfigError,
@@ -32,11 +33,13 @@ from scripts.ingest_l2 import (  # noqa: E402 - sys.path bootstrap lives in the 
     L2IngestClient,
     RawL2Writer,
     build_settings,
+    event_kind,
     event_timestamp_ns,
     parse_args,
     parse_payload,
     percentile,
     reconnect_delay,
+    unwrap_frame_text,
 )
 
 NS_PER_MS = 1_000_000
@@ -63,6 +66,29 @@ def _depth(event_ms: int = 1_700_000_000_000, **extra: Any) -> str:
     }
     payload.update(extra)
     return json.dumps(payload)
+
+
+def _agg_trade(event_ms: int = 1_700_000_000_000, **extra: Any) -> str:
+    """One Binance USDⓈ-M ``aggTrade`` frame (the tape)."""
+    payload: Dict[str, Any] = {
+        "e": "aggTrade",
+        "E": event_ms,
+        "T": event_ms - 1,
+        "s": "BTCUSDT",
+        "a": 12345,
+        "p": "30000.50",
+        "q": "0.010",
+        "f": 1,
+        "l": 1,
+        "m": False,
+    }
+    payload.update(extra)
+    return json.dumps(payload)
+
+
+def _combined(stream: str, payload: str) -> str:
+    """Wraps a payload exactly the way a combined socket does (no whitespace)."""
+    return '{"stream":"%s","data":%s}' % (stream, payload)
 
 
 class _FrameSource:
@@ -115,6 +141,9 @@ def test_settings_load_from_repository_yaml() -> None:
     assert ingestion.exchange == "binance_futures"
     assert ingestion.symbol == "btcusdt"
     assert ingestion.stream_type == "depth@100ms"
+    # The tape rides along on the same socket: a depth-only archive cannot
+    # distinguish a hit at our quote from the book crossing it.
+    assert ingestion.aux_streams == ("trade",)
     assert ingestion.storage_path == "data/raw_l2"
     assert ingestion.compression == "gzip"
     assert ingestion.compression_level == 1
@@ -129,6 +158,22 @@ def test_stream_url_targets_the_futures_endpoint() -> None:
     settings = _settings()
     assert settings.endpoint == EXCHANGE_ENDPOINTS["binance_futures"]
     assert settings.stream_url == "wss://fstream.binance.com/ws/btcusdt@depth@100ms"
+
+
+def test_aux_streams_build_a_combined_subscription() -> None:
+    settings = _settings(aux_streams=("aggTrade",))
+    assert settings.stream_tags == ("depth@100ms", "aggTrade")
+    assert settings.combined_stream_url == (
+        "wss://fstream.binance.com/stream"
+        "?streams=btcusdt@depth@100ms/btcusdt@aggTrade"
+    )
+    assert settings.stream_url == settings.combined_stream_url
+
+
+def test_a_single_stream_keeps_the_plain_url() -> None:
+    settings = _settings()
+    assert settings.combined_stream_url is None
+    assert settings.stream_url.endswith("/ws/btcusdt@depth@100ms")
 
 
 def test_storage_dir_is_absolute_and_repo_relative() -> None:
@@ -198,6 +243,30 @@ def test_symbol_and_stream_are_normalised_to_lowercase(tmp_path) -> None:
     assert settings.stream_url.endswith("/ethusdt@depth@100ms")
 
 
+def test_aux_stream_names_keep_their_case(tmp_path) -> None:
+    """``aggTrade`` is case-sensitive on the venue; lower-casing it breaks it."""
+    settings = load_settings(
+        _write_settings(tmp_path, {"aux_streams": ["aggTrade", "markPrice@1s", "aggTrade"]})
+    ).data_ingestion
+    assert settings.aux_streams == ("aggTrade", "markPrice@1s")
+
+
+def test_an_empty_aux_stream_list_is_a_depth_only_capture(tmp_path) -> None:
+    settings = load_settings(_write_settings(tmp_path, {"aux_streams": []})).data_ingestion
+    assert settings.aux_streams == ()
+    assert settings.combined_stream_url is None
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["aggTrade", {"aggTrade": True}, ["agg Trade"], [""], ["a@b@c"], ["btcusdt@aggTrade/x"]],
+)
+def test_invalid_aux_streams_are_rejected(tmp_path, value) -> None:
+    path = _write_settings(tmp_path, {"aux_streams": value})
+    with pytest.raises(ConfigError, match="data_ingestion.aux_streams"):
+        load_settings(path)
+
+
 def test_spot_exchange_uses_the_spot_endpoint(tmp_path) -> None:
     settings = load_settings(_write_settings(tmp_path, {"exchange": "binance_spot"}))
     assert settings.data_ingestion.stream_url == (
@@ -239,7 +308,12 @@ def test_non_mapping_block_is_rejected(tmp_path) -> None:
 
 def test_as_dict_exposes_the_resolved_stream_and_directory() -> None:
     entry = as_dict(load_settings())["data_ingestion"]
-    assert entry["stream_url"] == "wss://fstream.binance.com/ws/btcusdt@depth@100ms"
+    # The repository config captures the tape, so the resolved URL is the
+    # combined one; drop ``aux_streams`` and it collapses to ``/ws/<stream>``.
+    assert entry["stream_url"] == (
+        "wss://fstream.binance.com/stream"
+        "?streams=btcusdt@depth@100ms/btcusdt@trade"
+    )
     assert entry["storage_dir"] == str(REPO_ROOT / "data" / "raw_l2")
     assert entry["symbol"] == "btcusdt"
 
@@ -635,6 +709,56 @@ def test_client_handles_combined_stream_frames(tmp_path) -> None:
     assert client.latency.summary().last_ms == pytest.approx(50.0)
 
 
+def test_unwrap_frame_text_keeps_the_payload_bytes_verbatim() -> None:
+    """The envelope is sliced off, not re-serialised: numbers must not move."""
+    payload = _agg_trade()
+    assert unwrap_frame_text(_combined("btcusdt@aggTrade", payload)) == payload
+    # A single-stream frame is already the payload.
+    assert unwrap_frame_text(payload) == payload
+    # A bare payload that happens to contain a "data" key is untouched.
+    bare = '{"e":"trade","data":{"x":1}}'
+    assert unwrap_frame_text(bare) == bare
+
+
+def test_event_kind_separates_depth_from_tape() -> None:
+    assert event_kind(json.loads(_depth())) == "depth"
+    assert event_kind(json.loads(_agg_trade())) == "trade"
+    assert event_kind({"result": None, "id": 1}) == "other"
+
+
+def test_client_archives_the_tape_unwrapped_and_counts_it(tmp_path) -> None:
+    client = _client(tmp_path, settings=_settings(aux_streams=("aggTrade",)))
+    event_ms = 1_700_000_000_000
+    depth, trade = _depth(event_ms), _agg_trade(event_ms)
+    items: List[Frame] = [
+        (event_ms * NS_PER_MS + 5 * NS_PER_MS, _combined("btcusdt@depth@100ms", depth)),
+        (event_ms * NS_PER_MS + 6 * NS_PER_MS, _combined("btcusdt@aggTrade", trade)),
+    ]
+    assert _consume(client, items) == 2
+
+    stats = client.stats
+    assert (stats.depth_frames, stats.trade_frames) == (1, 1)
+    records = [record for path in _roll_files(tmp_path) for record in _read_roll(path)]
+    assert records == [depth, trade]
+    # The archived line is exactly what the native tape model consumes; without
+    # this the capture and ``--fill-model trade`` would silently disagree.
+    assert hft_native.classify_json(records[0]) == hft_native.FeedMessageType.DEPTH_UPDATE
+    assert hft_native.classify_json(records[1]) == hft_native.FeedMessageType.TRADE
+    tick = hft_native.parse_trade_json(records[1])
+    assert float(tick.price) == pytest.approx(30000.50)
+    assert float(tick.quantity) == pytest.approx(0.010)
+    # ``m: false`` means the buyer was the taker: the print lifts the ask.
+    assert tick.aggressor == hft_native.Side.BUY
+
+
+def test_roll_file_name_records_every_stream(tmp_path) -> None:
+    client = _client(tmp_path, settings=_settings(aux_streams=("aggTrade",)))
+    _consume(client, [(1, _combined("btcusdt@aggTrade", _agg_trade()))])
+    name = _roll_files(tmp_path)[0].name
+    assert name.startswith("binance_futures_btcusdt_depth_100ms_aggTrade_")
+    assert name.endswith(".ndjson.gz")
+
+
 def test_client_decodes_binary_frames() -> None:
     assert L2IngestClient._decode(b'{"E": 1}') == '{"E": 1}'
     assert L2IngestClient._decode(memoryview(b"abc")) == "abc"
@@ -725,7 +849,12 @@ def test_cli_overrides_are_applied_to_the_settings() -> None:
     ])
     settings = build_settings(args)
     assert settings.symbol == "ethusdt"
-    assert settings.stream_url == "wss://fstream.binance.com/ws/ethusdt@depth@500ms"
+    # The symbol and stream overrides apply to every stream on the socket,
+    # including the tape that the repository config adds.
+    assert settings.stream_url == (
+        "wss://fstream.binance.com/stream"
+        "?streams=ethusdt@depth@500ms/ethusdt@trade"
+    )
     assert settings.compression == "none"
     assert settings.max_file_mb == 8
     assert settings.flush_interval_ms == 20
@@ -736,6 +865,27 @@ def test_cli_defaults_keep_the_yaml_settings() -> None:
     args = parse_args(["--dry-run"])
     assert build_settings(args) == load_settings().data_ingestion
     assert args.dry_run is True
+
+
+def test_cli_adds_aux_streams() -> None:
+    args = parse_args(["--aux-stream", "aggTrade", "--aux-stream", "markPrice@1s"])
+    settings = build_settings(args)
+    assert settings.aux_streams == ("aggTrade", "markPrice@1s")
+    assert settings.stream_url == (
+        "wss://fstream.binance.com/stream"
+        "?streams=btcusdt@depth@100ms/btcusdt@aggTrade/btcusdt@markPrice@1s"
+    )
+
+
+def test_cli_depth_only_drops_the_configured_tape() -> None:
+    settings = build_settings(parse_args(["--depth-only"]))
+    assert settings.aux_streams == ()
+    assert settings.stream_url == "wss://fstream.binance.com/ws/btcusdt@depth@100ms"
+
+
+def test_cli_depth_only_wins_over_an_explicit_aux_stream() -> None:
+    settings = build_settings(parse_args(["--aux-stream", "aggTrade", "--depth-only"]))
+    assert settings.aux_streams == ()
 
 
 def test_cli_rejects_unknown_compression() -> None:

@@ -111,6 +111,17 @@ public:
         return Quantity::from_raw(quantities_[slot]);
     }
 
+    // Whether the ladder window can hold this price at all, ignoring whether it
+    // sits on the tick grid. Used to decide when the grid itself is wrong.
+    [[nodiscard]] bool contains(Price price) const noexcept {
+        if (tick_raw_ <= 0) {
+            return false;
+        }
+        const std::int64_t delta = price.raw() - center_raw_;
+        const std::int64_t span = static_cast<std::int64_t>(kHalf) * tick_raw_;
+        return delta >= -span && delta < span;
+    }
+
     [[nodiscard]] std::size_t live_levels() const noexcept { return live_levels_; }
     [[nodiscard]] std::int64_t tick_raw() const noexcept { return tick_raw_; }
     [[nodiscard]] std::int64_t center_raw() const noexcept { return center_raw_; }
@@ -261,6 +272,30 @@ public:
         end_write();
     }
 
+    // Re-anchors the price window on `center`, keeping the tick. The levels are
+    // dropped: the grid they were indexed on no longer exists, and the venue's
+    // absolute-level feed rebuilds them on the next frames. A ladder anchored on
+    // a stale constant is blind -- it accepts nothing and reports an empty book
+    // rather than a bad price, which is the failure this method exists to undo.
+    void recenter(Price center) noexcept {
+        configure(Price::from_raw(bid_.tick_raw()), center);
+    }
+
+    [[nodiscard]] Price center() const noexcept {
+        return center_price();
+    }
+
+    // A side with no levels means the feed cannot be represented at all, which
+    // is different from a genuinely empty market: no venue quotes one-sided
+    // forever, so a blind ladder is always a configuration/grid problem.
+    [[nodiscard]] bool blind() const noexcept {
+        return bid_.live_levels() == 0 || ask_.live_levels() == 0;
+    }
+
+    [[nodiscard]] bool contains(Price price) const noexcept {
+        return bid_.contains(price);
+    }
+
     // L2 semantics: absolute quantity at a price. Zero removes the level.
     [[nodiscard]] bool apply_level(Side side, Price price, Quantity quantity,
                                    Nanos timestamp = 0) noexcept {
@@ -274,6 +309,12 @@ public:
         }
         end_write();
         return ok;
+    }
+
+    // Displayed quantity resting at ``price`` on one side; zero when the level
+    // is empty or the price is outside the ladder. Read-only, allocation-free.
+    [[nodiscard]] Quantity quantity_at(Side side, Price price) const noexcept {
+        return ladder(side).quantity_at(price);
     }
 
     // Signed delta update, useful for L3 aggregation or trade prints.
@@ -427,6 +468,65 @@ private:
 };
 
 using L2Book = L2OrderBook<8192>;
+
+// Whether a depth frame proves the ladder is anchored on a stale price, and if so
+// where it must move.
+//
+// A ladder covers `center +/- kHalf` ticks. Anchor it on a constant that the
+// live market has left behind and every level is rejected while `top()` keeps
+// returning an empty book -- a failure that looks exactly like a quiet market,
+// so it can survive a whole study unnoticed. When a side has no levels *and*
+// this frame carries a touch the window cannot hold, the anchor is demonstrably
+// wrong; the frame's own touch is the only evidence available about where the
+// market is.
+//
+// The tick is never touched: it is the venue's grid, and a wrong tick has to
+// stay visible (as rejected levels) instead of being guessed around. The rule is
+// idempotent -- once the anchor equals the frame's touch it returns zero -- so an
+// unrepresentable grid cannot make the book thrash, clearing itself every frame.
+//
+// Returns the price to re-anchor on, or a default (zero) Price for "no move".
+template <std::size_t MaxTicks>
+[[nodiscard]] inline Price reframe_anchor(const L2OrderBook<MaxTicks>& book,
+                                          const DepthUpdate& update) noexcept {
+    if (!book.blind()) {
+        return Price{};
+    }
+    Price best_bid{};
+    Price best_ask{};
+    bool has_bid = false;
+    bool has_ask = false;
+    for (std::uint32_t i = 0; i < update.bid_count; ++i) {
+        const LevelDelta& level = update.bids[i];
+        if (level.quantity.raw() > 0 && (!has_bid || level.price.raw() > best_bid.raw())) {
+            best_bid = level.price;
+            has_bid = true;
+        }
+    }
+    for (std::uint32_t i = 0; i < update.ask_count; ++i) {
+        const LevelDelta& level = update.asks[i];
+        if (level.quantity.raw() > 0 && (!has_ask || level.price.raw() < best_ask.raw())) {
+            best_ask = level.price;
+            has_ask = true;
+        }
+    }
+    if (!has_bid && !has_ask) {
+        return Price{};
+    }
+    if ((!has_bid || book.contains(best_bid)) && (!has_ask || book.contains(best_ask))) {
+        return Price{};  // the window can hold this frame: nothing is wrong yet
+    }
+    // Mid of whatever sides this frame touches, floored onto the tick grid.
+    const Price::rep mid = has_bid && has_ask
+                               ? (best_bid.raw() + best_ask.raw()) / 2
+                               : (has_bid ? best_bid.raw() : best_ask.raw());
+    const Price::rep tick = book.tick_size().raw();
+    const Price::rep anchor = tick > 0 ? mid - (mid % tick) : mid;
+    if (anchor == book.center().raw()) {
+        return Price{};  // already anchored there: the grid, not the anchor, is wrong
+    }
+    return Price::from_raw(anchor);
+}
 
 // ---------------------------------------------------------------------------
 // L3 order book: fixed order pool + open-addressed order-id index.

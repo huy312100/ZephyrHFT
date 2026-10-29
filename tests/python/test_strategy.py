@@ -114,3 +114,37 @@ def test_stock_rounds_quotes_to_tick() -> None:
     assert strategy.round_to_tick(100.125) == pytest.approx(100.13)
     # The string adapter normalises to the MarketType enum.
     assert strategy._config.market_type == MarketType.STOCK
+
+
+def test_crypto_quotes_land_on_the_tick_grid() -> None:
+    """A quote between two ticks is not representable, so it must not be sent.
+
+    Crypto used to skip the adapter entirely, which produced quotes like
+    30000.8008 on a 0.5 tick: the ladder cannot hold them and a real venue
+    rejects them. The only reason such an order ever "filled" was a fill model
+    that ignored the book it was trading against.
+    """
+    config = _config(tick_size=0.5, market_type="CRYPTO")
+    strategy = AvellanedaStoikovStrategy(config)
+
+    for micro in (30000.9, 30001.0, 30001.4, 30001.9):
+        bid, ask = strategy.adjusted_quotes(micro, 0.0, 59.9)
+        for quote in (bid, ask):
+            assert math.isclose((quote - 30000) / 0.5, round((quote - 30000) / 0.5),
+                                abs_tol=1e-9)
+        # Outward rounding can only widen the market, never cross it.
+        assert ask > bid
+
+
+def test_crypto_quote_never_collapses_into_a_crossed_market() -> None:
+    """A spread narrower than one tick still yields a valid two-sided quote."""
+    # The committed fit (k=5.0, sigma=0.02) quotes ~0.20 wide, well under the
+    # 0.5 tick, so a nearest-tick rule would map both sides onto one price.
+    config = _config(tick_size=0.5, market_type="CRYPTO",
+                     k=5.0, sigma=0.02, time_horizon=60.0)
+    strategy = AvellanedaStoikovStrategy(config)
+
+    assert strategy.optimal_half_spread(59.9) < config.tick_size
+    bid, ask = strategy.adjusted_quotes(30001.0, 0.0, 59.9)
+    assert ask - bid >= config.tick_size
+    assert ask > bid

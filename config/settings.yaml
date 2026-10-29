@@ -1,6 +1,13 @@
 # Runtime configuration for the engine, risk guard and demo strategy.
 engine:
   symbol: BTCUSDT
+  # Price grid of the direct-indexed ladder. These two values are the *synthetic*
+  # world the committed sample archive and its locked artefacts live in. A real
+  # BTCUSDT-perp capture ticks at 0.10 and trades near 80k, so replay it with the
+  # venue lock instead: scripts/run_walk_forward.py --from-lock \
+  #   --lock-file config/venue_binance_futures_btcusdt.json. The ladder re-anchors
+  # on the feed by itself, but a tick that does not divide the venue's prices is
+  # reported (book: N unpriced frames) rather than silently guessed around.
   tick_size: "0.50"
   center: "30000"
   stale_after_ns: 1000000000
@@ -38,6 +45,12 @@ data_ingestion:
   exchange: binance_futures        # binance_futures | binance_futures_testnet | binance_spot
   symbol: btcusdt                  # lowercase, as required by the stream name
   stream_type: depth@100ms         # e.g. depth@100ms, depth@500ms, depth20@100ms
+  # Extra streams on the same socket (combined-stream form). The tape is what
+  # separates "our quote was hit" from "the book crossed us" -- without prints
+  # every backtested fill is adversarially selected by construction. ``trade`` is
+  # the stream that actually delivers on this endpoint (@aggTrade is silently
+  # empty); ``--aux-stream aggTrade`` still works if a venue serves it.
+  aux_streams: [trade]            # e.g. [trade, markPrice@1s], [] = depth only
   storage_path: data/raw_l2        # relative to the repository root
   compression: gzip                # gzip | none
   compression_level: 1             # 1 = fastest (ingest path), 9 = smallest

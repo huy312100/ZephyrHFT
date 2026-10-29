@@ -293,7 +293,7 @@ def test_no_artefacts_without_consent(gate, green, tmp_path) -> None:
 # --------------------------------------------------------------------------- #
 # Alpha: profitability is measured separately and never flatters the build
 # --------------------------------------------------------------------------- #
-ALPHA = {"alpha.net_pnl", "alpha.fee_assumption"}
+ALPHA = {"alpha.net_pnl", "alpha.fee_assumption", "alpha.fee_wall"}
 
 
 def test_alpha_is_always_measured_but_never_gated(gate, green) -> None:
@@ -362,3 +362,31 @@ def test_measure_alpha_passes_a_genuinely_profitable_run(gate) -> None:
     checks, evidence = gate.measure_alpha(payload, maker_bps=2.0, taker_bps=5.0)
     assert all(check.passed for check in checks), [c.measured for c in checks]
     assert evidence["pre_fee_profitable"] is True
+
+
+def test_measure_alpha_names_the_break_even_maker_fee(gate) -> None:
+    """Net PnL says the study loses; the wall says which fee would stop it."""
+
+    # 0.5 USDT earned before fees on 60,000 USDT of notional is 0.0833 bps, so a
+    # 2 bps maker fee is ~24x what the strategy can pay.
+    payload = {"aggregate": {"net_pnl": -11.5, "net_pnl_pct": -0.0115,
+                             "gross_pnl": -11.5, "fees_paid": 12.0,
+                             "traded_notional": 60_000.0, "fills": 120}}
+    checks, evidence = gate.measure_alpha(payload, maker_bps=2.0, taker_bps=5.0)
+    wall = next(check for check in checks if check.id == "alpha.fee_wall")
+    assert wall.passed is False
+    assert "break-even maker fee +0.083 bps" in wall.measured
+    assert "2 bps maker fee" in wall.measured
+    assert evidence["breakeven_maker_bps"] == pytest.approx(0.0833, abs=1e-4)
+    assert evidence["fee_wall_viable"] is False
+    assert evidence["fee_wall_multiple"] == pytest.approx(24.0, abs=1e-2)
+
+
+def test_measure_alpha_omits_the_fee_wall_when_nothing_was_traded(gate) -> None:
+    """A run with no fills has no notional, so there is no break-even fee to state."""
+
+    payload = {"aggregate": {"net_pnl": 0.0, "net_pnl_pct": 0.0,
+                             "gross_pnl": 0.0, "fees_paid": 0.0, "fills": 0}}
+    checks, evidence = gate.measure_alpha(payload, maker_bps=2.0, taker_bps=5.0)
+    assert "alpha.fee_wall" not in {check.id for check in checks}
+    assert "breakeven_maker_bps" not in evidence

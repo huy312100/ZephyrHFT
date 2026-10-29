@@ -274,12 +274,22 @@ class AvellanedaStoikovStrategy(Strategy):
                         time_remaining: float,
                         sigma: Optional[float] = None,
                         ofi_z: float = 0.0) -> tuple[float, float]:
-        """Raw quotes with market-specific adapter rules applied."""
+        """Raw quotes snapped onto the venue's price grid.
+
+        Every venue this engine trades quotes on a discrete tick grid, and an
+        order priced between two ticks is not representable: the ladder cannot
+        hold it, and a real exchange rejects it. Rounding is therefore applied
+        to all market types, and it is directional — the bid rounds **down** and
+        the ask rounds **up** — so snapping can only widen the market. Nearest-
+        tick rounding could pull both sides into the same tick and produce a
+        crossed or degenerate quote from a perfectly valid one.
+        """
         bid, ask = self.raw_quotes(micro_price, inventory, time_remaining,
                                    sigma=sigma, ofi_z=ofi_z)
-        if self._config.market_type in (MarketType.STOCK, MarketType.COMMODITIES):
-            bid = self.round_to_tick(bid)
-            ask = self.round_to_tick(ask)
+        tick = self._config.tick_size
+        if tick > 0.0:
+            bid = math.floor(bid / tick) * tick
+            ask = math.ceil(ask / tick) * tick
         return bid, ask
 
     def round_to_tick(self, price: float) -> float:

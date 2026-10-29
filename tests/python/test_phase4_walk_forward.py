@@ -247,6 +247,33 @@ def test_report_serialises_json_and_markdown(tmp_path: Path) -> None:
     assert "## Window detail" in markdown or "| 0 |" in markdown
 
 
+def test_aggregate_reports_the_break_even_maker_fee(tmp_path: Path) -> None:
+    """Gross edge per unit of notional is the fee a deployment has to clear.
+
+    The number is derived, never stored twice: it must equal the aggregate's own
+    pre-fee PnL over its own traded notional, and it must be absent (``None``)
+    when nothing traded rather than a misleading zero.
+    """
+    source = _write(tmp_path / "archive.ndjson", _lines(300))
+    report = _runner(_parameters()).run([source])
+    aggregate = report.aggregate
+    notional = aggregate["traded_notional"]
+    wall = report.fee_wall()
+    fee_lines = [line for line in report.summary_lines() if line.startswith("fee wall:")]
+
+    if notional > 0.0:
+        expected = ((aggregate["net_pnl"] + aggregate["fees_paid"])
+                    / notional * 10_000.0)
+        assert aggregate["gross_edge_bps"] == pytest.approx(expected, abs=1e-5)
+        assert wall is not None and wall.maker_bps == pytest.approx(2.0)
+        assert len(fee_lines) == 1
+        assert f"{expected:+.3f} bps" in fee_lines[0]
+    else:
+        assert aggregate["gross_edge_bps"] is None
+        assert wall is None
+        assert fee_lines == []
+
+
 def test_report_numbers_are_finite_or_null(tmp_path: Path) -> None:
     """NaN/Inf must never leak into JSON (they are not valid JSON numbers)."""
     source = _write(tmp_path / "archive.ndjson", _lines(120))

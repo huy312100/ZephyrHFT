@@ -63,6 +63,7 @@ from python_analytics.chaos import (  # noqa: E402
 from python_analytics.costs import (  # noqa: E402
     DEFAULT_MAKER_BPS,
     DEFAULT_TAKER_BPS,
+    FeeWall,
     round_trip_cost_bps,
 )
 from python_analytics.native import hft_native  # noqa: E402
@@ -725,6 +726,10 @@ def measure_alpha(payload: Dict[str, Any], *, maker_bps: float,
     These checks are *never* allowed to hide inside the build verdict. They are
     computed on every run so the number is always on the page, and only
     ``--require-positive-alpha`` turns them into a non-zero exit code.
+
+    ``alpha.fee_wall`` restates the same inequality as ``alpha.net_pnl`` in fee
+    units, and is only emitted when the study traded notional: the break-even
+    maker fee is the one form of a losing result that names what would fix it.
     """
     aggregate = payload.get("aggregate", {})
     net = float(aggregate.get("net_pnl", 0.0) or 0.0)
@@ -736,6 +741,12 @@ def measure_alpha(payload: Dict[str, Any], *, maker_bps: float,
     # Fees are already inside realized/unrealized PnL (both come from the cash
     # ledger), so adding them back is what the study would have earned for free.
     before_fees = net + fees
+    wall = FeeWall.from_study(
+        pre_fee_pnl=before_fees,
+        traded_notional=float(aggregate.get("traded_notional", 0.0) or 0.0),
+        maker_bps=maker_bps,
+        fills=int(trips or 0),
+    )
 
     checks = [
         Check(
@@ -753,6 +764,15 @@ def measure_alpha(payload: Dict[str, Any], *, maker_bps: float,
             note="a negative maker_bps is a rebate tier retail VIP 0 does not "
                  "have; it flatters every passive fill"),
     ]
+    if wall is not None:
+        # The same inequality as ``alpha.net_pnl``, restated in fee units. Net PnL
+        # says "this loses"; the wall says "you need a fee below 1.0 bps", which
+        # is the only form of the result an operator can act on.
+        checks.append(Check(
+            "alpha.fee_wall", "alpha", "fee wall (break-even maker fee)",
+            wall.describe(), "gross edge > maker fee", wall.viable,
+            note="no parameter set moves this sign once the fee exceeds the "
+                 "gross edge; it is a fee-tier or venue decision"))
 
     evidence = {
         "net_pnl": net,
@@ -767,6 +787,13 @@ def measure_alpha(payload: Dict[str, Any], *, maker_bps: float,
         "round_trip_cost_bps": round_trip,
         "rebate_assumed": maker_bps < 0.0,
     }
+    if wall is not None:
+        evidence["gross_edge_bps"] = round(wall.gross_bps, 6)
+        evidence["breakeven_maker_bps"] = round(wall.gross_bps, 6)
+        evidence["fee_wall_viable"] = wall.viable
+        evidence["fee_wall_multiple"] = (None if wall.fee_multiple is None
+                                         else round(wall.fee_multiple, 4))
+        evidence["fee_wall_traded_notional"] = round(wall.traded_notional, 8)
     return checks, evidence
 
 

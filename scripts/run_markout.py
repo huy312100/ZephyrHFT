@@ -108,6 +108,10 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--frames-per-hook", type=int, default=1,
                         help="frames per strategy hook; bounds markout resolution "
                              "(default 1 = every frame)")
+    parser.add_argument("--fill-model", default="touch",
+                        choices=("touch", "queue", "trade"),
+                        help="fill model used to reproduce the fills; match the "
+                             "study's --fill-model (default: touch)")
     parser.add_argument("--fills", default=None,
                         help="JSON of venue-timestamped fills; skips the replay and marks "
                              "these against --source instead")
@@ -160,7 +164,8 @@ def markouts_from_replay(args: argparse.Namespace, parameters: LockedParameters,
     window boundary impossible to mistake for a price move.
     """
     paths = resolve_sources(args.source)
-    runner = WalkForwardRunner(parameters, window_events=args.window_events)
+    runner = WalkForwardRunner(parameters, window_events=args.window_events,
+                               fill_model=args.fill_model)
     rows: List[Any] = []
     windows: List[Dict[str, Any]] = []
     for path, offset, lines in runner.iter_slices(paths):
@@ -173,6 +178,7 @@ def markouts_from_replay(args: argparse.Namespace, parameters: LockedParameters,
             initial_cash=parameters.initial_cash,
             frames_per_hook=args.frames_per_hook,
             order_quantity=parameters.order_quantity,
+            fill_model=args.fill_model,
         )
         replayer.replay_lines(lines, parameters.build_strategy())
         window_rows = replayer.markout_rows()

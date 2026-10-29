@@ -7,6 +7,12 @@ network/feed latency from the venue event time (``E``, falling back to ``T``)
 and appends the byte-exact payload to gzip-compressed NDJSON roll files under
 ``data_ingestion.storage_path`` (``data/raw_l2`` by default).
 
+With ``data_ingestion.aux_streams`` set (``aggTrade`` by default in
+``config/settings.yaml``) the socket is the *combined* one, so trade prints are
+archived interleaved with the depth frames they moved. That is what a
+``--fill-model trade`` backtest needs: a depth snapshot alone can never show
+that a print happened at our quote.
+
 Design notes
 ------------
 * **The receive loop never touches the filesystem.** Frames are appended to an
@@ -21,12 +27,17 @@ Design notes
 * **Everything received is archived**, including frames without a venue
   timestamp (subscription acks, venue errors); those are counted separately so
   a gap in the capture is always attributable.
+* **Combined frames are unwrapped textually, not re-serialised.** A combined
+  socket delivers ``{"stream": .., "data": ..}``; the envelope is sliced off so
+  the archived line is the venue's own payload bytes, identical in shape to a
+  single-stream capture (and to what the C++ parser expects).
 
 Examples
 --------
     python3 scripts/ingest_l2.py --duration 30
     python3 scripts/ingest_l2.py --dry-run --duration 10   # no files, no disk
     python3 scripts/ingest_l2.py --replay data/sample_events.ndjson
+    python3 scripts/ingest_l2.py --depth-only --duration 30  # depth, no tape
 """
 from __future__ import annotations
 
@@ -55,6 +66,7 @@ from python_analytics.utils.config import (
     COMPRESSION_CHOICES,
     ConfigError,
     DataIngestionSettings,
+    parse_stream_names,
 )
 
 logger = logging.getLogger("zephyr.ingest_l2")
@@ -83,6 +95,45 @@ def unwrap_payload(payload: Any) -> Any:
     if isinstance(payload, Mapping) and isinstance(payload.get("data"), Mapping):
         return payload["data"]
     return payload
+
+
+def unwrap_frame_text(raw: str) -> str:
+    """Returns the line to archive for one socket frame.
+
+    A single-stream socket already delivers the bare payload, which is archived
+    verbatim. A combined socket wraps it as
+    ``{"stream": "<name>", "data": <payload>}``; the envelope is sliced off
+    *textually* rather than round-tripped through ``json``, because re-serialising
+    would reformat numbers and the archive would stop being ground truth. The
+    ``stream`` name is pure redundancy: the payload carries ``s`` itself.
+    """
+    if not raw.startswith('{"stream"'):
+        return raw
+    marker = '"data":'
+    index = raw.find(marker)
+    if index < 0:
+        return raw
+    begin = index + len(marker)
+    limit = len(raw)
+    while begin < limit and raw[begin] in " \t\r\n":
+        begin += 1
+    end = raw.rfind("}")
+    if end <= begin:
+        return raw
+    return raw[begin:end]
+
+
+def event_kind(payload: Any) -> str:
+    """Classifies a payload as ``depth``, ``trade`` or ``other``."""
+    data = unwrap_payload(payload)
+    if not isinstance(data, Mapping):
+        return "other"
+    event = data.get("e")
+    if event in ("depthUpdate", "depth"):
+        return "depth"
+    if event in ("trade", "aggTrade"):
+        return "trade"
+    return "other"
 
 
 def event_timestamp_ns(payload: Any) -> Optional[int]:
@@ -407,9 +458,11 @@ class RawL2Writer:
     def _open_file(self, now: float) -> None:
         self._directory.mkdir(parents=True, exist_ok=True)
         stamp = datetime.fromtimestamp(now, timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-        slug = (
-            f"{self._settings.exchange}_{self._settings.symbol}_"
-            f"{self._settings.stream_type.replace('@', '_')}"
+        slug = "_".join(
+            [
+                f"{self._settings.exchange}_{self._settings.symbol}",
+                *(tag.replace("@", "_") for tag in self._settings.stream_tags),
+            ]
         )
         while True:
             self._sequence += 1
@@ -517,6 +570,8 @@ class IngestStats:
     started_ns: int = 0
     frames: int = 0
     stored: int = 0
+    depth_frames: int = 0
+    trade_frames: int = 0
     no_timestamp: int = 0
     malformed: int = 0
     bytes_received: int = 0
@@ -747,7 +802,7 @@ class L2IngestClient:
         # Archive first: the capture stays byte-complete even if a payload is
         # unparseable, which is what makes the roll files usable as ground truth.
         if self._writer is not None:
-            self._writer.append(raw)
+            self._writer.append(unwrap_frame_text(raw))
             stats.stored += 1
 
         payload = parse_payload(raw)
@@ -756,6 +811,12 @@ class L2IngestClient:
             if stats.malformed <= 5:
                 logger.warning("malformed frame #%d: %.160s", stats.malformed, raw)
             return
+
+        kind = event_kind(payload)
+        if kind == "depth":
+            stats.depth_frames += 1
+        elif kind == "trade":
+            stats.trade_frames += 1
 
         event_ns = event_timestamp_ns(payload)
         if event_ns is None:
@@ -894,6 +955,8 @@ class L2IngestClient:
         elapsed = stats.elapsed_s(self._clock())
         rate = stats.frames / elapsed if elapsed > 0 else 0.0
         parts = [f"frames={stats.frames}", f"rate={rate:.1f}/s"]
+        if stats.depth_frames or stats.trade_frames:
+            parts.append(f"depth={stats.depth_frames} trade={stats.trade_frames}")
         if latency.samples:
             parts.append(
                 f"lat_ms(p50={latency.p50_ms:.2f} p95={latency.p95_ms:.2f} "
@@ -939,6 +1002,12 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--symbol", default=None, help="stream symbol, e.g. btcusdt")
     parser.add_argument("--stream", dest="stream_type", default=None,
                         help="stream type, e.g. depth@100ms")
+    parser.add_argument("--aux-stream", dest="aux_streams", action="append",
+                        default=None, metavar="TYPE",
+                        help="extra stream on the same socket, e.g. aggTrade "
+                             "(repeatable; replaces data_ingestion.aux_streams)")
+    parser.add_argument("--depth-only", action="store_true",
+                        help="capture the depth stream only (drop the tape)")
     parser.add_argument("--url", dest="ws_base_url", default=None,
                         help="WebSocket base URL (overrides the exchange endpoint)")
     parser.add_argument("--output-dir", type=Path, default=None,
@@ -979,6 +1048,12 @@ def build_settings(args: argparse.Namespace) -> DataIngestionSettings:
         "telemetry_interval_s": args.telemetry_interval,
         "latency_warn_ms": args.latency_warn_ms,
     }
+    # ``--depth-only`` wins over ``--aux-stream``: an explicit request to drop
+    # the tape must not be undone by a flag earlier on the command line.
+    if args.depth_only:
+        overrides["aux_streams"] = ()
+    elif args.aux_streams:
+        overrides["aux_streams"] = parse_stream_names(args.aux_streams)
     overrides = {name: value for name, value in overrides.items() if value is not None}
     return replace(settings, **overrides) if overrides else settings
 
@@ -1017,6 +1092,9 @@ def _print_summary(
     print("=" * 74)
     print(f"  Stream        : {settings.stream_url}")
     print(f"  Frames        : {stats.frames:,}  ({rate:.1f}/s over {elapsed:.1f}s)")
+    if stats.depth_frames or stats.trade_frames:
+        print(f"  Composition   : depth={stats.depth_frames:,}"
+              f"  trade={stats.trade_frames:,}")
     if writer is None:
         print("  Archived      : dry-run (no storage)")
     else:
@@ -1067,6 +1145,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "dry-run (no files)" if args.dry_run else storage_dir,
         "no storage" if args.dry_run else settings.compression,
     )
+    if not settings.aux_streams:
+        logger.warning(
+            "depth-only capture: no trade prints are archived, so "
+            "'--fill-model trade' can never fill from this archive"
+        )
 
     async def _run() -> None:
         install_signal_handlers(client)
