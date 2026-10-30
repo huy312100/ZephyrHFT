@@ -35,6 +35,14 @@ our resting order has on the book are all outside this number. Every one of them
 makes fills *less* likely, never more, so the curve is an upper bound on fill
 rate and a best case on edge: a distance that does not clear the fee here cannot
 be rescued by anything this model leaves out.
+
+Scale
+-----
+The scan keeps one small record per print, which is a few tens of megabytes per
+hour of BTCUSDT tape -- fine for a study, and the reason a day-long capture
+should be measured roll by roll (or as a `--source` list, which this module
+treats as one chronological tape). The timeline is the larger of the two and is
+bounded by the depth frame rate, not by the print rate.
 """
 from __future__ import annotations
 
@@ -240,11 +248,24 @@ class EdgeCurveConfig:
         primary = self.primary_horizon_s
         if primary is None:
             positive = [value for value in horizons if value > 0.0]
-            primary = positive[0] if positive else horizons[0]
+            if not positive:
+                raise ValueError(
+                    "horizons_s needs at least one positive horizon; h=0 is the "
+                    "quote offset, not an edge")
+            primary = positive[0]
         elif float(primary) not in horizons:
             raise ValueError(
                 f"primary_horizon_s {primary!r} is not one of the measured "
                 f"horizons {list(horizons)}")
+        if float(primary) <= 0.0:
+            # The verdict subtracts the fee from the primary horizon's mean. At
+            # h=0 that mean is the distance the quote was posted at, so any
+            # grid distance above the fee would "clear" it and the runner would
+            # exit 0 on a GO that measures nothing. The column stays in the
+            # table; it is only refused as the horizon that decides.
+            raise ValueError(
+                "primary_horizon_s must be positive; h=0 measures the quote "
+                "offset, not an edge")
         object.__setattr__(self, "primary_horizon_s", float(primary))
 
     def as_dict(self) -> Dict[str, Any]:

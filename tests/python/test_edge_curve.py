@@ -160,7 +160,7 @@ def test_the_agreeing_side_is_the_one_that_rests() -> None:
         _print(1_200, 100.01, buyer_is_maker=False),
         _snapshot(2_500, 99.99, 100.01),
     ]
-    summary, _ = _curve(lines, _config(distances_bps=(1.0,), horizons_s=(0.0,)))
+    summary, _ = _curve(lines, _config(distances_bps=(1.0,), horizons_s=(0.0, 1.0)))
     # One print fills the bid at 99.99, the other fills the ask at 100.01.
     assert summary["rows"][0]["fills"] == 2
 
@@ -231,7 +231,7 @@ def test_fill_rate_is_reported_per_minute_of_tape() -> None:
         _print(61_100, 99.99),
         _snapshot(121_100, 99.99, 100.01),
     ]
-    summary, _ = _curve(lines, _config(distances_bps=(1.0,), horizons_s=(0.0,)))
+    summary, _ = _curve(lines, _config(distances_bps=(1.0,), horizons_s=(0.0, 1.0)))
     row = summary["rows"][0]
     assert row["fills"] == 2
     assert row["fills_per_min"] == pytest.approx(2.0, rel=1e-6)
@@ -270,6 +270,20 @@ def test_a_quote_that_cannot_be_priced_is_dropped_not_guessed() -> None:
         EdgeCurveConfig(distances_bps=(0.0,))
     with pytest.raises(ValueError):
         EdgeCurveConfig(primary_horizon_s=42.0)
+
+
+def test_the_verdict_is_never_decided_at_the_quote_offset() -> None:
+    """``h = 0`` earns the distance it was posted at, so it cannot be an edge.
+
+    A primary horizon of ``0`` makes net edge ``distance - fee``, so every grid
+    distance above the fee would clear and the runner would exit 0 on a GO that
+    measures the grid rather than the market. Both routes to it are refused: a
+    horizon list with nothing positive, and an explicit ``0``.
+    """
+    with pytest.raises(ValueError):
+        EdgeCurveConfig(horizons_s=(0.0,))
+    with pytest.raises(ValueError):
+        EdgeCurveConfig(horizons_s=(0.0, 1.0), primary_horizon_s=0.0)
 
 
 def test_an_empty_tape_is_reported_as_no_data() -> None:
@@ -331,3 +345,37 @@ def test_the_runner_refuses_a_missing_capture() -> None:
     """A path that does not exist is a usage error, never an empty study."""
     script = _load_script()
     assert script.main(["--source", "does-not-exist.ndjson.gz", "--no-report"]) == 2
+
+
+def test_the_runner_refuses_roll_files_handed_over_out_of_order(tmp_path) -> None:
+    """A backwards timeline is an input defect, and must not read as a verdict.
+
+    Python's traceback would exit ``1``, which this runner reserves for "no
+    distance clears". Feeding yesterday's roll after today's is a usage error.
+    """
+    later = tmp_path / "later.ndjson"
+    later.write_text(_snapshot(5_000, 99.99, 100.01) + "\n", encoding="utf-8")
+    earlier = tmp_path / "earlier.ndjson"
+    earlier.write_text(_snapshot(1_000, 99.99, 100.01) + "\n", encoding="utf-8")
+    script = _load_script()
+    assert script.main([
+        "--source", str(later), str(earlier), "--no-report",
+    ]) == 2
+
+
+def test_the_runner_refuses_an_unwritable_report_directory(tmp_path) -> None:
+    """A report that cannot be written is an environment error, not a NO."""
+    capture = tmp_path / "tape.ndjson"
+    capture.write_text("\n".join([
+        _snapshot(1_000, 99.99, 100.01),
+        _print(1_100, 99.99),
+        _snapshot(2_200, 101.00, 101.02),
+    ]) + "\n", encoding="utf-8")
+    blocker = tmp_path / "blocker"
+    blocker.write_text("not a directory", encoding="utf-8")
+    script = _load_script()
+    assert script.main([
+        "--source", str(capture), "--tick-size", "0.01",
+        "--distances-bps", "0.5", "--min-samples", "1",
+        "--report-dir", str(blocker / "reports"),
+    ]) == 2

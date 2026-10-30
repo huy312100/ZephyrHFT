@@ -130,7 +130,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print(f"usage: {exc}", file=sys.stderr)
         return EXIT_USAGE
 
-    timeline = build_timeline_from_files(sources, symbol=args.symbol)
+    # Building the timeline is part of reading the input, not of the study: a
+    # capture that mixes symbols, or roll files handed over out of order, raises
+    # ``ValueError`` here, and a traceback would exit 1 -- the code this runner
+    # reserves for "no distance clears". Input defects are usage errors.
+    try:
+        timeline = build_timeline_from_files(sources, symbol=args.symbol)
+    except (FileNotFoundError, ValueError) as exc:
+        print(f"usage: {exc}", file=sys.stderr)
+        return EXIT_USAGE
     scan = scan_tape(
         (line for path in sources for line in iter_capture_lines(path)),
         symbol=args.symbol,
@@ -178,28 +186,35 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "summary": summary,
             "verdict": verdict,
         }
-        write_json(payload, directory / f"{args.stem}.json")
-        write_csv(
-            [{
-                "distance_bps": row["distance_bps"],
-                "distance_ticks": row["distance_ticks"],
-                "fills": row["fills"],
-                "reach_pct": row["reach_pct"],
-                "fills_per_min": row["fills_per_min"],
-                **{
-                    f"net_{label2}_bps": block["net_bps"]
-                    for label2, block in row["horizons"].items()
-                },
-                **{
-                    f"mean_{label2}_bps": block["mean_bps"]
-                    for label2, block in row["horizons"].items()
-                },
-            } for row in summary["rows"]],
-            directory / f"{args.stem}.csv",
-        )
-        markdown = render_markdown(summary, verdict)
-        (directory / f"{args.stem}.md").write_text(
-            "\n".join(markdown) + "\n", encoding="utf-8")
+        try:
+            write_json(payload, directory / f"{args.stem}.json")
+            write_csv(
+                [{
+                    "distance_bps": row["distance_bps"],
+                    "distance_ticks": row["distance_ticks"],
+                    "fills": row["fills"],
+                    "reach_pct": row["reach_pct"],
+                    "fills_per_min": row["fills_per_min"],
+                    **{
+                        f"net_{label2}_bps": block["net_bps"]
+                        for label2, block in row["horizons"].items()
+                    },
+                    **{
+                        f"mean_{label2}_bps": block["mean_bps"]
+                        for label2, block in row["horizons"].items()
+                    },
+                } for row in summary["rows"]],
+                directory / f"{args.stem}.csv",
+            )
+            markdown = render_markdown(summary, verdict)
+            (directory / f"{args.stem}.md").write_text(
+                "\n".join(markdown) + "\n", encoding="utf-8")
+        except OSError as exc:
+            # An unwritable report directory is an environment problem, never a
+            # measured verdict, so it must not exit with the "no" code.
+            print(f"usage: cannot write the report to {directory}: {exc}",
+                  file=sys.stderr)
+            return EXIT_USAGE
 
     if verdict["verdict"] == "CLEARS":
         return EXIT_CLEARS
