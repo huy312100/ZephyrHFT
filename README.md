@@ -1207,9 +1207,11 @@ That offset is what the fill rule produces, not a reading of the tape: this
 sample carries no prints, and under the `touch` model a resting order fills on
 the frame the opposite touch reaches its price, which leaves the mid exactly
 half a spread away by construction. The doc's §11.4 makes the same point at
-length. On the 55 fills that have a 60 s sample, the mean drifts from −0.328 to
+length. On the 55 fills that have a 60 s sample, the mean drifts from −0.334 to
 −0.709 bps — a −0.38 bps move on the same fills, not a comparison of two
-different populations.
+different populations. (The `h = 0` column is the starting point, not the 1 s
+mean: on those same 55 fills the 1 s mean is −0.155 bps, so quoting −0.328 here
+would mix a 227-fill average into a same-fill comparison.)
 
 The 1 s markout totals −2.23 USDT against the study's gross PnL of −2.05 USDT.
 This comparison is indicative only: the markout covers 227 of the study's 230
