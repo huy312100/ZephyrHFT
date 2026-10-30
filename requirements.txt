@@ -1,4 +1,13 @@
-PyYAML>=6.0,<7
-pybind11>=2.12,<4
+# The floor is CPython 3.9 (README, docs/phase1_roadmap.md, the py3.9 CI leg and
+# the interpreter the engine's wheel is built for). A pin that needs a newer
+# interpreter is not a maintenance win: it turns the py3.9 leg red and moves the
+# operator's runtime out from under the engine. The caps below are the last
+# releases that still install on 3.9, and .github/dependabot.yml parks the
+# majors that raise it. Raising the floor is a deliberate change to CI, the docs
+# and the built extension together, not a side effect of a version bump.
+PyYAML>=6.0.3,<7
+pybind11>=3.1.0,<4
+# pytest 9 requires >= 3.10.
 pytest>=8.0,<9
+# websockets 16 requires >= 3.10, 17 requires >= 3.11.
 websockets>=12.0,<16
