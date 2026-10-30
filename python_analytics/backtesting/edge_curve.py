@@ -331,10 +331,22 @@ def _t_stat(values: Sequence[float]) -> float:
     return _mean(values) / error
 
 
-def _block(values: Sequence[float], fee_bps: float) -> Dict[str, Any]:
+def _block(values: Sequence[float], fee_bps: float,
+           attempts: Optional[int] = None) -> Dict[str, Any]:
+    """Distribution of one horizon's edge, plus how many fills it could not mark.
+
+    ``attempts`` is the number of fills that reached this distance. A fill whose
+    target time lands in a hole in the timeline has no markout and is not
+    interpolated, so the difference is reported rather than silently shrinking
+    the sample: on a real capture those holes are not random — they cluster
+    around reconnects and violent moves, which is exactly when the fills that are
+    dropped happened.
+    """
     mean = _mean(values)
+    dropped = 0 if attempts is None else max(int(attempts) - len(values), 0)
     return {
         "samples": len(values),
+        "truncated": dropped,
         "mean_bps": mean,
         "median_bps": _median(values),
         "stdev_bps": _stdev(values),
@@ -421,7 +433,7 @@ def measure_edge_curve(scan: TapeScan, timeline: MarkoutTimeline,
             "reach_pct": 100.0 * count / matched if matched else 0.0,
             "fills_per_min": count / minutes if minutes > 0.0 else 0.0,
             "horizons": {
-                label: _block(samples[distance][label], config.maker_bps)
+                label: _block(samples[distance][label], config.maker_bps, count)
                 for label in labels
             },
         }
@@ -574,9 +586,9 @@ def render_markdown(summary: Mapping[str, Any], verdict: Mapping[str, Any]) -> L
         "",
         "## Curve",
         "",
-        f"| distance bps | ticks | fills | reach % | fills/min | {label} mean | "
-        f"median | t | win % | net of fee |",
-        "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+        f"| distance bps | ticks | fills | reach % | fills/min | {label} n | "
+        f"dropped | {label} mean | median | t | win % | net of fee |",
+        "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
     ])
     for row in summary.get("rows") or []:
         block = (row.get("horizons") or {}).get(label) or {}
@@ -586,12 +598,19 @@ def render_markdown(summary: Mapping[str, Any], verdict: Mapping[str, Any]) -> L
             f"{'—' if ticks is None else f'{float(ticks):.0f}'} | "
             f"{int(row['fills'])} | {float(row['reach_pct']):.2f}% | "
             f"{float(row['fills_per_min']):.2f} | "
+            f"{int(block.get('samples', 0) or 0)} | "
+            f"{int(block.get('truncated', 0) or 0)} | "
             f"{float(block.get('mean_bps', 0.0) or 0.0):+.2f} | "
             f"{float(block.get('median_bps', 0.0) or 0.0):+.2f} | "
             f"{float(block.get('t_stat', 0.0) or 0.0):+.2f} | "
             f"{float(block.get('win_rate_pct', 0.0) or 0.0):.1f}% | "
             f"{float(block.get('net_bps', 0.0) or 0.0):+.2f} |")
     lines.extend([
+        "",
+        "`dropped` counts the fills whose target time landed in a hole in the mid",
+        "timeline. They are excluded, never interpolated, and on a real capture they",
+        "are not a random subset: they cluster around reconnects and violent moves.",
+        "Read a row's `n` before its mean.",
         "",
         "## What this does not prove",
         "",

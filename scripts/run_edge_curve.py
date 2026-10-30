@@ -167,13 +167,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
           f"{', '.join(f'{value:g}' for value in config.distances_bps)} bps"
           + (f" | tick {config.tick_size:g}" if config.tick_size > 0 else ""))
     label = verdict["primary_horizon"]
-    print(f"| distance bps | fills | fills/min | {label} mean | net of fee |")
-    print("| --- | --- | --- | --- | --- |")
+    print(f"| distance bps | fills | fills/min | {label} n | {label} mean | net of fee |")
+    print("| --- | --- | --- | --- | --- | --- |")
     for row in summary["rows"]:
         block = row["horizons"][label]
         print(f"| {row['distance_bps']:g} | {row['fills']} | "
-              f"{row['fills_per_min']:.2f} | {block['mean_bps']:+.2f} | "
-              f"{block['net_bps']:+.2f} |")
+              f"{row['fills_per_min']:.2f} | {block['samples']} | "
+              f"{block['mean_bps']:+.2f} | {block['net_bps']:+.2f} |")
+    dropped = sum(row["horizons"][label]["truncated"] for row in summary["rows"])
+    if dropped:
+        print(f"note: {dropped} fill(s) had no mid inside the "
+              f"{config.tolerance_s:g} s tolerance and are excluded, not interpolated")
     print(f"verdict: {verdict['verdict']}")
     for reason in verdict["reasons"]:
         print(f"  - {reason}")

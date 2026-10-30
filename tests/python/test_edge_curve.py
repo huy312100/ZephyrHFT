@@ -295,6 +295,33 @@ def test_an_empty_tape_is_reported_as_no_data() -> None:
     assert verdict["distance_bps"] is None
 
 
+def test_a_fill_with_no_mid_after_it_is_dropped_and_counted() -> None:
+    """A hole in the timeline must shrink the sample visibly, never silently.
+
+    On a real capture the holes are not random — they cluster around reconnects
+    and violent moves, so a row that quietly reported the surviving fills would
+    report the calm ones and hide the episode the maker would actually have been
+    filled in.
+    """
+    lines = [
+        _snapshot(1_000, 99.99, 100.01),
+        _print(1_100, 99.99),
+        # Nothing for the next five seconds: the 1 s target has no sample
+        # inside the 2 s tolerance.
+        _snapshot(6_100, 99.99, 100.01),
+    ]
+    summary, _ = _curve(lines, _config(distances_bps=(0.5,), horizons_s=(0.0, 1.0)))
+    row = summary["rows"][0]
+    assert row["fills"] == 1
+    assert row["horizons"]["0s"]["samples"] == 1
+    assert row["horizons"]["1s"]["samples"] == 0
+    assert row["horizons"]["1s"]["truncated"] == 1
+
+    markdown = "\n".join(render_markdown(summary, edge_curve_verdict(summary, _config(
+        distances_bps=(0.5,), horizons_s=(0.0, 1.0)))))
+    assert "dropped" in markdown
+
+
 def test_a_print_constructor_refuses_a_missing_side() -> None:
     """A defaulted side would silently invert the sign of an edge."""
     with pytest.raises(ValueError):
