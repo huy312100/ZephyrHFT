@@ -713,6 +713,20 @@ def test_render_markdown_states_the_verdict_and_its_limits() -> None:
     assert verdict["verdict"] in markdown
     assert "What this does not prove" in markdown
     assert "| 1s | 3 |" in markdown
+    # No model was named, so the report does not invent one.
+    assert "Fill model" not in markdown
+
+
+def test_render_markdown_names_the_fill_model_it_was_given() -> None:
+    config = MarkoutConfig(horizons_s=(0.0, 1.0), min_samples=1)
+    rows, _ = _flat_rows([3.0, 3.5, 2.5])
+    summary = summarize_markouts(rows, config)
+    verdict = markout_verdict(summary, config)
+
+    markdown = "\n".join(render_markdown(summary, verdict, fill_model="queue"))
+
+    # The verdict is model-dependent, so the report has to say which model it is.
+    assert "Fill model: `queue`" in markdown
 
 
 # --------------------------------------------------------------------------- #
@@ -768,3 +782,14 @@ def test_cli_rejects_horizons_before_any_replay_runs() -> None:
 
     assert cli.main(["--horizons", "inf", "--no-report"]) == cli.EXIT_USAGE
     assert cli.main(["--horizons", "-1", "--no-report"]) == cli.EXIT_USAGE
+
+
+def test_the_markout_artefact_records_the_fill_model() -> None:
+    cli = _load_cli()
+    args = cli.parse_args(["--fill-model", "queue", "--no-report"])
+
+    payload = cli.build_payload(args, _parameters(), MarkoutConfig(horizons_s=(0.0, 1.0)),
+                                {}, {}, [])
+
+    # Two runs over the same archive with different models must be tellable apart.
+    assert payload["inputs"]["fill_model"] == "queue"

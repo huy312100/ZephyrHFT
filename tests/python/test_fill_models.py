@@ -161,17 +161,27 @@ def test_depth_only_archive_cannot_fabricate_tape_fills():
 
 def test_queue_model_fills_once_depth_at_the_price_is_consumed():
     engine = _engine(n.FillModel.QUEUE)
-    engine.process_update(_depth(1000, [("30000", "1.0")], [("30000.5", "1.0")]))
+    # A second bid keeps the book two-sided after 30000 is swept, so the last
+    # frame reaches ``match_resting_queue`` instead of returning at the BBO.
+    engine.process_update(
+        _depth(1000, [("30000", "1.0"), ("29999.5", "1.0")], [("30000.5", "1.0")]))
     assert _post(engine, n.Side.BUY, "30000", "0.5", 1000).accepted()
 
-    # Partial depletion only advances the queue.
-    engine.process_update(_depth(1100, [("30000", "0.6")], [("30000.5", "1.0")]))
+    # Partial depletion only advances the queue: 0.4 of the 1.0 ahead of us.
+    engine.process_update(
+        _depth(1100, [("30000", "0.6"), ("29999.5", "1.0")], [("30000.5", "1.0")]))
     assert _drain(engine) == []
 
-    # The level is removed: the observable traded volume clears the queue but
-    # leaves nothing behind it for a back-of-queue order.
-    engine.process_update(_depth(1200, [("30000", "0.0")], [("30000.5", "1.0")]))
+    # Depth is re-added: nothing traded, so the queue ahead of us is unchanged.
+    engine.process_update(
+        _depth(1200, [("30000", "1.0"), ("29999.5", "1.0")], [("30000.5", "1.0")]))
     assert _drain(engine) == []
+
+    # The level is swept: 1.0 traded clears the 0.6 still ahead of us and the
+    # remaining 0.4 reaches the order. Nothing behind it is left over.
+    engine.process_update(
+        _depth(1300, [("30000", "0.0"), ("29999.5", "1.0")], [("30000.5", "1.0")]))
+    assert _drain(engine) == [("30000.00000000", "0.40000000", 1)]
 
 
 def test_fill_model_survives_reset_and_is_reported():
@@ -221,6 +231,60 @@ def test_reframing_settles_instead_of_thrashing():
     for ts in range(1000, 2000, 100):
         engine.process_update(_depth(ts, [("81199.5", "1.5")], [("81200.0", "2.0")]))
     assert engine.metrics().book_recenters == 1
+
+
+def test_a_populated_book_re_anchors_when_the_feed_leaves_the_window():
+    """A book that holds levels is not safe: it can still go stale."""
+    engine = _engine(n.FillModel.TOUCH)
+    engine.process_update(_depth(1000, [("30000", "1.0")], [("30000.5", "1.0")]))
+    assert engine.metrics().book_recenters == 0
+
+    # The market gaps 3000 USDT, past the window's 2048. No level of this frame
+    # fits. The ladder used to stay put and keep publishing 30000/30000.5 as a
+    # valid BBO while rejecting every level of the live feed.
+    engine.process_update(_depth(1100, [("33000", "1.0")], [("33000.5", "1.0")]))
+    metrics = engine.metrics()
+    assert metrics.book_recenters == 1
+    assert metrics.rejected_levels == 0  # the frame landed, it was not refused
+    bbo = engine.bbo()
+    assert float(bbo.bid_price) == pytest.approx(33000.0)
+    assert float(bbo.ask_price) == pytest.approx(33000.5)
+
+
+def test_re_anchoring_keeps_the_levels_the_new_window_still_holds():
+    engine = _engine(n.FillModel.TOUCH)
+    engine.process_update(
+        _depth(1000, [("31000", "2.0"), ("29900", "3.0")], [("31000.5", "1.0")]))
+
+    # A one-sided frame 3000 USDT away re-anchors the window on 33000.5, so its
+    # span covers 30952.5 to 35048.5. The bid at 31000 and the ask at 31000.5
+    # still fit and are carried across; 29900 does not and is dropped.
+    engine.process_update(_depth(1100, [], [("33000.5", "1.0")]))
+    assert float(engine.center()) == pytest.approx(33000.5)
+
+    bbo = engine.bbo()
+    assert bbo.is_valid()
+    assert float(bbo.bid_price) == pytest.approx(31000.0)
+    # Retained makes it the *best* ask: the frame's 33000.5 is now the far one.
+    assert float(bbo.ask_price) == pytest.approx(31000.5)
+    assert engine.metrics().unpriced_frames == 0
+
+
+def test_one_implausible_level_does_not_drag_the_anchor():
+    """A stray price is a bad print, not evidence that the market has moved."""
+    engine = _engine(n.FillModel.TOUCH)
+    engine.process_update(_depth(1000, [("30000", "1.0")], [("30000.5", "1.0")]))
+
+    # The touch is 1000 -- far outside the window -- but every other level of the
+    # frame fits. Chasing it would move the anchor 29,000 away and lose the book
+    # for frames the market never actually left.
+    engine.process_update(_depth(
+        1100, [("30000", "1.0"), ("29999.5", "1.0")], [("1000", "1.0")]))
+    metrics = engine.metrics()
+    assert metrics.book_recenters == 0
+    assert float(engine.center()) == pytest.approx(30000.0)
+    assert metrics.rejected_levels == 1  # the bad level is reported, not chased
+    assert float(engine.bbo().bid_price) == pytest.approx(30000.0)
 
 
 def test_a_wrong_tick_is_reported_instead_of_hidden():

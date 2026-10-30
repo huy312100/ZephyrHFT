@@ -397,6 +397,41 @@ void test_json_parser() {
                                             bad_trade));
 }
 
+void test_json_parser_keeps_the_levels_nearest_the_touch() {
+    // A partial-book burst carries more levels than the update buffer holds, and
+    // the venue promises no ordering. Here the bids are listed ascending from
+    // 30,000, so keeping the first come-first-served would make the engine's
+    // "best bid" the lowest one in the frame rather than the real touch.
+    std::string json = "{\"e\":\"depthUpdate\",\"E\":1700000000000,\"U\":1,\"u\":2,";
+    json += "\"s\":\"BTCUSDT\",\"b\":[";
+    for (int i = 0; i < 40; ++i) {
+        json += (i == 0 ? "" : ",");
+        json += "[\"" + std::to_string(30000 + i) + ".0\",\"1.0\"]";
+    }
+    json += "],\"a\":[";
+    for (int i = 0; i < 40; ++i) {
+        json += (i == 0 ? "" : ",");
+        json += "[\"" + std::to_string(40000 + i) + ".0\",\"1.0\"]";
+    }
+    json += "]}";
+
+    hft::DepthUpdate update;
+    CHECK(hft::JsonFeedParser::parse_depth_update(json, update));
+    CHECK(update.bid_count == hft::kMaxDepthLevels);
+    CHECK(update.ask_count == hft::kMaxDepthLevels);
+    hft::Price::rep best_bid = 0;
+    for (std::uint32_t i = 0; i < update.bid_count; ++i) {
+        best_bid = std::max(best_bid, update.bids[i].price.raw());
+    }
+    hft::Price::rep best_ask = update.asks[0].price.raw();
+    for (std::uint32_t i = 1; i < update.ask_count; ++i) {
+        best_ask = std::min(best_ask, update.asks[i].price.raw());
+    }
+    CHECK(best_bid == P("30039").raw());  // the highest bid, not the first
+    CHECK(best_ask == P("40000").raw());  // the lowest ask, not the last
+    CHECK(update.bids[0].quantity == Q("1.0"));
+}
+
 void test_websocket_decoder() {
     std::uint8_t scratch[64]{};
     hft::WsFrameView view;
@@ -1548,6 +1583,7 @@ int main() {
     test_risk_guard();
     test_latency_histogram();
     test_json_parser();
+    test_json_parser_keeps_the_levels_nearest_the_touch();
     test_websocket_decoder();
     test_l2_clear_resets_timestamps();
     test_crossing_limit_fill_preserves_price();

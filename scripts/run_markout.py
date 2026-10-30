@@ -242,6 +242,7 @@ def build_payload(args: argparse.Namespace, parameters: LockedParameters,
         "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "inputs": {
             "mode": "fills" if args.fills else "replay",
+            "fill_model": str(args.fill_model),
             "sources": [str(path) for path in resolve_sources(args.source)],
             "lock_file": str(args.lock_file),
             "lock_fingerprint": parameters.fingerprint,
@@ -288,7 +289,8 @@ def run(args: argparse.Namespace) -> int:
     if args.fills:
         print(f"  fills         : {args.fills} (clock={args.clock})")
     else:
-        print(f"  window_events : {args.window_events or 'per-archive'}"
+        print(f"  replay        : {args.fill_model} fill model"
+              f"  window_events {args.window_events or 'per-archive'}"
               f"  frames_per_hook {args.frames_per_hook}")
     print("-" * 100)
 
@@ -331,8 +333,11 @@ def run(args: argparse.Namespace) -> int:
                              report_dir / f"{args.stem}_fills.csv")
         markdown_path = report_dir / f"{args.stem}.md"
         markdown_path.parent.mkdir(parents=True, exist_ok=True)
-        markdown_path.write_text("\n".join(render_markdown(summary, verdict)) + "\n",
-                                 encoding="utf-8")
+        markdown_path.write_text(
+            "\n".join(render_markdown(summary, verdict,
+                                      fill_model=None if args.fills else args.fill_model))
+            + "\n",
+            encoding="utf-8")
         print("-" * 100)
         print(f"  wrote: {json_path}")
         print(f"  wrote: {markdown_path}")

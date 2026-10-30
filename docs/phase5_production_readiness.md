@@ -959,27 +959,55 @@ unnoticed. `TradingEngine` (the live path) had the identical defect: it
 configured the book once from `EngineConfig` and never re-anchored.
 
 Both engines now re-anchor. `reframe_anchor()` (in `orderbook.hpp`) moves the
-window onto the frame's own touch when *and only when* the book is blind and the
-frame carries a price the window cannot hold. Three properties matter:
+window onto the frame's own touch when the frame carries a price the window
+cannot hold. Four properties matter:
 
+- **The test is the frame, not the book.** The first version of this rule only
+  fired while the book was *blind* (one side empty). That leaves the second
+  failure open: once the ladder holds levels it is no longer blind, so a market
+  that leaves the window again is rejected in full while the old, believable
+  BBO keeps being published to the quoting and matching paths — and
+  `unpriced_frames` stays at zero, so nothing looks wrong. A populated book
+  that cannot hold the frame is exactly as useless as an empty one, so the rule
+  now fires for it too.
 - **The tick is never guessed.** It is the venue's grid; a tick that does not
-divide the venue's prices is a configuration error. Faking a finer grid would
+  divide the venue's prices is a configuration error. Faking a finer grid would
   hide it, so instead `metrics.unpriced_frames` exposes it.
 - **The rule is idempotent.** Once the anchor equals the frame's touch it returns
   "no move", so an unrepresentable grid cannot make the book clear itself on
   every frame.
+- **Depth is carried across.** `recenter()` keeps every level the new window can
+  still hold instead of dropping the lot, and the swap is published through the
+  seqlock so a reader never sees a half-rebuilt book. What cannot fit is gone —
+  and because the default `depth@100ms` feed is a *diff* stream, a dropped level
+  is not repeated until it changes. After a re-anchor that loses depth, a live
+  deployment must reseed from a REST snapshot (`seed_from_snapshot`) instead of
+  trusting the near touch; the `depth20@100ms` partial-book stream is a
+  snapshot-style exception and does not make the diff path safe.
+- **A frame is truncated toward the touch, not from the front.** `DepthUpdate`
+  holds `kMaxDepthLevels` (32) levels per side, but a partial-book burst on this
+  feed carries hundreds — one frame here listed 407 bids and 440 asks — and the
+  venue promises no ordering: those bids arrived *ascending*, starting at
+  `30 895`. Keeping the first 32 therefore discarded the real touch, and the
+  parser's "best bid" became a price ~800 USDT below the market — which the
+  re-anchor rule above then dutifully chased: 78 re-anchors and 37 unpriced
+  frames on the same archive. `parse_levels` now keeps the highest bids and the
+  lowest asks, evicting the furthest level instead, because the touch is the only
+  quantity the engine reads. `test_json_parser_keeps_the_levels_nearest_the_touch`
+  pins it.
 - **It is observable.** `book_recenters`, `rejected_levels` and
   `unpriced_frames` are carried through `ReplaySummary` into
   `aggregate`, and printed on the study's own summary line:
 
 ```
-fills 130 under the trade model | tape 6290 print(s) | book: 1 unpriced frame(s), 4 re-anchor(s)
+fills 147 under the trade model | tape 6290 print(s) | book: 1 unpriced frame(s), 4 re-anchor(s)
 ```
 
 `rejected_levels` alone is not a health signal — a real feed legitimately quotes
 levels thousands of ticks away (this capture carried one at `1000.00`), and they
 are all dropped by design. One unpriced frame out of 1,466 means the book was the
-market for 99.93 % of the capture; 24,303 rejected levels are the far ones.
+market for 99.93 % of the capture; the 7,864 rejected levels are the far ones,
+not the touch.
 
 #### 11.6.3 Touch versus tape, on real prints
 
@@ -988,55 +1016,67 @@ tick `0.10`, seed centre `80000`), 4 windows of 2,000 events:
 
 | model | fills | trades | net PnL | fees | **before fees** |
 | --- | --- | --- | --- | --- | --- |
-| `touch` | 78 | 24 | `-28.26` | `12.69` | `-15.57` |
-| `trade` | 130 | 59 | `-10.96` | `10.12` | `-0.83` |
+| `touch` | 61 | 8 | `-9.32` | `9.93` | `+0.61` |
+| `trade` | 147 | 45 | `-7.64` | `8.09` | `+0.45` |
 
 Two things changed with the model, and both matter:
 
-1. The tape model fills **more** often (130 vs 78): a print at the quote fills an
+1. The tape model fills **more** often (147 vs 61): a print at the quote fills an
    order the touch model cannot see, so the legacy model was not "conservative",
-   it was measuring a different (and rarer) event.
-2. Loss per trade fell from `-1.18` to `-0.19` USDT, and pre-fee PnL went from
-   `-15.57` to `-0.83` — nearly flat. The old number was mostly an artefact.
+   it was measuring a different (and rarer) event. It also completes five times
+   as many round trips (45 vs 8), which is why its numbers mean more.
+2. Loss per trade fell from `-1.16` to `-0.17` USDT, and pre-fee PnL is `+0.61`
+   (touch) against `+0.45` (trade): at this sample size the strategy captures
+   slightly *more* than nothing before the fee, and the whole loss is the `2 bps`
+   maker charge. The earlier `-15.57` was mostly a symptom of the phantom anchor
+   described in §11.6.2, not of the strategy.
 
 The markout study tells the same story with more resolution:
 
 | model | h=0 mean | h=0 median | h=0 sd | win % | h=1s mean | t | verdict |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| `touch` | `-6.877 bps` | `-1.510` | `16.48` | 23.3 | `-11.246` | `-2.63` | INCONCLUSIVE (n=22) |
-| `trade` | `-0.452 bps` | `+0.092` | `1.85` | 71.6 | `-1.760` | `-3.40` | ADVERSE_SELECTION |
+| `touch` | `+0.139 bps` | `+0.086` | `0.61` | 57.1 | `-0.412` | `-4.91` | INCONCLUSIVE (n=6) |
+| `trade` | `+0.232 bps` | `+0.092` | `0.36` | 100.0 | `-0.404` | `-11.92` | INCONCLUSIVE (n=28) |
 
-Under the tape model the shape of the loss becomes visible: **the median fill is
-profitable** (`+0.09 bps`, 71.6 % of fills positive at `h=0`) while the mean is
-negative. That is the signature of a toxic tail — a minority of fills are run
-over hard enough to pay for the majority that are fine. The legacy model could
-never show this: it only ever sampled the tail.
+Both models agree on the shape, and it is not a tail. At `h=0` every tape-model
+fill is positive (100 % win) because the fill is marked against the mid it was
+quoted *away* from — that number measures the quote offset, not an edge. One
+second later every single fill is negative (`-0.404 bps`, 0 % win, `t = -11.92`):
+**the capture decays to nothing inside the marking window**, uniformly, rather
+than being destroyed by a minority of toxic prints. Neither column clears the
+`30`-sample bar, so both verdicts stay INCONCLUSIVE — the 1 s sign is
+consistent (45/45 → 0/28 positive) but it is still one 151 s capture.
 
-It also sharpens the conclusion. The strategy is not "wrong"; it is
+The conclusion it sharpens: the strategy is not "wrong", it is
 **mis-priced against its own fee**:
 
-- `h=0` net after `2 bps` maker = `-2.45 bps` per fill.
-- `h=1s` net after `2 bps` maker = `-3.76 bps` per fill.
+- `h=0` net after `2 bps` maker = `-1.77 bps` per fill.
+- `h=1s` net after `2 bps` maker = `-2.40 bps` per fill.
 - To break even on a `2 bps` fee, the fill needs `> +2 bps` of markout edge; it
-  delivers `+0.09 bps` at the median and `-1.76 bps` at the mean.
+  delivers `+0.23 bps` at `h=0` and `-0.40 bps` at the horizon that matters.
 
 #### 11.6.4 The OFI knob does not rescue it (yet)
 
 The strategy carries `ofi_sensitivity` (order-flow-imbalance coupling), disabled
 at `0.0` in the lock. Swept on this capture with the tape model:
 
-| `ofi_sensitivity` | trades | net PnL |
-| --- | --- | --- |
-| `0.0` | 59 | `-10.96` |
-| `0.5` | 86 | `-14.26` |
-| `1.0` | 111 | `-17.10` |
-| `2.0` | 95 | `-16.61` |
-| `4.0` | 102 | `-16.61` |
+| `ofi_sensitivity` | fills | trades | net PnL | gross edge |
+| --- | --- | --- | --- | --- |
+| `0.0` (locked) | 147 | 45 | `-7.64` | `+0.110 bps` |
+| `0.5` | 172 | 51 | `-7.88` | `-0.132 bps` |
+| `1.0` | 175 | 50 | `-8.66` | `-0.318 bps` |
+| `2.0` | 153 | 44 | `-10.25` | `-0.489 bps` |
+| `4.0` | 188 | 57 | `-10.59` | `-0.556 bps` |
 
-It makes the loss larger at every setting: wider skew means more quotes that
-either never fill or fill in the wrong direction. With 151 s of data this is a
-hint, not a finding — fitting a toxicity filter needs hours of tape and a proper
-in-sample/out-of-sample split, which is exactly what §11.5.2 asks for.
+It makes things worse at every setting: the skew does add fills (147 → 188) but
+it takes the pre-fee capture from `+0.11 bps` to `-0.56 bps`, so it is buying
+fills that lose money. One caveat on the sweep itself: `--from-lock` makes the
+lock file the single source of truth and *ignores* CLI overrides, so these rows
+are run with explicit `--k 1.5 --gamma 0.1 --tick-size 0.1 --center 80000
+--maker-bps 2 --taker-bps 5 --ofi-sensitivity ...` and no lock. With 151 s of
+data this is a hint, not a finding — fitting a toxicity filter needs hours of
+tape and a proper in-sample/out-of-sample split, which is exactly what §11.5.2
+asks for.
 
 #### 11.6.5 What this leaves as the next decision
 
@@ -1046,14 +1086,15 @@ PnL is stamped with the model and grid that produced it. The remaining gap is
 commercial, not engineering, and the options are ordered by what the evidence
 supports:
 
-1. **Fix the fee.** `+0.09 bps` of median capture against a `2 bps` maker fee is
-   not a parameter problem. Either reach a fee tier where the spread clears
-   (VIP/BNB discounts, or a rebate venue), or trade a book whose spread is
+1. **Fix the fee.** `+0.23 bps` of mean capture at `h=0` against a `2 bps` maker
+   fee is not a parameter problem. Either reach a fee tier where the capture
+   clears (VIP/BNB discounts, or a rebate venue), or trade a book whose spread is
    several bps wide. This is the only lever that moves the sign.
-2. **Attack the toxic tail.** The loss is concentrated in ~28 % of fills. A
-   working toxicity filter (OFI, micro-price, trade-size imbalance) has to cut
-   those without cutting the 71 % that pay. Needs hours of tape; the sweep in
-   §11.6.4 is the shape of the experiment, not its answer.
+2. **Attack the decay.** The `h=0 → 1s` flip is uniform (100 % → 0 % positive),
+   not a fat tail, so a filter cannot fix it by dropping bad fills — it has to
+   change *when the quote is present*, i.e. predict the mid move rather than
+   select among fills. Needs hours of tape; the sweep in §11.6.4 is the shape of
+   the experiment, not its answer.
 3. **Accumulate data.** 151 s cannot separate alpha from noise. `ingest_l2.py`
    already runs for days (reconnects, rotation, graceful drain); the study just
    needs the archive.
@@ -1098,28 +1139,42 @@ rows are not a locked study):
 
 | `k` | half-spread | fills | trades | pre-fee PnL | **gross edge** | net at 2 bps |
 | --- | --- | --- | --- | --- | --- | --- |
-| `1.5` (locked) | `0.08 bps` | 130 | 59 | `-0.84` | `-0.164 bps` | `-10.96` |
-| `0.2` | `0.50 bps` | 91 | 42 | `+0.08` | `+0.018 bps` | `-8.24` |
-| `0.05` | `1.35 bps` | 96 | 32 | `+1.40` | `+0.339 bps` | `-6.85` |
-| `0.018` | `2.31 bps` | 63 | 16 | `+1.66` | `+0.606 bps` | `-3.81` |
-| `0.006` | `3.53 bps` | 41 | 9 | `+1.68` | **`+1.015 bps`** | `-1.63` |
-| `0.002` | `4.83 bps` | 11 | 1 | `-0.91` | `-1.828 bps` | `-1.90` |
-| `0.0008` | `5.94 bps` | 7 | 0 | `-1.14` | `-3.430 bps` | `-1.81` |
+| `1.5` (locked) | `0.08 bps` | 147 | 45 | `+0.45` | `+0.110 bps` | `-7.64` |
+| `0.2` | `0.50 bps` | 117 | 19 | `+0.91` | `+0.259 bps` | `-6.09` |
+| `0.05` | `1.35 bps` | 73 | 9 | `+2.07` | `+0.848 bps` | `-2.81` |
+| `0.018` | `2.31 bps` | 36 | 0 | `+2.57` | `+1.264 bps` | `-1.50` |
+| `0.006` | `3.53 bps` | 28 | 0 | `+2.18` | `+1.916 bps` | `-0.10` |
+| `0.002` | `4.83 bps` | 11 | 0 | `+1.59` | `+2.441 bps` | `+0.29` |
+| `0.0008` | `5.94 bps` | 11 | 0 | `+1.01` | `+3.096 bps` | `+0.36` |
 
-The shape is the finding:
+The shape is the finding, and it is not the shape a parameter search would want:
 
-* Widening the quotes **works** up to a point. Gross edge climbs from
-  `-0.16 bps` to `+1.02 bps` as the half-spread goes from 0.08 to 3.5 bps,
-  because the fill now carries something worth having.
-* Then it **inverts**. At a 4.8 bps half-spread the only prints that reach the
-  quote are the ones the mid is genuinely travelling towards, and the gross
-  edge is `-1.8 bps`; at 5.9 bps out it is `-3.4 bps` on 7 fills. Quoting wider
-  buys adverse selection faster than it buys spread.
-* The peak, `+1.015 bps`, is **half of the retail fee**. Best case, this
-  strategy donates `~1 bps` of every unit of notional it trades.
+* Gross edge climbs monotonically, `+0.11 bps` at the locked width to
+  `+3.10 bps` at the widest — but the fill count falls from 147 to 11 and the
+  completed round trips from 45 to **zero** over the same range.
+* From `k = 0.018` down nothing closes inside a window: every fill stays open
+  until the window boundary flattens it, so the PnL is a mark, not a trade. The
+  two positive net rows are 11 one-way fills with 0 round trips, and their gross
+  edge is computed against 3,254–6,509 USDT of notional that barely moved. That
+  is not a measured edge; it is a small sample divided by a small denominator.
+* Among the widths that still complete round trips (`k >= 0.05`), the capture is
+  `+0.11 … +0.85 bps` and net is negative at every single row.
 
-So the break-even maker fee on this tape is at most **~1.0 bps**, and the
-locked configuration's is `-0.30 bps` (it loses money before fees).
+So the break-even maker fee on this tape is at most **~0.85 bps** at a width that
+still completes trades, and `+0.110 bps` at the locked `k` — against a retail
+maker fee of `2.0 bps`. The earlier reading of a `+1.015 bps` peak was measured
+before the depth parser kept the levels nearest the touch (§11.6.2); the peak it
+found was traded against a phantom book and does not survive the fix.
+
+Two different runs feed the numbers in this section, and they are not
+interchangeable. Every `+0.110 bps` above comes from the real archive; the
+`-0.299 bps` that §11.7.3 shows in the gate's output is the committed *sample*
+study, a different dataset:
+
+| Run | Data | Fills / trades | Notional | Pre-fee | Gross edge |
+| --- | --- | --- | --- | --- | --- |
+| Real tape, locked `k` | the 151 s archive, tick `0.1` | 147 / 45 | `40,444.89 USDT` | `+0.445` | `+0.110 bps` |
+| Committed sample study | `data/sample_events.ndjson`, tick `0.5`, centre `30,000` | 229 / 105 | `68,664.88 USDT` | `-2.050` | `-0.299 bps` |
 
 #### 11.7.3 What the code now reports
 
@@ -1133,7 +1188,7 @@ break-even fee is now a first-class number:
 * `walk_forward` — the aggregate carries `gross_edge_bps`, the console prints
 
   ```
-  fee wall: gross edge -0.165 bps vs 2 bps maker fee | break-even maker fee -0.165 bps
+  fee wall: gross edge +0.110 bps vs 2 bps maker fee | break-even maker fee +0.110 bps
   ```
 
   and the markdown gains `Gross edge (pre-fee)` and `Break-even maker fee` rows.
@@ -1157,20 +1212,23 @@ meeting.
 
 #### 11.7.4 The decision this forces
 
-1. **The fee tier is the business case, not a detail.** `1.0 bps` is the ceiling
-   this edge can pay on this instrument, measured on real prints. Retail VIP 0
-   charges `2.0 bps`. Only a materially better maker rate — a high volume tier,
-   a market-maker/rebate programme, or a venue whose quoted spread is a few bps
-   wide — clears it. No parameter set moves the sign on its own: `k` widens the
-   edge by `~1.2 bps` in total before it turns around.
-2. **The peak needs confirming on more data.** 151 s produced 41 fills at the
-   peak and one directional sample; `+1.02 bps` could still be drift. The fee
-   wall does not depend on that sample (it comes from the spread and the fee
-   schedule), but the peak does, so accumulating hours of tape is still the
-   prerequisite for quoting at the peak width.
+1. **The fee tier is the business case, not a detail.** `+0.11 … +0.85 bps` is
+   the ceiling this edge can pay on this instrument at a width that still
+   completes round trips. Retail VIP 0 charges `2.0 bps`. Only a materially
+   better maker rate — a high volume tier, a market-maker/rebate programme, or a
+   venue whose quoted spread is a few bps wide — clears it. No parameter set
+   moves the sign on its own: `k` widens the capture by `~0.74 bps` in total
+   before the trade count collapses to zero.
+2. **The wide end is unmeasured, not better.** The only rows whose net PnL is
+   positive (`k = 0.002` and `0.0008`) hold 11 fills and 0 completed round trips
+   apiece; they are a boundary mark on a position that never round-tripped, so
+   they cannot be read as an edge. Either way the fee wall does not depend on
+   them — it comes from the spread and the fee schedule §11.7.1 — but the shape
+   does, so accumulating hours of tape is still the prerequisite for quoting at
+   the peak width.
 3. **Everything else is second order.** Toxicity filters, micro-price and OFI
-   skew act on a `~1 bps` edge against a `2 bps` cost. They are worth building
-   once the edge is larger than the fee, not before.
+   skew act on a `0.1–0.8 bps` capture against a `2 bps` cost. They are worth
+   building once the edge is larger than the fee, not before.
 
 With `alpha.fee_wall` in the report, the promotion checklist in §10 cannot pass
 a study whose edge is smaller than the fee it will be charged, and the number

@@ -130,7 +130,7 @@ public:
 
     void process_update(const DepthUpdate& update) noexcept {
         const Nanos start = now_ns();
-        reframe_if_blind(update);
+        reframe_if_out_of_window(update);
         for (std::uint32_t i = 0; i < update.bid_count; ++i) {
             if (!book_.apply_level(Side::Buy, update.bids[i].price,
                                    update.bids[i].quantity, update.exchange_ts)) {
@@ -330,16 +330,18 @@ public:
     [[nodiscard]] std::size_t pending_fills() const noexcept { return fill_count_; }
     [[nodiscard]] Price tick_size() const noexcept { return book_.tick_size(); }
     // The window the ladder is anchored on *now*; it follows the feed when the
-    // configured centre cannot hold it (see ``reframe_if_blind``).
+    // configured centre cannot hold it (see ``reframe_if_out_of_window``).
     [[nodiscard]] Price center() const noexcept { return center_; }
 
 private:
     // A ladder anchored on a stale constant rejects every level of a live feed
     // and reports an empty book, which is indistinguishable from a quiet market.
-    // ``reframe_anchor`` decides from the frame itself whether that is what is
-    // happening; moving the window is safe here because a blind ladder holds no
-    // levels to lose, and the venue's absolute levels rebuild it next frame.
-    void reframe_if_blind(const DepthUpdate& update) noexcept {
+    // ``reframe_anchor`` decides from the frame itself whether the window can
+    // no longer hold it; a populated ladder is reframed too, because rejecting
+    // the whole frame would keep publishing its stale BBO to the strategy.
+    // ``recenter`` carries across the levels still representable, and the venue's
+    // absolute levels rebuild the rest on the next frames.
+    void reframe_if_out_of_window(const DepthUpdate& update) noexcept {
         const Price anchor = reframe_anchor(book_, update);
         if (anchor.raw() <= 0) {
             return;

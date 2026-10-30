@@ -160,7 +160,7 @@ public:
     }
 
     void apply_depth(const DepthUpdate& update) noexcept {
-        reframe_if_blind(update);
+        reframe_if_out_of_window(update);
         for (std::uint32_t i = 0; i < update.bid_count; ++i) {
             const bool applied =
                 book_.apply_level(Side::Buy, update.bids[i].price, update.bids[i].quantity,
@@ -470,10 +470,11 @@ private:
 
     // A live book whose ladder is anchored on a stale constant is blind: it
     // rejects every level and looks like a quiet market while quoting against
-    // nothing. ``reframe_anchor`` says when a frame proves the anchor is wrong;
-    // the tree is re-based on the feed's own touch. Re-anchoring drops the old
-    // levels, which the venue's absolute-level feed rebuilds on the next frames.
-    void reframe_if_blind(const DepthUpdate& update) noexcept {
+    // nothing. ``reframe_anchor`` says when a frame proves the window is wrong;
+    // the tree is re-based on the feed's own touch. A populated ladder is
+    // reframed as well -- keeping its stale BBO is worse than losing depth --
+    // and ``recenter`` carries across the levels the new window still holds.
+    void reframe_if_out_of_window(const DepthUpdate& update) noexcept {
         const Price anchor = reframe_anchor(book_, update);
         if (anchor.raw() <= 0) {
             return;

@@ -1052,9 +1052,15 @@ def _format_horizon_row(label: str, stats: Mapping[str, Any], fee_bps: float) ->
     )
 
 
-def render_markdown(summary: Mapping[str, Any],
-                    verdict: Mapping[str, Any]) -> List[str]:
-    """Renders a study-grade markdown report (no terminal-width assumptions)."""
+def render_markdown(summary: Mapping[str, Any], verdict: Mapping[str, Any],
+                    fill_model: Optional[str] = None) -> List[str]:
+    """Renders a study-grade markdown report (no terminal-width assumptions).
+
+    ``fill_model`` names the maker model the fills were reproduced under. It is
+    not part of ``summary`` -- the vocabulary is the engine's, not the study's --
+    but a markout that cannot say which model produced its fills cannot be
+    compared with another one.
+    """
     known = MarkoutConfig.__dataclass_fields__
     config = MarkoutConfig(**{
         key: value for key, value in (summary.get("config") or {}).items()
@@ -1071,12 +1077,20 @@ def render_markdown(summary: Mapping[str, Any],
         f"Horizons: {', '.join(horizon_label(h) for h in config.horizons_s)} "
         f"(tolerance {config.tolerance_s:g} s, maker fee {fee:.2f} bps).",
         "",
+    ]
+    if fill_model:
+        lines.extend([
+            f"Fill model: `{fill_model}` -- the maker model that produced every "
+            "fill marked below.",
+            "",
+        ])
+    lines.extend([
         "## Verdict",
         "",
         f"**{verdict['verdict']}** at {verdict['primary_horizon']} "
         f"({verdict['samples']} maker fills, t={verdict['t_stat']:+.2f}).",
         "",
-    ]
+    ])
     lines.extend(f"- {reason}" for reason in verdict.get("reasons", []))
     lines.extend([
         "",

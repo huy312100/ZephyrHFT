@@ -255,6 +255,9 @@ template <std::size_t MaxTicks = 8192>
 class alignas(64) L2OrderBook {
 public:
     static constexpr std::size_t kMaxTicks = MaxTicks;
+    // Depth carried across a re-anchor. Every level the new window can still
+    // hold is kept; this bounds the copy, not the book.
+    static constexpr std::size_t kRetainedLevels = 64;
 
     L2OrderBook() noexcept = default;
     L2OrderBook(Price tick_size, Price center) noexcept { configure(tick_size, center); }
@@ -263,22 +266,36 @@ public:
 
     void configure(Price tick_size, Price center) noexcept {
         begin_write();
-        bid_.configure(tick_size, center, true);
-        ask_.configure(tick_size, center, false);
-        last_exchange_ts_ = 0;
-        last_recv_ts_ = 0;
-        last_sequence_ = 0;
-        updates_ = 0;
+        configure_owned(tick_size, center);
         end_write();
     }
 
-    // Re-anchors the price window on `center`, keeping the tick. The levels are
-    // dropped: the grid they were indexed on no longer exists, and the venue's
-    // absolute-level feed rebuilds them on the next frames. A ladder anchored on
-    // a stale constant is blind -- it accepts nothing and reports an empty book
-    // rather than a bad price, which is the failure this method exists to undo.
+    // Re-anchors the price window on `center`, keeping the tick. Levels the new
+    // window can still hold are carried across, so a re-anchor does not throw
+    // away depth it could keep; anything outside the new window is dropped,
+    // because the grid it was indexed on no longer exists.
+    //
+    // A ladder anchored on a stale constant is blind -- it accepts nothing and
+    // reports an empty book rather than a bad price, which is the failure this
+    // method exists to undo. Note that a *diff* depth feed only repeats a level
+    // when it changes, so a dropped level is not rebuilt on its own: after a
+    // re-anchor that loses depth, a live deployment must reseed from a REST
+    // snapshot (``seed_from_snapshot``) rather than trust the near touch.
     void recenter(Price center) noexcept {
-        configure(Price::from_raw(bid_.tick_raw()), center);
+        const Price tick = Price::from_raw(bid_.tick_raw());
+        std::array<BookLevel, kRetainedLevels> bids{};
+        std::array<BookLevel, kRetainedLevels> asks{};
+        const std::size_t bid_count = bid_.walk(bids.data(), bids.size());
+        const std::size_t ask_count = ask_.walk(asks.data(), asks.size());
+        begin_write();
+        configure_owned(tick, center);
+        for (std::size_t i = 0; i < bid_count; ++i) {
+            (void)bid_.set(bids[i].price, bids[i].quantity.raw());  // false = outside
+        }
+        for (std::size_t i = 0; i < ask_count; ++i) {
+            (void)ask_.set(asks[i].price, asks[i].quantity.raw());
+        }
+        end_write();
     }
 
     [[nodiscard]] Price center() const noexcept {
@@ -427,6 +444,16 @@ public:
 private:
     using Ladder = detail::LadderSide<MaxTicks>;
 
+    // The write half of ``configure``, for callers already holding the seqlock.
+    void configure_owned(Price tick_size, Price center) noexcept {
+        bid_.configure(tick_size, center, true);
+        ask_.configure(tick_size, center, false);
+        last_exchange_ts_ = 0;
+        last_recv_ts_ = 0;
+        last_sequence_ = 0;
+        updates_ = 0;
+    }
+
     [[nodiscard]] const Ladder& ladder(Side side) const noexcept {
         return side == Side::Buy ? bid_ : ask_;
     }
@@ -469,52 +496,83 @@ private:
 
 using L2Book = L2OrderBook<8192>;
 
-// Whether a depth frame proves the ladder is anchored on a stale price, and if so
-// where it must move.
+// Whether a depth frame proves the ladder is anchored on a price the window can
+// no longer hold, and if so where it must move.
 //
 // A ladder covers `center +/- kHalf` ticks. Anchor it on a constant that the
 // live market has left behind and every level is rejected while `top()` keeps
 // returning an empty book -- a failure that looks exactly like a quiet market,
-// so it can survive a whole study unnoticed. When a side has no levels *and*
-// this frame carries a touch the window cannot hold, the anchor is demonstrably
-// wrong; the frame's own touch is the only evidence available about where the
-// market is.
+// so it can survive a whole study unnoticed. The book that is merely out of date
+// is worse: once it holds levels it is no longer ``blind()``, so the next time
+// the market leaves the window it rejects the whole frame while still publishing
+// that believable -- and wrong -- BBO to the quoting and matching paths, with
+// ``unpriced_frames`` at zero. The test is therefore the frame, not the book:
+// when this frame carries a touch the window cannot hold, the anchor is
+// demonstrably wrong whatever the ladder currently contains. The frame's own
+// touch is the only evidence available about where the market is.
 //
 // The tick is never touched: it is the venue's grid, and a wrong tick has to
 // stay visible (as rejected levels) instead of being guessed around. The rule is
 // idempotent -- once the anchor equals the frame's touch it returns zero -- so an
 // unrepresentable grid cannot make the book thrash, clearing itself every frame.
+// Two conditions are required as evidence, not one: the touch must be outside
+// *and* most of the frame must be unrepresentable, so a corrupt print cannot
+// drag the book onto a price the market never traded at.
 //
 // Returns the price to re-anchor on, or a default (zero) Price for "no move".
 template <std::size_t MaxTicks>
 [[nodiscard]] inline Price reframe_anchor(const L2OrderBook<MaxTicks>& book,
                                           const DepthUpdate& update) noexcept {
-    if (!book.blind()) {
-        return Price{};
-    }
     Price best_bid{};
     Price best_ask{};
     bool has_bid = false;
     bool has_ask = false;
+    // How much of this frame the current window can hold. The touch alone is not
+    // evidence: real captures carry stray levels thousands of ticks away, and a
+    // frame with one implausible price would otherwise drag the anchor onto a
+    // corrupt level and lose the whole book with it.
+    std::uint32_t levels = 0;
+    std::uint32_t held = 0;
     for (std::uint32_t i = 0; i < update.bid_count; ++i) {
         const LevelDelta& level = update.bids[i];
-        if (level.quantity.raw() > 0 && (!has_bid || level.price.raw() > best_bid.raw())) {
+        if (level.quantity.raw() <= 0) {
+            continue;
+        }
+        ++levels;
+        if (book.contains(level.price)) {
+            ++held;
+        }
+        if (!has_bid || level.price.raw() > best_bid.raw()) {
             best_bid = level.price;
             has_bid = true;
         }
     }
     for (std::uint32_t i = 0; i < update.ask_count; ++i) {
         const LevelDelta& level = update.asks[i];
-        if (level.quantity.raw() > 0 && (!has_ask || level.price.raw() < best_ask.raw())) {
+        if (level.quantity.raw() <= 0) {
+            continue;
+        }
+        ++levels;
+        if (book.contains(level.price)) {
+            ++held;
+        }
+        if (!has_ask || level.price.raw() < best_ask.raw()) {
             best_ask = level.price;
             has_ask = true;
         }
     }
-    if (!has_bid && !has_ask) {
+    if (levels == 0) {
         return Price{};
     }
     if ((!has_bid || book.contains(best_bid)) && (!has_ask || book.contains(best_ask))) {
         return Price{};  // the window can hold this frame: nothing is wrong yet
+    }
+    // The touch is outside the window. Move the anchor only when most of the frame
+    // cannot be held either -- a lone bad price is a bad print, not proof that the
+    // market has left -- unless the book is blind, in which case it has nothing to
+    // lose and nothing to keep it right.
+    if (!book.blind() && static_cast<std::uint64_t>(held) * 2 > levels) {
+        return Price{};
     }
     // Mid of whatever sides this frame touches, floored onto the tick grid.
     const Price::rep mid = has_bid && has_ask

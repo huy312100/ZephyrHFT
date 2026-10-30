@@ -7,7 +7,7 @@ network/feed latency from the venue event time (``E``, falling back to ``T``)
 and appends the byte-exact payload to gzip-compressed NDJSON roll files under
 ``data_ingestion.storage_path`` (``data/raw_l2`` by default).
 
-With ``data_ingestion.aux_streams`` set (``aggTrade`` by default in
+With ``data_ingestion.aux_streams`` set (``trade`` by default in
 ``config/settings.yaml``) the socket is the *combined* one, so trade prints are
 archived interleaved with the depth frames they moved. That is what a
 ``--fill-model trade`` backtest needs: a depth snapshot alone can never show
