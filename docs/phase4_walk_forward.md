@@ -535,24 +535,30 @@ tick 0.50):
 | Windows / events | 2 / 800 |
 | Parameter lock | `b29a62ed93caf69a`, 4 checks (2 pre + 2 post) |
 | Chronology checks | 1 (one boundary) |
-| Net PnL | `-16.4743` (`-0.0165%`) |
-| Realized / boundary / unrealized | `-16.1119` / `-0.4291` / `-0.3624` |
-| Fees paid | `+13.73` on `68,664.89` notional (2 bps maker, 5 bps taker) |
+| Net PnL | `-15.7830` (`-0.0158%`) |
+| Realized / boundary / unrealized | `-15.4417` (of which `-0.3929` boundary) / `-0.3413` |
+| Fees paid | `+13.7330` on `68,664.88` notional (2 bps maker, 5 bps taker) |
 | Fills / round trips | 229 / 105 |
-| Win rate / profit factor | `30.48%` / `0.387` |
-| Sharpe / Sortino | `-4.132` / `-4.469` |
-| Max drawdown | `0.0166%` |
-| Fill ratio | `15.51%` |
+| Win rate / profit factor | `32.38%` / `0.504` |
+| Sharpe / Sortino | `-3.987` / `-4.344` |
+| Max drawdown | `0.0160%` |
+| Fill ratio | `16.47%` |
 | Window hit rate | `0%` (0 positive, 2 negative) |
-| Ledger residual | `+1.4e-7` (tolerance `2.0e-2`) |
+| Ledger residual | `-1.1e-7` (tolerance `2.0e-2`) |
+
+> **These numbers were re-measured after the depth-parser fix.** The ladder now
+> keeps the levels nearest the touch, so the marked book and the mark-to-market
+> leg differ from the figure this table carried before (`-16.4743` on the same
+> 229 fills and the same notional); the conclusion did not change.
 
 > **This is a red result, and it is reported as one.** The same 800 events at the
-> rebate tier this repository used to default to (`maker_bps = -1.0`) report
-> `+4.1251` net; at retail fees they report `-16.4743`. Nothing in the strategy
-> changed — only the cost assumption did, which is exactly why the assumption is
-> now a tested gate rather than a default. At *zero* fees the study still loses
-> `2.74`, so the quoting logic does not earn on this book either; the param set
-> needs signal work before it can be promoted.
+> rebate tier this repository used to default to (`maker_bps = -1.0`, a different
+> lock because the fees are part of the fingerprint) report `+4.8165` net; at
+> retail fees they report `-15.7830`. Nothing in the strategy changed — only the
+> cost assumption did, which is exactly why the assumption is now a tested gate
+> rather than a default. At *zero* fees the study still loses `2.05`, so the
+> quoting logic does not earn on this book either; the param set needs signal work
+> before it can be promoted.
 
 > **Read this as machinery evidence, not alpha.** The bundled sample is a
 > synthetic walk: the point of the table is that the pipeline reports what it

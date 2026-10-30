@@ -67,7 +67,10 @@ from python_analytics.costs import (  # noqa: E402
     round_trip_cost_bps,
 )
 from python_analytics.native import hft_native  # noqa: E402
-from python_analytics.simulator.paper_engine import synthetic_depth_messages  # noqa: E402
+from python_analytics.simulator.paper_engine import (  # noqa: E402
+    parse_depth_message,
+    synthetic_depth_messages,
+)
 from python_analytics.utils import configure_logging, load_settings  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -458,6 +461,60 @@ def measure_engine(parameters: LockedParameters, lines: List[str], *,
     return checks, evidence
 
 
+#: Ticks between the two books the re-anchor measurement alternates between.
+#: The window holds ``kHalf`` (4,096) ticks each way, so this is outside one
+#: window and inside the next: every frame proves the anchor is wrong.
+REANCHOR_TICKS = 5000
+
+
+def measure_reanchor(parameters: LockedParameters, *, frames: int,
+                     max_p99_us: float) -> tuple[List[Check], Dict[str, Any]]:
+    """Phase 2: latency of the frame that has to move the price window.
+
+    The evidence replay never leaves the window it was seeded on, so its p99
+    covers ``apply_depth`` but not ``recenter``. This feeds frames from two
+    books more than a window apart, in alternation, on a *populated* ladder:
+    every frame is out of the current window, so every frame re-anchors -- the
+    exact path a live feed takes when the market leaves the anchor.
+    """
+    tick = float(parameters.tick_size)
+    mid = float(parameters.center)
+    engine = build_paper_engine(parameters.tick_size, parameters.center)
+    near = synthetic_depth_messages(mid=mid, tick=tick, seed=11)
+    far = synthetic_depth_messages(mid=mid + REANCHOR_TICKS * tick, tick=tick,
+                                   seed=12)
+    applied = 0
+    for index in range(frames):
+        update = parse_depth_message(next(near) if index % 2 == 0 else next(far))
+        if update is None:
+            continue
+        engine.process_update(update)
+        applied += 1
+
+    stats = engine.metrics()
+    p50_us = stats.p50_ns / 1000.0
+    p99_us = stats.p99_ns / 1000.0
+    p999_us = stats.p999_ns / 1000.0
+    recenters = int(stats.book_recenters)
+    # A run that never re-anchored would publish a comfortable p99 for a path it
+    # never took, so the check fails unless the window actually moved.
+    moved = recenters > 0
+    checks = [
+        Check("phase2.reanchor_latency_p99", "phase2", "re-anchor p99",
+              f"{p99_us:.1f} us (p50 {p50_us:.1f} us, {recenters} re-anchor(s))",
+              f"<= {max_p99_us:g} us", p99_us <= max_p99_us and moved,
+              note="p99 of a populated ladder whose window moves on every frame; "
+                   "the seeded replay never exercises this path"),
+    ]
+    evidence = {
+        "frames": applied,
+        "recenters": recenters,
+        "latency_us": {"p50": round(p50_us, 3), "p99": round(p99_us, 3),
+                       "p999": round(p999_us, 3)},
+    }
+    return checks, evidence
+
+
 class _FakeClock:
     """Monotonic clock that only advances when ``sleep`` is called."""
 
@@ -833,6 +890,11 @@ def build_report(args: argparse.Namespace) -> ReadinessReport:
     checks += found
     evidence["engine"] = measured
 
+    found, measured = measure_reanchor(parameters, frames=args.reanchor_frames,
+                                       max_p99_us=args.max_engine_p99_us)
+    checks += found
+    evidence["reanchor"] = measured
+
     found, measured = measure_chaos(args.chaos_frames)
     checks += found
     evidence["chaos"] = measured
@@ -1010,6 +1072,9 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
                         help="seed of the evidence book (default: 7)")
     parser.add_argument("--chaos-frames", type=int, default=200,
                         help="frames pushed through each chaos profile")
+    parser.add_argument("--reanchor-frames", type=int, default=1000,
+                        help="frames used for the re-anchor latency check; every "
+                             "one of them moves the priced window")
     parser.add_argument("--window-events", type=int, default=0,
                         help="walk-forward window size for recomputed evidence; "
                              "0 = evidence-events/4")

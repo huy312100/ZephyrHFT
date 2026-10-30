@@ -20,8 +20,9 @@ SCRIPT = ROOT / "scripts" / "generate_readiness_report.py"
 
 PHASE1 = {"phase1.configuration", "phase1.archive_integrity"}
 PHASE2 = {"phase2.engine_latency_p99", "phase2.engine_latency_p999",
-          "phase2.replay_throughput", "phase2.ledger_residual",
-          "phase2.order_rejections", "phase2.fill_activity"}
+          "phase2.reanchor_latency_p99", "phase2.replay_throughput",
+          "phase2.ledger_residual", "phase2.order_rejections",
+          "phase2.fill_activity"}
 PHASE3 = {"phase3.disconnect_storm", "phase3.latency_injection",
           "phase3.deadman_switch"}
 PHASE4 = {"phase4.parameter_lock", "phase4.no_look_ahead",
@@ -108,6 +109,25 @@ def test_deadman_switch_proves_trip_and_recovery(green) -> None:
     assert evidence["orders_allowed_after_reset"] is True
     assert evidence["retripped_after_recovery"] is True
     assert evidence["trip_reason"].startswith("heartbeat_timeout")
+
+
+def test_reanchor_check_measures_the_path_it_names(gate) -> None:
+    """The re-anchor p99 must come from frames that actually moved the window."""
+    parameters = gate.LockedParameters()
+    checks, evidence = gate.measure_reanchor(parameters, frames=50, max_p99_us=1e6)
+    assert evidence["frames"] == 50
+    assert evidence["recenters"] > 0
+    assert evidence["latency_us"]["p99"] > 0.0
+    assert checks[0].passed
+
+
+def test_reanchor_check_fails_when_the_window_never_moves(gate) -> None:
+    """A comfortable p99 for a path the run never took is not evidence."""
+    # One frame next to the seeded centre proves nothing about the anchor.
+    parameters = gate.LockedParameters()
+    checks, evidence = gate.measure_reanchor(parameters, frames=1, max_p99_us=1e6)
+    assert evidence["recenters"] == 0
+    assert not checks[0].passed
 
 
 def test_chaos_profiles_are_attributed(green) -> None:

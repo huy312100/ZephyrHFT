@@ -32,16 +32,16 @@ verdicts** against **explicit, named thresholds**:
 ==============================================================================
   BUILD READINESS:     GO
   ALPHA (PROFITABILITY): NO-GO
-  generated 2026-10-24T16:30:57+00:00
+  generated 2026-10-30T00:39:08+00:00
 ------------------------------------------------------------------------------
-  BUILD: GO (15/15 gated checks passed)
-  ALPHA: NO-GO (1/2 profitability checks passed at 2.0 / 5.0 bps maker/taker)
-    ALPHA FAIL alpha.net_pnl: -16.4743 USDT (-0.0165%); -2.7413 before +13.7330 of fees (required >= 0 after modelled fees)
+  BUILD: GO (16/16 gated checks passed)
+  ALPHA: NO-GO (1/3 profitability checks passed at 2.0 / 5.0 bps maker/taker)
+    ALPHA FAIL alpha.net_pnl: -15.7830 USDT (-0.0158%); -2.0500 before +13.7330 of fees (required >= 0 after modelled fees)
     Phase 1 - data ingestion               3/3 checks
-    Phase 2 - paper execution              6/6 checks
+    Phase 2 - paper execution              7/7 checks
     Phase 3 - resilience                   3/3 checks
     Phase 4 - out-of-sample validation     5/5 checks
-    Alpha - profitability at modelled fees 1/2 checks
+    Alpha - profitability at modelled fees 1/3 checks
 ------------------------------------------------------------------------------
   wrote: reports/production_readiness_report.json
   wrote: reports/production_readiness_report.md
@@ -82,7 +82,7 @@ never lets one impersonate the other:
 
 | Verdict | Answers | Gates the exit code by default | Contains |
 | --- | --- | --- | --- |
-| **BUILD** | Does the machinery keep the promises of phases 1–4? | yes (`0` / `1`) | the 15 gated build checks, plus informational rows |
+| **BUILD** | Does the machinery keep the promises of phases 1–4? | yes (`0` / `1`) | the 16 gated build checks, plus informational rows |
 | **ALPHA** | Does *this* parameter set earn after the fees a retail account actually pays? | no — only with `--require-positive-alpha` (`3`) | `alpha.net_pnl`, `alpha.fee_assumption` |
 
 Both are always measured and both are printed; `summary.blocking` (build) and
@@ -109,9 +109,9 @@ signal, not the fee tier.
 
 ## 2. Gate inventory
 
-15 gated build checks by default across 17 table rows (15 gates + 2
-informational rows); enabling `--min-oos-sharpe` adds one gate for 16 gated
-checks across 18 rows. The two alpha checks (§1.3) are reported alongside these
+16 gated build checks by default across 18 table rows (16 gates + 2
+informational rows); enabling `--min-oos-sharpe` adds one gate for 17 gated
+checks across 19 rows. The two alpha checks (§1.3) are reported alongside these
 but are gated separately, so they are not counted here.
 
 ### 2.1 Phase 1 — data ingestion
@@ -133,6 +133,7 @@ refuses to call an archive healthy when the venue skipped updates.
 | --- | --- | --- |
 | `phase2.engine_latency_p99` | Engine p99 over the evidence replay (C++ `apply_depth`: book update + mark + resting match) | `<= 50 µs` (`--max-engine-p99-us`) |
 | `phase2.engine_latency_p999` | Engine p999 | `<= 500 µs` (`--max-engine-p999-us`) |
+| `phase2.reanchor_latency_p99` | Engine p99 over `--reanchor-frames` frames that each move the priced window (the `recenter` path) | `<= 50 µs`; fails unless the run actually re-anchored |
 | `phase2.replay_throughput` | Depth events/s through the replay path | `>= 1,000` (`--min-throughput-fps`) |
 | `phase2.ledger_residual` | `Δequity − realized − unrealized` | `<= 1e-2` (`--ledger-tolerance`) |
 | `phase2.order_rejections` | Rejected / submitted orders | exactly `0` rejected |
@@ -141,6 +142,13 @@ refuses to call an archive healthy when the venue skipped updates.
 A rejected order is a **configuration error, not bad luck**: the strategy quoted
 outside its own risk limits. Fill activity exists to prove the evidence book
 actually trades — a book that cannot fill would make every PnL figure vacuous.
+
+The evidence replay never leaves the window it was seeded on, so its p99 covers
+`apply_depth` but never `recenter`. `phase2.reanchor_latency_p99` closes that
+gap: it alternates between two books more than a window apart, so every frame
+proves the anchor is wrong and every frame re-anchors a populated ladder. The
+check also fails when the run never re-anchored, because a comfortable p99 for a
+path that was never taken is not evidence.
 
 ### 2.3 Phase 3 — resilience
 
@@ -180,7 +188,7 @@ alpha checks exist to prevent. Decimal-string fields (`tick_size`, `center`,
 grid, while a fee change is always drift.
 
 > **The two studies are not interchangeable.** The committed artefact is the
-> bundled-sample study (Sharpe `-4.132`); a recompute runs over the *synthetic
+> bundled-sample study (Sharpe `-3.987`); a recompute runs over the *synthetic
 > evidence book*, which is a zero-drift random walk and therefore scores ~`0.18`.
 > Recomputing is how you check that the pipeline still produces a valid study —
 > it is not how you re-derive a market edge. Gate profitability
@@ -271,6 +279,7 @@ Every row below was produced by this code base on the same developer host
 | 2,000-frame evidence book, idle host | `0.5 µs` | `3.2 µs` | `723.9 µs` | NO-GO (p999 only) | NO-GO |
 | 2,000-frame evidence book, concurrent load | `0.5 µs` | `8.2–11.3 µs` | `93–724 µs` | GO, unless the tail trips | NO-GO |
 | Phase 2 warm ingest harness (`docs/phase2_technical_specification.md`) | `0.9 µs` | `1.10–1.30 µs` | — | GO | GO |
+| Re-anchor path, 1,000 frames that each move the window | `4.8–5.0 µs` | `5.5–21.5 µs` | `18–51 µs` | GO | NO-GO (p99) |
 
 Reading the table:
 
@@ -283,6 +292,14 @@ Reading the table:
   ceiling while three consecutive re-runs passed. A single p999 breach is a
   statement about the machine, not about the code — re-run on an idle host before
   investigating.
+- **Re-anchoring costs one memmove.** The last row is the frame that moves the
+  price window: the ladder is translated in place (a `memmove` plus a 128-word
+  bitmap shift), so the p50 goes from ~1 µs to `4.8 µs` and the p99 to
+  `5.5–21.5 µs` over five runs. That is why the 5 µs production budget is stated
+  for seeded frames: a re-anchor is a market-structure event, not a steady-state
+  frame, and it is the only place where the whole ladder moves at once. Its p999
+  (up to `51 µs`) is the same host noise as the row above, not a property of the
+  translate.
 - **The 5.0 µs budget is achievable here** when the host is idle and the book is
   warm (1.4 µs at 20k frames) and fails when it is not. That is exactly how a
   budget should behave; it is not a number to chase on a laptop.
@@ -455,7 +472,8 @@ PASS/FAIL rows to find the reason for a NO-GO:
 
 | Check | Measured | Required |
 | --- | --- | --- |
-| `alpha.net_pnl` | -16.4743 USDT (-0.0165%); -2.7413 before +13.7330 of fees | >= 0 after modelled fees |
+| `alpha.net_pnl` | -15.7830 USDT (-0.0158%); -2.0500 before +13.7330 of fees | >= 0 after modelled fees |
+| `alpha.fee_wall` | gross edge -0.299 bps vs 2 bps maker fee | gross edge > maker fee |
 
 ### Blocking failures
 
@@ -481,7 +499,7 @@ mistaken for gates.
 | `thresholds` | The exact ceilings in force for this run (§2.5), including `maker_bps`, `taker_bps`, `round_trip_cost_bps` and `require_positive_alpha` |
 | `inputs` | Source archive, evidence description, parameter fingerprint, walk-forward origin (plus `walk_forward_drift` when a reused artefact was rejected), `costs` |
 | `checks[]` | One object per check: `id`, `phase`, `title`, `measured`, `threshold`, `passed`, `gated`, `note` (`phase: "alpha"` marks profitability) |
-| `evidence` | Raw measurements: `configuration`, `ingestion`, `engine`, `chaos`, `deadman`, `walk_forward`, `alpha` |
+| `evidence` | Raw measurements: `configuration`, `ingestion`, `engine`, `reanchor`, `chaos`, `deadman`, `walk_forward`, `alpha` |
 
 `summary.blocking` is the machine-readable form of the same fact the console
 prints, so a pipeline can gate on the JSON without parsing prose:
@@ -505,17 +523,19 @@ reading the committed `reports/walk_forward.json` (retail fees: 2 bps maker /
 | Phase | Representative measurement | Status |
 | --- | --- | --- |
 | 1 — ingestion | `0` malformed / `0` gaps in 800 lines; ~496 k lines/s | PASS |
-| 2 — execution | p99 `1.7 µs`, p999 `10.8 µs` (host-dependent — §3.3), `16.7 k` depth events/s, residual `-1.1e-7`, `0/3480` rejected, fills `16.4 %` | PASS |
+| 2 — execution | p99 `1.7 µs`, p999 `10.8 µs` (host-dependent — §3.3), re-anchor p99 `5.8–21.5 µs` over 1,000 moving frames, `16.7 k` depth events/s, residual `-1.1e-7`, `0/3480` rejected, fills `16.4 %` | PASS |
 | 3 — resilience | 2 outages / 2 reconnects / 2 frames dropped; 36 spikes, max `19.8 ms`; switch tripped on `heartbeat_timeout: silence=600ms>=limit=500ms` | PASS |
 | 4 — validation | lock `b29a62ed93caf69a` (4 checks); 1 chronology check across 2 windows; residual `+1.4e-7`; 2 windows / 800 events | PASS |
-| **Build verdict** | **15/15 gated checks passed** | **GO** |
-| Alpha (profitability) | `-16.4743 USDT` (`-2.7413` before `+13.7330` of fees) at 2/5 bps; Sharpe `-4.132` (info); `0/2` windows positive | **NO-GO (1/2)** |
+| **Build verdict** | **16/16 gated checks passed** | **GO** |
+| Alpha (profitability) | `-15.7830 USDT` (`-2.0500` before `+13.7330` of fees) at 2/5 bps; Sharpe `-3.987` (info); `0/2` windows positive | **NO-GO (1/3)** |
 
 Read that last row as the headline: **the machinery is ready and the strategy is
 not**. At the rebate assumption this branch removed (`maker_bps = -1.0`) the same
-800 events reported `+4.13 USDT`; the fee change alone was worth ~`20.6 USDT`, and
-even at *zero* fees the run loses `2.74 USDT`. That is the honest state of the
-alpha workstream, and no fee-tier editing can turn it green.
+800 events reported `+4.82 USDT` (Sharpe `1.31`, `2/0` windows positive; a
+different lock, since the fees are part of the fingerprint); the fee change alone
+was worth `20.60 USDT`, and even at *zero* fees the run loses `2.05 USDT`. That is
+the honest state of the alpha workstream, and no fee-tier editing can turn it
+green.
 
 Latency and throughput vary per run (§3.3); the ledger, window, lock, chaos and
 alpha counts are deterministic.
@@ -595,7 +615,7 @@ Other failure shapes:
 | Limitation | Consequence |
 | --- | --- |
 | Engine, chaos and OOS evidence come from a **synthetic book** | The verdict proves the machinery, not a market edge. `--source` only drives the Phase 1 integrity check, so judging alpha requires a Phase 4 study over a real capture (`run_walk_forward.py --source <capture> ...`) passed explicitly with `--walk-forward-json <path>` — do not rely on the default `reports/walk_forward.json` — plus an explicit `--min-oos-sharpe` |
-| The synthetic book is a zero-drift random walk | Expect Sharpe ≈ 0 with a fee drag; the committed sample reports `-4.132` (negative because it is charged 2 bps of maker fees on both sides), which is a cost-model statement, not a market verdict |
+| The synthetic book is a zero-drift random walk | Expect Sharpe ≈ 0 with a fee drag; the committed sample reports `-3.987` (negative because it is charged 2 bps of maker fees on both sides), which is a cost-model statement, not a market verdict |
 | Engine p99 is host-sensitive | Two runs on the same machine, differing only in background load, move p99 from `1.4 µs` to `11.3 µs` and p999 from `8 µs` to `724 µs` (§3.3). The 5.0 µs budget is only meaningful with the cores and the load characterised |
 | Chaos runs on a fake monotonic clock | Deterministic and fast, but it does not exercise the socket, the TLS stack or the kernel's retransmit timers |
 | The dead-man's switch is driven directly | It proves monitor + kill-switch semantics, not the full live feed loop that must eventually beat into it |
@@ -977,8 +997,13 @@ cannot hold. Four properties matter:
   "no move", so an unrepresentable grid cannot make the book clear itself on
   every frame.
 - **Depth is carried across.** `recenter()` keeps every level the new window can
-  still hold instead of dropping the lot, and the swap is published through the
-  seqlock so a reader never sees a half-rebuilt book. What cannot fit is gone —
+  still hold instead of dropping the lot. Re-anchoring is a constant slot shift,
+  so it is a `memmove` of the ladder plus a shift of the occupancy bitmap and a
+  recount of the live set — no allocation, no per-level copy, and no cap on how
+  many levels survive (a 200-level-per-side book keeps all 200 across a move and
+  loses only the level that leaves the window). The swap is published through the
+  seqlock so a reader never sees a half-rebuilt book, and an off-grid centre
+  clears the ladder rather than mis-indexing it. What cannot fit is gone —
   and because the default `depth@100ms` feed is a *diff* stream, a dropped level
   is not repeated until it changes. After a re-anchor that loses depth, a live
   deployment must reseed from a REST snapshot (`seed_from_snapshot`) instead of

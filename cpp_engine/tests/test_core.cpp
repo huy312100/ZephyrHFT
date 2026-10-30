@@ -397,6 +397,61 @@ void test_json_parser() {
                                             bad_trade));
 }
 
+void test_re_anchor_keeps_every_level_the_window_can_hold() {
+    // Retention used to copy at most 64 levels a side, so a deep ladder lost
+    // levels that still fitted the new window. The whole ladder is translated
+    // now, and this test carries more levels than that old bound.
+    hft::L2Book book{hft::Price::from_int(1), hft::Price::from_int(30'000)};
+    for (std::int64_t i = 0; i < 200; ++i) {
+        CHECK(book.apply_level(hft::Side::Buy, hft::Price::from_int(30'000 - i),
+                               hft::Quantity::from_int(1)));
+        CHECK(book.apply_level(hft::Side::Sell, hft::Price::from_int(30'001 + i),
+                               hft::Quantity::from_int(1)));
+    }
+    // Parked on the low edge of the window: it fits now, and the re-anchor
+    // below is what takes it out.
+    CHECK(book.apply_level(hft::Side::Buy, hft::Price::from_int(25'904),
+                           hft::Quantity::from_int(7)));
+    CHECK(book.live_levels(hft::Side::Buy) == 201);
+
+    book.recenter(hft::Price::from_int(30'100));
+
+    CHECK(book.center() == hft::Price::from_int(30'100));
+    CHECK(book.live_levels(hft::Side::Buy) == 200);   // only the edge level went
+    CHECK(book.live_levels(hft::Side::Sell) == 200);
+    CHECK(book.best_bid() == hft::Price::from_int(30'000));
+    CHECK(book.best_ask() == hft::Price::from_int(30'001));
+    CHECK(book.quantity_at(hft::Side::Buy, hft::Price::from_int(29'801)) ==
+          hft::Quantity::from_int(1));
+    CHECK(book.quantity_at(hft::Side::Sell, hft::Price::from_int(30'200)) ==
+          hft::Quantity::from_int(1));
+    CHECK(book.quantity_at(hft::Side::Buy, hft::Price::from_int(25'904)).raw() == 0);
+
+    // And back again, which is the other direction of the same translation.
+    book.recenter(hft::Price::from_int(30'000));
+    CHECK(book.live_levels(hft::Side::Buy) == 200);
+    CHECK(book.best_bid() == hft::Price::from_int(30'000));
+    CHECK(book.quantity_at(hft::Side::Buy, hft::Price::from_int(29'801)) ==
+          hft::Quantity::from_int(1));
+}
+
+void test_re_anchor_off_the_grid_drops_the_book_instead_of_moving_it() {
+    // A centre that is not a multiple of the tick leaves every level between
+    // slots; moving them by a truncated number of ticks would rewrite their
+    // prices. The book is emptied instead and rebuilt from the feed.
+    hft::L2Book book{hft::Price::from_int(1), hft::Price::from_int(30'000)};
+    CHECK(book.apply_level(hft::Side::Buy, hft::Price::from_int(29'999),
+                           hft::Quantity::from_int(1)));
+    CHECK(book.apply_level(hft::Side::Sell, hft::Price::from_int(30'001),
+                           hft::Quantity::from_int(1)));
+
+    book.recenter(hft::Price::from_double(30'100.5));
+
+    CHECK(book.live_levels(hft::Side::Buy) == 0);
+    CHECK(book.live_levels(hft::Side::Sell) == 0);
+    CHECK(book.blind());
+}
+
 void test_json_parser_keeps_the_levels_nearest_the_touch() {
     // A partial-book burst carries more levels than the update buffer holds, and
     // the venue promises no ordering. Here the bids are listed ascending from
@@ -1584,6 +1639,8 @@ int main() {
     test_latency_histogram();
     test_json_parser();
     test_json_parser_keeps_the_levels_nearest_the_touch();
+    test_re_anchor_keeps_every_level_the_window_can_hold();
+    test_re_anchor_off_the_grid_drops_the_book_instead_of_moving_it();
     test_websocket_decoder();
     test_l2_clear_resets_timestamps();
     test_crossing_limit_fill_preserves_price();

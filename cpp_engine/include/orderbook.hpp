@@ -14,11 +14,13 @@
 // false sharing.
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <bit>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <optional>
 #include <span>
 #include <type_traits>
@@ -145,7 +147,124 @@ public:
         return written;
     }
 
+    // Re-indexes the whole ladder onto a window centred on ``center``, keeping
+    // the tick. Every level the new window can hold is kept: the slots are
+    // translated by a constant, so the move is a memmove plus a bitmap shift
+    // rather than a level-by-level copy, and nothing is allocated. Levels that
+    // fall outside the new window are dropped, because the grid they were
+    // indexed on no longer exists.
+    void retarget(std::int64_t center) noexcept {
+        if (tick_raw_ <= 0) {
+            return;
+        }
+        const std::int64_t delta = center_raw_ - center;
+        center_raw_ = center;
+        if (delta % tick_raw_ != 0) {
+            // The new window sits off this ladder's grid, so no level has a
+            // slot to land on. Same outcome as an out-of-window frame: the
+            // feed rebuilds the book.
+            clear_all();
+            return;
+        }
+        const std::int64_t shift = delta / tick_raw_;
+        if (shift == 0) {
+            return;
+        }
+        const auto span = static_cast<std::int64_t>(MaxTicks);
+        if (shift <= -span || shift >= span) {
+            clear_all();
+            return;
+        }
+        if (shift > 0) {
+            const auto moved = static_cast<std::size_t>(shift);
+            std::memmove(quantities_.data() + moved, quantities_.data(),
+                         (MaxTicks - moved) * sizeof(std::int64_t));
+            std::fill_n(quantities_.data(), moved, std::int64_t{0});
+            shift_occupancy(moved, /*up=*/true);
+        } else {
+            const auto moved = static_cast<std::size_t>(-shift);
+            std::memmove(quantities_.data(), quantities_.data() + moved,
+                         (MaxTicks - moved) * sizeof(std::int64_t));
+            std::fill_n(quantities_.data() + (MaxTicks - moved), moved, std::int64_t{0});
+            shift_occupancy(moved, /*up=*/false);
+        }
+        refresh_index();
+    }
+
 private:
+    void clear_all() noexcept {
+        quantities_.fill(0);
+        occupancy_.fill(0);
+        best_slot_ = -1;
+        live_levels_ = 0;
+    }
+
+    // Moves the occupancy bitmap by ``by`` bits, in the same direction as the
+    // quantities. Iterating in the direction of the move means every word is
+    // read before it is overwritten.
+    void shift_occupancy(std::size_t by, bool up) noexcept {
+        const std::size_t words = by / 64;
+        const unsigned bits = static_cast<unsigned>(by % 64);
+        if (words >= kWords) {
+            occupancy_.fill(0);
+            return;
+        }
+        if (up) {
+            for (std::size_t i = kWords; i-- > 0;) {
+                std::uint64_t value = 0;
+                if (i >= words) {
+                    const std::size_t src = i - words;
+                    value = occupancy_[src] << bits;
+                    if (bits != 0 && src > 0) {
+                        value |= occupancy_[src - 1] >> (64U - bits);
+                    }
+                }
+                occupancy_[i] = value;
+            }
+        } else {
+            for (std::size_t i = 0; i < kWords; ++i) {
+                std::uint64_t value = 0;
+                const std::size_t src = i + words;
+                if (src < kWords) {
+                    value = occupancy_[src] >> bits;
+                    if (bits != 0 && src + 1 < kWords) {
+                        value |= occupancy_[src + 1] << (64U - bits);
+                    }
+                }
+                occupancy_[i] = value;
+            }
+        }
+    }
+
+    // Recomputes the touch and the live count from the bitmap after a move:
+    // 128 word operations instead of a slot-by-slot rescan of the ladder.
+    void refresh_index() noexcept {
+        std::int32_t live = 0;
+        for (std::size_t word = 0; word < kWords; ++word) {
+            live += static_cast<std::int32_t>(std::popcount(occupancy_[word]));
+        }
+        live_levels_ = live;
+        best_slot_ = -1;
+        if (higher_is_better_) {
+            for (std::size_t word = kWords; word-- > 0;) {
+                if (occupancy_[word] != 0) {
+                    best_slot_ = static_cast<std::int32_t>(
+                        word * 64 + 63 -
+                        static_cast<std::size_t>(std::countl_zero(occupancy_[word])));
+                    break;
+                }
+            }
+        } else {
+            for (std::size_t word = 0; word < kWords; ++word) {
+                if (occupancy_[word] != 0) {
+                    best_slot_ = static_cast<std::int32_t>(
+                        word * 64 + static_cast<std::size_t>(std::countr_zero(occupancy_[word])));
+                    break;
+                }
+            }
+        }
+    }
+
     [[nodiscard]] bool slot_for(Price price, std::size_t& out) const noexcept {
         const std::int64_t delta = price.raw() - center_raw_;
         if (tick_raw_ <= 0 || delta % tick_raw_ != 0) {
@@ -255,9 +374,6 @@ template <std::size_t MaxTicks = 8192>
 class alignas(64) L2OrderBook {
 public:
     static constexpr std::size_t kMaxTicks = MaxTicks;
-    // Depth carried across a re-anchor. Every level the new window can still
-    // hold is kept; this bounds the copy, not the book.
-    static constexpr std::size_t kRetainedLevels = 64;
 
     L2OrderBook() noexcept = default;
     L2OrderBook(Price tick_size, Price center) noexcept { configure(tick_size, center); }
@@ -273,7 +389,9 @@ public:
     // Re-anchors the price window on `center`, keeping the tick. Levels the new
     // window can still hold are carried across, so a re-anchor does not throw
     // away depth it could keep; anything outside the new window is dropped,
-    // because the grid it was indexed on no longer exists.
+    // because the grid it was indexed on no longer exists. The move is a slot
+    // translation on both ladders (memmove plus a bitmap shift), so it keeps
+    // every representable level without allocating and without a level count.
     //
     // A ladder anchored on a stale constant is blind -- it accepts nothing and
     // reports an empty book rather than a bad price, which is the failure this
@@ -282,19 +400,13 @@ public:
     // re-anchor that loses depth, a live deployment must reseed from a REST
     // snapshot (``seed_from_snapshot``) rather than trust the near touch.
     void recenter(Price center) noexcept {
-        const Price tick = Price::from_raw(bid_.tick_raw());
-        std::array<BookLevel, kRetainedLevels> bids{};
-        std::array<BookLevel, kRetainedLevels> asks{};
-        const std::size_t bid_count = bid_.walk(bids.data(), bids.size());
-        const std::size_t ask_count = ask_.walk(asks.data(), asks.size());
         begin_write();
-        configure_owned(tick, center);
-        for (std::size_t i = 0; i < bid_count; ++i) {
-            (void)bid_.set(bids[i].price, bids[i].quantity.raw());  // false = outside
-        }
-        for (std::size_t i = 0; i < ask_count; ++i) {
-            (void)ask_.set(asks[i].price, asks[i].quantity.raw());
-        }
+        bid_.retarget(center.raw());
+        ask_.retarget(center.raw());
+        last_exchange_ts_ = 0;
+        last_recv_ts_ = 0;
+        last_sequence_ = 0;
+        updates_ = 0;
         end_write();
     }
 
