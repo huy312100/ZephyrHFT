@@ -1184,12 +1184,13 @@ python3 scripts/run_markout.py --fills state/fills.json --source 'data/raw_l2/*.
 | `ADVERSE_SELECTION` | the mid moves against the fills, so resting *adds* a cost | `1` |
 | `INCONCLUSIVE` | fewer than `--min-samples` marked fills | `3` |
 
-A simulated fill carries a `steady_clock` stamp, so it cannot be joined to an
-archive afterwards; `MarkoutReplayer` measures it inside the replay instead,
-where the mid behind `h = 0` is the book that produced the fill. Fills missing a
-sample within `--tolerance-ms` are reported as truncated rather than
-interpolated, because an invented price is indistinguishable from an edge once
-it reaches a report.
+A simulated fill's local record time is a `steady_clock` stamp, so it cannot be
+joined to an archive afterwards; the engine also carries the venue event time of
+whatever filled it (`Fill.event_ts`), and `MarkoutReplayer` measures the fill
+inside the replay against that, where the mid behind `h = 0` is the book that
+produced the fill. Fills missing a sample within `--tolerance-ms` are reported
+as truncated rather than interpolated, because an invented price is
+indistinguishable from an edge once it reaches a report.
 
 **What the committed study shows** (`python3 scripts/run_markout.py`):
 

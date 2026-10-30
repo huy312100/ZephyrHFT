@@ -157,6 +157,46 @@ void test_l2_book() {
     CHECK(book.updates() >= 5);
 }
 
+// A reader that never wins the seqlock race must not be handed the torn book it
+// just read. ``top()`` reports an invalid Bbo instead, and every consumer of it
+// already fails closed: the paper engine marks nothing, the trading engine
+// quotes nothing, and no order is submitted against a book it cannot vouch for.
+void test_top_never_returns_a_half_written_book() {
+    hft::L2Book book{hft::Price::from_int(1), hft::Price::from_int(30'000)};
+    CHECK(book.apply_level(hft::Side::Buy, hft::Price::from_int(29'999),
+                           hft::Quantity::from_int(5)));
+    CHECK(book.apply_level(hft::Side::Sell, hft::Price::from_int(30'001),
+                           hft::Quantity::from_int(5)));
+    CHECK(book.top().is_valid());
+
+    std::atomic<bool> stop{false};
+    std::thread writer([&] {
+        std::int64_t quantity = 1;
+        while (!stop.load(std::memory_order_relaxed)) {
+            (void)book.apply_level(hft::Side::Buy, hft::Price::from_int(29'999),
+                                   hft::Quantity::from_int(quantity));
+            (void)book.apply_level(hft::Side::Sell, hft::Price::from_int(30'001),
+                                   hft::Quantity::from_int(quantity));
+            quantity = quantity == 1 ? 2 : 1;
+        }
+    });
+    for (int i = 0; i < 200'000; ++i) {
+        const hft::Bbo bbo = book.top();
+        if (bbo.is_valid()) {
+            CHECK(bbo.bid_price == hft::Price::from_int(29'999));
+            CHECK(bbo.ask_price == hft::Price::from_int(30'001));
+            continue;
+        }
+        // Fail closed: no prices, no clocks, no sequence -- never one side of a
+        // write paired with the other side of the next.
+        CHECK(bbo.bid_price.raw() == 0);
+        CHECK(bbo.ask_price.raw() == 0);
+        CHECK(bbo.exchange_ts == 0 && bbo.recv_ts == 0 && bbo.sequence == 0);
+    }
+    stop.store(true);
+    writer.join();
+}
+
 void test_l3_book() {
     hft::L3Book book{hft::Price::from_int(1), hft::Price::from_int(30'000)};
     CHECK(book.add_order(1, hft::Side::Buy, hft::Price::from_int(29'999),
@@ -1635,6 +1675,7 @@ int main() {
     test_fixed_point();
     test_ring_buffer();
     test_l2_book();
+    test_top_never_returns_a_half_written_book();
     test_l3_book();
     test_order_manager();
     test_risk_guard();

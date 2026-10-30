@@ -11,8 +11,12 @@ Two modes:
 
 * **replay** (default) — replays the same archives, the same frozen parameter
   lock and the same window slicing as ``run_walk_forward.py`` and marks the
-  fills it produces. Simulated fills carry a ``steady_clock`` stamp, so they can
-  only be measured inside the replay; there is no post-hoc join to fake.
+  fills it produces. Simulated fills carry a ``steady_clock`` stamp for their
+  local record time, so they can only be measured inside the replay; the engine
+  also carries the venue event time of whatever filled the order
+  (``Fill.event_ts``: the depth frame, or the print under ``--fill-model trade``)
+  and that is the clock the markout marks against. There is no post-hoc join to
+  fake.
 * **--fills FILE** — marks venue-timestamped fills (an export from a real
   session) against ``--source`` captures. Both sides must share the venue clock.
 

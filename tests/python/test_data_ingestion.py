@@ -595,6 +595,58 @@ def test_writer_sequence_never_reuses_a_file_name(tmp_path) -> None:
     assert len(names) == len(set(names)) == 3
 
 
+def test_a_long_aux_list_still_fits_the_filesystem_limit(tmp_path) -> None:
+    """``aux_streams`` accepts any number of tags; the name must still open."""
+    tags = tuple(f"bookTicker{index:04d}@100ms" for index in range(12))
+    writer = RawL2Writer(_settings(aux_streams=tags), directory=tmp_path)
+    writer.append(_depth())
+    asyncio.run(writer.aclose())
+
+    files = _roll_files(tmp_path)
+    assert len(files) == 1
+    assert len(files[0].name.encode("utf-8")) <= 255
+    # Truncated, not scrambled: the capture is still identifiable.
+    assert files[0].name.startswith("binance_futures_btcusdt_depth_100ms_book")
+
+
+def test_two_long_aux_lists_do_not_share_a_truncated_name(tmp_path) -> None:
+    tags = [f"bookTicker{index:04d}@100ms" for index in range(12)]
+    variants = (tuple(tags), tuple(tags[:-1] + ["aggTrade@100ms"]))
+    names = []
+    for index, variant in enumerate(variants):
+        directory = tmp_path / str(index)
+        writer = RawL2Writer(_settings(aux_streams=variant), directory=directory)
+        writer.append(_depth())
+        asyncio.run(writer.aclose())
+        names.append(_roll_files(directory)[0].name)
+
+    assert names[0] != names[1]
+
+
+def test_prepare_opens_the_first_roll_file_before_any_frame(tmp_path) -> None:
+    """An archive that cannot be opened must fail now, not on the first flush."""
+    writer = RawL2Writer(_settings(), directory=tmp_path)
+    assert _roll_files(tmp_path) == []
+
+    writer.prepare()
+
+    assert len(_roll_files(tmp_path)) == 1
+    asyncio.run(writer.aclose())
+
+
+def test_main_refuses_to_capture_into_an_unusable_archive(tmp_path, capsys,
+                                                          monkeypatch) -> None:
+    def _refuse(self, now):
+        raise PermissionError("read-only archive")
+
+    monkeypatch.setattr(ingest_module.RawL2Writer, "_open_file", _refuse)
+
+    code = ingest_module.main(["--output-dir", str(tmp_path)])
+
+    assert code == 1
+    assert "cannot open the capture archive" in capsys.readouterr().err
+
+
 # --------------------------------------------------------------------------- #
 # Ingest client
 # --------------------------------------------------------------------------- #

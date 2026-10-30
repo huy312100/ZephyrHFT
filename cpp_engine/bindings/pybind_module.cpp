@@ -271,6 +271,7 @@ PYBIND11_MODULE(hft_native, m) {
         .def_readonly("quantity", &Fill::quantity)
         .def_readonly("fee", &Fill::fee)
         .def_readonly("timestamp", &Fill::timestamp)
+        .def_readonly("event_ts", &Fill::event_ts)
         .def_readonly("side", &Fill::side)
         .def_readonly("is_maker", &Fill::is_maker);
 

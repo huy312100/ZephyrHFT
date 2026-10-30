@@ -777,13 +777,18 @@ per horizon, per maker/taker and per maker side, and prints one verdict.
 
 Three design decisions matter more than the statistics:
 
-* **Simulated fills are marked in-loop, never joined.** The C++ engine stamps
-  `Fill.timestamp` with `steady_clock`, which has an arbitrary epoch, so a
-  replay fill cannot be looked up in a capture. `MarkoutReplayer` measures it
-  during the replay instead — the mid behind `h = 0` is the book that produced
-  the fill, and later horizons are later frames of the same feed. Venue-clock
-  fills (a real session exported as JSON) go through `--fills` instead, where
-  the join is legitimate because both sides carry the exchange timestamp.
+* **Simulated fills are marked in-loop, never joined.** A fill carries two
+  clocks. `Fill.timestamp` is the local record time, a `steady_clock` stamp with
+  an arbitrary epoch, so it can never be looked up in a capture;
+  `Fill.event_ts` is the venue event time of whatever filled the order (the
+  depth frame, or the trade print under the tape model), copied from the event
+  that the engine matched against. `MarkoutReplayer` measures the fill during the
+  replay instead — the mid behind `h = 0` is the book that produced the fill, and
+  later horizons are later frames of the same feed — stamping each fill with
+  `event_ts` so a `trade`-model fill is placed at its print, not at the depth
+  frame that preceded it. Venue-clock fills (a real session exported as JSON) go
+  through `--fills` instead, where the join is legitimate because both sides
+  carry the exchange timestamp.
 * **A missing sample is truncated, not interpolated.** A horizon with no sample
   inside `--tolerance-ms` is counted and excluded. Carrying the last mid forward
   across a feed outage is how a hole becomes a fake edge.

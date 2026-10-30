@@ -282,15 +282,37 @@ class AvellanedaStoikovStrategy(Strategy):
         to all market types, and it is directional — the bid rounds **down** and
         the ask rounds **up** — so snapping can only widen the market. Nearest-
         tick rounding could pull both sides into the same tick and produce a
-        crossed or degenerate quote from a perfectly valid one.
+        crossed or degenerate quote from a perfectly valid one. A quote that is
+        already on the grid is returned untouched: the division that tests it is
+        inexact, so rounding blindly would move a representable price by a tick.
         """
         bid, ask = self.raw_quotes(micro_price, inventory, time_remaining,
                                    sigma=sigma, ofi_z=ofi_z)
         tick = self._config.tick_size
         if tick > 0.0:
-            bid = math.floor(bid / tick) * tick
-            ask = math.ceil(ask / tick) * tick
+            bid = self.snap_to_tick(bid, round_down=True)
+            ask = self.snap_to_tick(ask, round_down=False)
         return bid, ask
+
+    def snap_to_tick(self, price: float, *, round_down: bool) -> float:
+        """Snaps ``price`` onto the tick grid, leaving an on-grid price alone.
+
+        ``price / tick`` is not exact in binary: ``80000.2 / 0.1`` evaluates to
+        ``800001.9999999999``, so a bare ``floor`` moves a price that the venue
+        can already represent down a whole tick (and a bare ``ceil`` moves an ask
+        up one), changing which orders fill. A step count within a rounding
+        tolerance of an integer is therefore taken as that integer, and the price
+        is returned unchanged; only a genuinely off-grid price is rounded, in the
+        direction asked for.
+        """
+        tick = self._config.tick_size
+        if tick <= 0.0:
+            return price
+        steps = price / tick
+        nearest = round(steps)
+        if abs(steps - nearest) <= 1e-9 * max(1.0, abs(steps)):
+            return price
+        return (math.floor(steps) if round_down else math.ceil(steps)) * tick
 
     def round_to_tick(self, price: float) -> float:
         """Rounds a quote to the nearest ``tick_size`` (round half away from 0)."""

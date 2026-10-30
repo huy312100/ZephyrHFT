@@ -44,6 +44,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import gzip
+import hashlib
 import json
 import logging
 import math
@@ -80,6 +81,11 @@ Frame = Tuple[int, str]
 
 #: Buffer size above which a WARNING is logged (nothing is ever dropped).
 HIGH_WATER_BYTES = 64 * 1024 * 1024
+
+#: Cap on the roll-file name prefix. ``NAME_MAX`` is 255 bytes on Linux and on
+#: APFS; the stamp, sequence and suffix add ~30, so 120 leaves room for both
+#: and for a directory the venue does not control.
+MAX_SLUG_BYTES = 120
 
 #: A connection that survives this long resets the reconnect backoff.
 HEALTHY_SESSION_S = 5.0
@@ -446,6 +452,18 @@ class RawL2Writer:
             self._high_water_logged = False
 
     # -- file handling (worker thread only, except stats()) ---------------- #
+    def prepare(self) -> None:
+        """Opens the first roll file eagerly, before the socket is connected.
+
+        The first write otherwise happens in the worker thread, where a failing
+        ``_open_file`` is logged, the chunk is discarded, and ``stats.stored``
+        keeps counting frames -- a capture that looks healthy and archives
+        nothing. Opening one file up front turns an unusable archive (missing
+        permission, wrong filesystem) into a refusal to start.
+        """
+        if self._handle is None:
+            self._open_file(self._clock())
+
     def _should_rotate(self, now: float, incoming: int) -> bool:
         # Size rotation only applies when there is data to write; otherwise a
         # final empty flush would create a spurious (empty) roll file.
@@ -459,12 +477,7 @@ class RawL2Writer:
     def _open_file(self, now: float) -> None:
         self._directory.mkdir(parents=True, exist_ok=True)
         stamp = datetime.fromtimestamp(now, timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-        slug = "_".join(
-            [
-                f"{self._settings.exchange}_{self._settings.symbol}",
-                *(tag.replace("@", "_") for tag in self._settings.stream_tags),
-            ]
-        )
+        slug = self._slug()
         while True:
             self._sequence += 1
             path = self._directory / f"{slug}_{stamp}_{self._sequence:05d}{self._suffix}"
@@ -489,6 +502,27 @@ class RawL2Writer:
         self._live_bytes = 0
         self._file_bytes = 0
         logger.info("roll file open: %s", path)
+
+    def _slug(self) -> str:
+        """Roll-file name prefix, bounded so the whole name fits a filesystem.
+
+        ``data_ingestion.aux_streams`` accepts any number of distinct tags, and
+        ten long ones would push the name past ``NAME_MAX`` (255 bytes). The
+        prefix is therefore capped and disambiguated with a hash of the full
+        set, so two long configurations still produce distinct, readable names.
+        """
+        slug = "_".join(
+            [
+                f"{self._settings.exchange}_{self._settings.symbol}",
+                *(tag.replace("@", "_") for tag in self._settings.stream_tags),
+            ]
+        )
+        encoded = slug.encode("utf-8")
+        if len(encoded) <= MAX_SLUG_BYTES:
+            return slug
+        digest = hashlib.sha1(encoded).hexdigest()[:8]
+        head = encoded[: MAX_SLUG_BYTES - len(digest) - 1].decode("utf-8", "ignore")
+        return f"{head}_{digest}"
 
     def _close_file(self) -> None:
         handle, self._handle = self._handle, None
@@ -735,6 +769,15 @@ class L2IngestClient:
     def writer_stats(self) -> Optional[WriterStats]:
         """Roll-file counters, or ``None`` in dry-run mode."""
         return None if self._writer is None else self._writer.stats()
+
+    def prepare_storage(self) -> None:
+        """Opens the first roll file, so a bad archive path fails loudly here.
+
+        No-op in dry-run mode. Raises ``OSError`` if the archive cannot be
+        opened; the caller turns that into a refusal to start.
+        """
+        if self._writer is not None:
+            self._writer.prepare()
 
     # -- shutdown ---------------------------------------------------------- #
     def _stop_event(self) -> asyncio.Event:
@@ -1005,7 +1048,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
                         help="stream type, e.g. depth@100ms")
     parser.add_argument("--aux-stream", dest="aux_streams", action="append",
                         default=None, metavar="TYPE",
-                        help="extra stream on the same socket, e.g. aggTrade "
+                        help="extra stream on the same socket, e.g. trade "
                              "(repeatable; replaces data_ingestion.aux_streams)")
     parser.add_argument("--depth-only", action="store_true",
                         help="capture the depth stream only (drop the tape)")
@@ -1140,6 +1183,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     storage_dir = (
         Path(args.output_dir) if args.output_dir is not None else settings.storage_dir
     )
+    # Fail before the socket is opened: an unwritable archive would otherwise be
+    # discovered by the first flush, whose error is logged and the chunk
+    # discarded while the run keeps counting archived frames.
+    try:
+        client.prepare_storage()
+    except OSError as exc:
+        print(f"cannot open the capture archive in {storage_dir}: {exc}", file=sys.stderr)
+        return 1
     logger.info(
         "ingest %s -> %s (%s)",
         settings.stream_url,

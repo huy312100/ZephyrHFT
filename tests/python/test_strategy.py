@@ -136,6 +136,25 @@ def test_crypto_quotes_land_on_the_tick_grid() -> None:
         assert ask > bid
 
 
+def test_a_quote_already_on_the_grid_keeps_its_price() -> None:
+    """``80000.2 / 0.1`` is ``800001.9999999999``, so blind rounding loses a tick.
+
+    A quote the venue can already represent must not be moved: snapping it down
+    silently changes the price, and therefore which orders fill.
+    """
+    config = _config(tick_size=0.1, market_type="CRYPTO")
+    strategy = AvellanedaStoikovStrategy(config)
+
+    assert strategy.snap_to_tick(80000.2, round_down=True) == 80000.2
+    assert strategy.snap_to_tick(80000.2, round_down=False) == 80000.2
+    assert strategy.snap_to_tick(80000.0, round_down=True) == 80000.0
+
+    # A genuinely off-grid quote still rounds in the direction asked for, so
+    # snapping can only widen the market.
+    assert strategy.snap_to_tick(80000.25, round_down=True) == pytest.approx(80000.2)
+    assert strategy.snap_to_tick(80000.25, round_down=False) == pytest.approx(80000.3)
+
+
 def test_crypto_quote_never_collapses_into_a_crossed_market() -> None:
     """A spread narrower than one tick still yields a valid two-sided quote."""
     # The committed fit (k=5.0, sigma=0.02) quotes ~0.20 wide, well under the

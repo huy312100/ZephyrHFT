@@ -502,7 +502,11 @@ public:
                 return bbo;
             }
         }
-        return bbo;  // best-effort under pathological writer pressure
+        // Every retry lost the race with the writer. Reporting the last torn
+        // read would hand the caller a book that was never consistent, so
+        // report an invalid one instead: every consumer of `top()` already
+        // fails closed on `is_valid()` (no quote, no order, no mark).
+        return Bbo{};
     }
 
     [[nodiscard]] bool snapshot(BookSnapshot& out) const noexcept {

@@ -701,6 +701,43 @@ def test_plain_bulk_replayer_still_replays_with_the_new_hook() -> None:
     assert summary.stats["fills"] == len(summary.fills)
 
 
+class _StampedFill:
+    """The fields ``on_frame`` reads from a native fill."""
+
+    def __init__(self, event_ts: int, price: float = 100.0) -> None:
+        self.event_ts = event_ts
+        self.timestamp = 0  # local record time: not on the feed's clock
+        self.side = "BUY"
+        self.price = price
+        self.quantity = 0.1
+        self.is_maker = 1
+
+
+def test_a_tape_fill_is_marked_from_the_print_not_the_depth_frame() -> None:
+    """The mid behind a tape fill is the one at the print, not the last frame.
+
+    Under the tape model a fill happens *between* depth frames, and the engine
+    stamps it with the print's own event time (``match_trade``). Marking it on
+    the frame clock moves the fill -- and every horizon measured from it -- onto
+    a mid the market had already left.
+    """
+    replayer = _markout_replayer()
+    event_ms = 1_700_000_000_000
+    line = ('{"e":"depthUpdate","E":%d,"U":1,"u":1,"s":"BTCUSDT",'
+            '"b":[["100.0","1"]],"a":[["100.5","1"]]}' % event_ms)
+    replayer.replay_lines([line], None)
+    assert int(replayer.engine.bbo().exchange_ts) == event_ms
+
+    # The print that filled us arrived 37 ms before that depth frame.
+    print_ms = event_ms - 37
+    replayer.on_frame(print_ms * 1_000_000, [_StampedFill(print_ms)])
+    assert replayer.fill_log[-1].ts_ns == print_ms * 1_000_000
+
+    # An unstamped fill (no venue clock on this archive) keeps the frame clock.
+    replayer.on_frame(0, [_StampedFill(0)])
+    assert replayer.fill_log[-1].ts_ns == event_ms * 1_000_000
+
+
 def test_render_markdown_states_the_verdict_and_its_limits() -> None:
     config = MarkoutConfig(horizons_s=(0.0, 1.0), min_samples=1)
     rows, _ = _flat_rows([3.0, 3.5, 2.5])

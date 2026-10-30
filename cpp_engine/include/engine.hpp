@@ -180,8 +180,13 @@ public:
         book_.set_sequence(update.final_update_id, update.exchange_ts, update.recv_ts);
         ++metrics_.depth_events;
         metrics_.last_update_ts = std::max(metrics_.last_update_ts, update.exchange_ts);
-        if (book_.best_bid().raw() > 0 && book_.best_ask().raw() > 0) {
-            mark_price_ = book_.top().mid();
+        // One validated read decides both the mark and the counter: a second
+        // `top()` could see a different book, and after its retries are
+        // exhausted it reports an invalid one, which must not become a mark of
+        // zero.
+        const Bbo mark = book_.top();
+        if (mark.is_valid()) {
+            mark_price_ = mark.mid();
         } else {
             ++metrics_.unpriced_frames;
         }
@@ -304,8 +309,9 @@ public:
                     opposite(request.side), touch, -fill_quantity,
                     current.exchange_ts);
                 (void)applied;
-                if (book_.best_bid().raw() > 0 && book_.best_ask().raw() > 0) {
-                    mark_price_ = book_.top().mid();
+                const Bbo mark = book_.top();
+                if (mark.is_valid()) {
+                    mark_price_ = mark.mid();
                 }
                 recompute_unrealized();
             }
@@ -411,6 +417,7 @@ private:
         fill.price = price;
         fill.quantity = quantity;
         fill.timestamp = timestamp != 0 ? timestamp : now_ns();
+        fill.event_ts = timestamp;
         fill.side = side;
         fill.is_maker = static_cast<std::uint8_t>(is_maker ? 1 : 0);
         const bool queued = fills_.try_push(fill);

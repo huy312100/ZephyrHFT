@@ -254,7 +254,8 @@ public:
                                      remaining);
             const Notional fee =
                 account_.apply_fill(leg.price, leg.quantity, request.side, false);
-            push_fill(id, leg.price, leg.quantity, request.side, false, fee);
+            push_fill(id, leg.price, leg.quantity, request.side, false, fee,
+                      request.timestamp);
             ++counters_.fills;
             counters_.filled_quantity += leg.quantity;
             counters_.traded_notional += notional(leg.price, leg.quantity);
@@ -385,13 +386,14 @@ private:
     }
 
     void push_fill(OrderId id, Price price, Quantity quantity, Side side, bool is_maker,
-                   Notional fee) noexcept {
+                   Notional fee, Nanos event_ts = 0) noexcept {
         Fill& fill = fills_[fill_head_ & (kFillRing - 1)];
         fill.order_id = id;
         fill.price = price;
         fill.quantity = quantity;
         fill.fee = fee;
         fill.timestamp = now_ns();
+        fill.event_ts = event_ts;
         fill.side = side;
         fill.is_maker = static_cast<std::uint8_t>(is_maker ? 1 : 0);
         if (fill_count_ == kFillRing) {
@@ -456,7 +458,7 @@ private:
             const Notional fee = account_.apply_fill(
                 crossed[i].price, crossed[i].remaining, crossed[i].side, true);
             push_fill(crossed[i].id, crossed[i].price, crossed[i].remaining,
-                      crossed[i].side, true, fee);
+                      crossed[i].side, true, fee, timestamp);
             ++counters_.fills;
             counters_.filled_quantity += crossed[i].remaining;
             counters_.traded_notional +=
@@ -632,7 +634,7 @@ private:
             const Notional fee = account_.apply_fill(
                 fills[i].price, fills[i].quantity, fills[i].side, true);
             push_fill(fills[i].id, fills[i].price, fills[i].quantity,
-                      fills[i].side, true, fee);
+                      fills[i].side, true, fee, timestamp);
             ++counters_.fills;
             counters_.filled_quantity += fills[i].quantity;
             counters_.traded_notional += notional(fills[i].price, fills[i].quantity);
