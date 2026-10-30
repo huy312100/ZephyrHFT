@@ -17,7 +17,7 @@ from python_analytics.native.factory import (
 )
 from python_analytics.strategies import InventoryMarketMaker
 from python_analytics.utils import load_settings
-from python_analytics.utils.config import ConfigError
+from python_analytics.utils.config import ConfigError, require_aligned_center
 
 DEPTH_JSON = (
     '{"e":"depthUpdate","E":1700000000000,"U":1,"u":1,"s":"BTCUSDT",'
@@ -137,6 +137,38 @@ def test_config_validation(tmp_path: Path) -> None:
     config = engine_config(load_settings())
     limits = risk_limits(load_settings())
     assert config.tick_size.raw() > 0 and limits.max_open_orders > 0
+
+
+def test_centre_tick_alignment_is_enforced() -> None:
+    """An off-grid centre rejects every price, so it is rejected up front.
+
+    ``LadderSide::slot_for`` refuses any price whose delta from the centre is
+    not a whole number of ticks; with an off-grid centre that is *every* price,
+    so the study comes back empty instead of failing.
+    """
+    require_aligned_center("30000", "0.5")
+    require_aligned_center("84570", "0.1")
+    require_aligned_center("30000.0", 0.5)
+
+    with pytest.raises(ValueError, match="not a whole number of ticks"):
+        require_aligned_center("30000.1", "0.5")
+    with pytest.raises(ValueError, match="tick size must be positive"):
+        require_aligned_center("30000", "0")
+    with pytest.raises(ValueError, match="tick size must be positive"):
+        require_aligned_center("30000", "nan")
+    with pytest.raises(ValueError, match="is not a decimal price"):
+        require_aligned_center("abc", "0.5")
+    with pytest.raises(ValueError, match="is not a finite price"):
+        require_aligned_center("inf", "0.5")
+
+
+def test_an_off_grid_centre_never_reaches_the_ladder() -> None:
+    from python_analytics.bridge import build_paper_engine
+
+    with pytest.raises(ValueError, match="not a whole number of ticks"):
+        build_paper_engine(tick_size="0.50", center="30000.1")
+    # The configured pair is on the grid and must keep building.
+    assert build_paper_engine(tick_size="0.50", center="30000") is not None
 
 
 def test_risk_manager_guards() -> None:

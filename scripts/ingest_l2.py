@@ -7,6 +7,12 @@ network/feed latency from the venue event time (``E``, falling back to ``T``)
 and appends the byte-exact payload to gzip-compressed NDJSON roll files under
 ``data_ingestion.storage_path`` (``data/raw_l2`` by default).
 
+With ``data_ingestion.aux_streams`` set (``trade`` by default in
+``config/settings.yaml``) the socket is the *combined* one, so trade prints are
+archived interleaved with the depth frames they moved. That is what a
+``--fill-model trade`` backtest needs: a depth snapshot alone can never show
+that a print happened at our quote.
+
 Design notes
 ------------
 * **The receive loop never touches the filesystem.** Frames are appended to an
@@ -21,18 +27,24 @@ Design notes
 * **Everything received is archived**, including frames without a venue
   timestamp (subscription acks, venue errors); those are counted separately so
   a gap in the capture is always attributable.
+* **Combined frames are unwrapped textually, not re-serialised.** A combined
+  socket delivers ``{"stream": .., "data": ..}``; the envelope is sliced off so
+  the archived line is the venue's own payload bytes, identical in shape to a
+  single-stream capture (and to what the C++ parser expects).
 
 Examples
 --------
     python3 scripts/ingest_l2.py --duration 30
     python3 scripts/ingest_l2.py --dry-run --duration 10   # no files, no disk
     python3 scripts/ingest_l2.py --replay data/sample_events.ndjson
+    python3 scripts/ingest_l2.py --depth-only --duration 30  # depth, no tape
 """
 from __future__ import annotations
 
 import argparse
 import asyncio
 import gzip
+import hashlib
 import json
 import logging
 import math
@@ -55,6 +67,8 @@ from python_analytics.utils.config import (
     COMPRESSION_CHOICES,
     ConfigError,
     DataIngestionSettings,
+    parse_stream_names,
+    silent_aux_streams,
 )
 
 logger = logging.getLogger("zephyr.ingest_l2")
@@ -67,6 +81,11 @@ Frame = Tuple[int, str]
 
 #: Buffer size above which a WARNING is logged (nothing is ever dropped).
 HIGH_WATER_BYTES = 64 * 1024 * 1024
+
+#: Cap on the roll-file name prefix. ``NAME_MAX`` is 255 bytes on Linux and on
+#: APFS; the stamp, sequence and suffix add ~30, so 120 leaves room for both
+#: and for a directory the venue does not control.
+MAX_SLUG_BYTES = 120
 
 #: A connection that survives this long resets the reconnect backoff.
 HEALTHY_SESSION_S = 5.0
@@ -83,6 +102,103 @@ def unwrap_payload(payload: Any) -> Any:
     if isinstance(payload, Mapping) and isinstance(payload.get("data"), Mapping):
         return payload["data"]
     return payload
+
+
+_JSON_DECODER = json.JSONDecoder()
+
+
+def _skip_ws(raw: str, index: int) -> int:
+    """Advances past spaces, tabs and newlines."""
+    limit = len(raw)
+    while index < limit and raw[index] in " \t\r\n":
+        index += 1
+    return index
+
+
+def _envelope_data_span(raw: str) -> Optional[Tuple[int, int]]:
+    """Returns the text span of a combined envelope's ``data`` value, or ``None``.
+
+    The members are walked one at a time with ``JSONDecoder.raw_decode``, which
+    reports where each value ends, so the span is the value's own text: a brace
+    inside a string, a nested object, or a key that *follows* ``data`` can
+    neither shorten nor extend it. ``None`` unless the line is a single
+    ``{"stream": ..., "data": ...}`` object, so a bare payload that happens to
+    carry a ``data`` key is left alone.
+    """
+    index = _skip_ws(raw, 0)
+    if index >= len(raw) or raw[index] != "{":
+        return None
+    index += 1
+    has_stream = False
+    span: Optional[Tuple[int, int]] = None
+    while True:
+        index = _skip_ws(raw, index)
+        if index >= len(raw):
+            return None
+        if raw[index] == "}":
+            break
+        try:
+            key, index = _JSON_DECODER.raw_decode(raw, index)
+        except ValueError:
+            return None
+        if not isinstance(key, str):
+            return None
+        index = _skip_ws(raw, index)
+        if index >= len(raw) or raw[index] != ":":
+            return None
+        index = _skip_ws(raw, index + 1)
+        start = index
+        try:
+            _, index = _JSON_DECODER.raw_decode(raw, index)
+        except ValueError:
+            return None
+        if key == "stream":
+            has_stream = True
+        elif key == "data":
+            span = (start, index)
+        index = _skip_ws(raw, index)
+        if index >= len(raw):
+            return None
+        if raw[index] == ",":
+            index += 1
+            continue
+        if raw[index] != "}":
+            return None
+        break
+    if not has_stream or span is None:
+        return None
+    return span
+
+
+def unwrap_frame_text(raw: str) -> str:
+    """Returns the line to archive for one socket frame.
+
+    A single-stream socket already delivers the bare payload, which is archived
+    verbatim. A combined socket wraps it as
+    ``{"stream": "<name>", "data": <payload>}``; the envelope is sliced off
+    *textually* rather than round-tripped through ``json``, because re-serialising
+    would reformat numbers and the archive would stop being ground truth. The
+    ``stream`` name is pure redundancy: the payload carries ``s`` itself.
+    """
+    if '"stream"' not in raw:
+        return raw
+    span = _envelope_data_span(raw)
+    if span is None:
+        return raw
+    return raw[span[0]:span[1]]
+
+
+def event_kind(payload: Any) -> str:
+    """Classifies a payload as ``depth``, ``trade`` or ``other``."""
+    data = unwrap_payload(payload)
+    if not isinstance(data, Mapping):
+        return "other"
+    event = data.get("e")
+    if event in ("depthUpdate", "depth"):
+        return "depth"
+    if event in ("trade", "aggTrade"):
+        return "trade"
+    return "other"
 
 
 def event_timestamp_ns(payload: Any) -> Optional[int]:
@@ -394,6 +510,18 @@ class RawL2Writer:
             self._high_water_logged = False
 
     # -- file handling (worker thread only, except stats()) ---------------- #
+    def prepare(self) -> None:
+        """Opens the first roll file eagerly, before the socket is connected.
+
+        The first write otherwise happens in the worker thread, where a failing
+        ``_open_file`` is logged, the chunk is discarded, and ``stats.stored``
+        keeps counting frames -- a capture that looks healthy and archives
+        nothing. Opening one file up front turns an unusable archive (missing
+        permission, wrong filesystem) into a refusal to start.
+        """
+        if self._handle is None:
+            self._open_file(self._clock())
+
     def _should_rotate(self, now: float, incoming: int) -> bool:
         # Size rotation only applies when there is data to write; otherwise a
         # final empty flush would create a spurious (empty) roll file.
@@ -407,10 +535,7 @@ class RawL2Writer:
     def _open_file(self, now: float) -> None:
         self._directory.mkdir(parents=True, exist_ok=True)
         stamp = datetime.fromtimestamp(now, timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-        slug = (
-            f"{self._settings.exchange}_{self._settings.symbol}_"
-            f"{self._settings.stream_type.replace('@', '_')}"
-        )
+        slug = self._slug()
         while True:
             self._sequence += 1
             path = self._directory / f"{slug}_{stamp}_{self._sequence:05d}{self._suffix}"
@@ -435,6 +560,27 @@ class RawL2Writer:
         self._live_bytes = 0
         self._file_bytes = 0
         logger.info("roll file open: %s", path)
+
+    def _slug(self) -> str:
+        """Roll-file name prefix, bounded so the whole name fits a filesystem.
+
+        ``data_ingestion.aux_streams`` accepts any number of distinct tags, and
+        ten long ones would push the name past ``NAME_MAX`` (255 bytes). The
+        prefix is therefore capped and disambiguated with a hash of the full
+        set, so two long configurations still produce distinct, readable names.
+        """
+        slug = "_".join(
+            [
+                f"{self._settings.exchange}_{self._settings.symbol}",
+                *(tag.replace("@", "_") for tag in self._settings.stream_tags),
+            ]
+        )
+        encoded = slug.encode("utf-8")
+        if len(encoded) <= MAX_SLUG_BYTES:
+            return slug
+        digest = hashlib.sha1(encoded).hexdigest()[:8]
+        head = encoded[: MAX_SLUG_BYTES - len(digest) - 1].decode("utf-8", "ignore")
+        return f"{head}_{digest}"
 
     def _close_file(self) -> None:
         handle, self._handle = self._handle, None
@@ -517,6 +663,8 @@ class IngestStats:
     started_ns: int = 0
     frames: int = 0
     stored: int = 0
+    depth_frames: int = 0
+    trade_frames: int = 0
     no_timestamp: int = 0
     malformed: int = 0
     bytes_received: int = 0
@@ -680,6 +828,15 @@ class L2IngestClient:
         """Roll-file counters, or ``None`` in dry-run mode."""
         return None if self._writer is None else self._writer.stats()
 
+    def prepare_storage(self) -> None:
+        """Opens the first roll file, so a bad archive path fails loudly here.
+
+        No-op in dry-run mode. Raises ``OSError`` if the archive cannot be
+        opened; the caller turns that into a refusal to start.
+        """
+        if self._writer is not None:
+            self._writer.prepare()
+
     # -- shutdown ---------------------------------------------------------- #
     def _stop_event(self) -> asyncio.Event:
         """Lazily creates the stop event (asyncio.Event needs a running loop)."""
@@ -747,7 +904,7 @@ class L2IngestClient:
         # Archive first: the capture stays byte-complete even if a payload is
         # unparseable, which is what makes the roll files usable as ground truth.
         if self._writer is not None:
-            self._writer.append(raw)
+            self._writer.append(unwrap_frame_text(raw))
             stats.stored += 1
 
         payload = parse_payload(raw)
@@ -756,6 +913,12 @@ class L2IngestClient:
             if stats.malformed <= 5:
                 logger.warning("malformed frame #%d: %.160s", stats.malformed, raw)
             return
+
+        kind = event_kind(payload)
+        if kind == "depth":
+            stats.depth_frames += 1
+        elif kind == "trade":
+            stats.trade_frames += 1
 
         event_ns = event_timestamp_ns(payload)
         if event_ns is None:
@@ -894,6 +1057,8 @@ class L2IngestClient:
         elapsed = stats.elapsed_s(self._clock())
         rate = stats.frames / elapsed if elapsed > 0 else 0.0
         parts = [f"frames={stats.frames}", f"rate={rate:.1f}/s"]
+        if stats.depth_frames or stats.trade_frames:
+            parts.append(f"depth={stats.depth_frames} trade={stats.trade_frames}")
         if latency.samples:
             parts.append(
                 f"lat_ms(p50={latency.p50_ms:.2f} p95={latency.p95_ms:.2f} "
@@ -939,6 +1104,12 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--symbol", default=None, help="stream symbol, e.g. btcusdt")
     parser.add_argument("--stream", dest="stream_type", default=None,
                         help="stream type, e.g. depth@100ms")
+    parser.add_argument("--aux-stream", dest="aux_streams", action="append",
+                        default=None, metavar="TYPE",
+                        help="extra stream on the same socket, e.g. trade "
+                             "(repeatable; replaces data_ingestion.aux_streams)")
+    parser.add_argument("--depth-only", action="store_true",
+                        help="capture the depth stream only (drop the tape)")
     parser.add_argument("--url", dest="ws_base_url", default=None,
                         help="WebSocket base URL (overrides the exchange endpoint)")
     parser.add_argument("--output-dir", type=Path, default=None,
@@ -979,6 +1150,12 @@ def build_settings(args: argparse.Namespace) -> DataIngestionSettings:
         "telemetry_interval_s": args.telemetry_interval,
         "latency_warn_ms": args.latency_warn_ms,
     }
+    # ``--depth-only`` wins over ``--aux-stream``: an explicit request to drop
+    # the tape must not be undone by a flag earlier on the command line.
+    if args.depth_only:
+        overrides["aux_streams"] = ()
+    elif args.aux_streams:
+        overrides["aux_streams"] = parse_stream_names(args.aux_streams)
     overrides = {name: value for name, value in overrides.items() if value is not None}
     return replace(settings, **overrides) if overrides else settings
 
@@ -1017,6 +1194,9 @@ def _print_summary(
     print("=" * 74)
     print(f"  Stream        : {settings.stream_url}")
     print(f"  Frames        : {stats.frames:,}  ({rate:.1f}/s over {elapsed:.1f}s)")
+    if stats.depth_frames or stats.trade_frames:
+        print(f"  Composition   : depth={stats.depth_frames:,}"
+              f"  trade={stats.trade_frames:,}")
     if writer is None:
         print("  Archived      : dry-run (no storage)")
     else:
@@ -1061,12 +1241,33 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     storage_dir = (
         Path(args.output_dir) if args.output_dir is not None else settings.storage_dir
     )
+    # Fail before the socket is opened: an unwritable archive would otherwise be
+    # discovered by the first flush, whose error is logged and the chunk
+    # discarded while the run keeps counting archived frames.
+    try:
+        client.prepare_storage()
+    except OSError as exc:
+        print(f"cannot open the capture archive in {storage_dir}: {exc}", file=sys.stderr)
+        return 1
     logger.info(
         "ingest %s -> %s (%s)",
         settings.stream_url,
         "dry-run (no files)" if args.dry_run else storage_dir,
         "no storage" if args.dry_run else settings.compression,
     )
+    if not settings.aux_streams:
+        logger.warning(
+            "depth-only capture: no trade prints are archived, so "
+            "'--fill-model trade' can never fill from this archive"
+        )
+    else:
+        silent = silent_aux_streams(settings.aux_streams, settings.endpoint)
+        if silent:
+            logger.warning(
+                "aux stream(s) %s were accepted and stayed silent on this "
+                "endpoint; the tape needs 'trade' (docs/phase5 section 11.6.1)",
+                ", ".join(f"{settings.symbol}@{tag}" for tag in silent),
+            )
 
     async def _run() -> None:
         install_signal_handlers(client)

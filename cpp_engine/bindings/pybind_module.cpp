@@ -120,6 +120,12 @@ PYBIND11_MODULE(hft_native, m) {
         .value("FILLED", OrderStatus::Filled)
         .value("CANCELLED", OrderStatus::Cancelled)
         .value("REJECTED", OrderStatus::Rejected);
+    // Maker fill model: TOUCH fills on the touch crossing, QUEUE waits for
+    // volume to trade through the displayed depth ahead of the order.
+    py::enum_<fill_model>(m, "FillModel")
+        .value("TOUCH", fill_model::touch)
+        .value("QUEUE", fill_model::queue)
+        .value("TRADE", fill_model::trade);
     py::enum_<RejectReason>(m, "RejectReason")
         .value("NONE", RejectReason::None)
         .value("INVALID_PRICE", RejectReason::InvalidPrice)
@@ -265,6 +271,7 @@ PYBIND11_MODULE(hft_native, m) {
         .def_readonly("quantity", &Fill::quantity)
         .def_readonly("fee", &Fill::fee)
         .def_readonly("timestamp", &Fill::timestamp)
+        .def_readonly("event_ts", &Fill::event_ts)
         .def_readonly("side", &Fill::side)
         .def_readonly("is_maker", &Fill::is_maker);
 
@@ -547,7 +554,10 @@ PYBIND11_MODULE(hft_native, m) {
         .def_readonly("p50_ns", &EngineMetrics::p50_ns)
         .def_readonly("p99_ns", &EngineMetrics::p99_ns)
         .def_readonly("p999_ns", &EngineMetrics::p999_ns)
-        .def_readonly("open_orders", &EngineMetrics::open_orders);
+        .def_readonly("open_orders", &EngineMetrics::open_orders)
+        .def_readonly("rejected_levels", &EngineMetrics::rejected_levels)
+        .def_readonly("book_recenters", &EngineMetrics::book_recenters)
+        .def_readonly("unpriced_frames", &EngineMetrics::unpriced_frames);
 
     py::class_<OrderView>(m, "OrderView")
         .def(py::init<>())
@@ -810,14 +820,23 @@ PYBIND11_MODULE(hft_native, m) {
         .def_readonly("open_orders", &paper_metrics::open_orders)
         .def_readonly("last_update_ts", &paper_metrics::last_update_ts)
         .def_readonly("last_frame_latency_ns", &paper_metrics::last_frame_latency_ns)
+        .def_readonly("trade_events", &paper_metrics::trade_events)
+        .def_readonly("rejected_levels", &paper_metrics::rejected_levels)
+        .def_readonly("book_recenters", &paper_metrics::book_recenters)
+        .def_readonly("unpriced_frames", &paper_metrics::unpriced_frames)
         .def_readonly("account", &paper_metrics::account);
 
     py::class_<paper_engine>(m, "PaperEngine")
-        .def(py::init<Price, Price, double, double, Notional>(),
+        .def(py::init<Price, Price, double, double, Notional, fill_model>(),
              py::arg("tick_size"), py::arg("center"), py::arg("maker_bps") = 0.0,
-             py::arg("taker_bps") = 5.0, py::arg("initial_cash") = Notional{})
+             py::arg("taker_bps") = 5.0, py::arg("initial_cash") = Notional{},
+             py::arg("fill_model") = fill_model::touch)
+        .def("set_fill_model", &paper_engine::set_fill_model,
+             py::arg("model"))
+        .def("fill_model", &paper_engine::model)
         .def("reset", &paper_engine::reset)
         .def("process_update", &paper_engine::process_update, py::arg("update"))
+        .def("process_trade", &paper_engine::process_trade, py::arg("trade"))
         .def("submit", &paper_engine::submit, py::arg("request"))
         .def("cancel", &paper_engine::cancel, py::arg("order_id"),
              py::arg("timestamp") = 0)

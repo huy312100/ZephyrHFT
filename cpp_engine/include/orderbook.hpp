@@ -14,11 +14,13 @@
 // false sharing.
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <bit>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <optional>
 #include <span>
 #include <type_traits>
@@ -111,6 +113,17 @@ public:
         return Quantity::from_raw(quantities_[slot]);
     }
 
+    // Whether the ladder window can hold this price at all, ignoring whether it
+    // sits on the tick grid. Used to decide when the grid itself is wrong.
+    [[nodiscard]] bool contains(Price price) const noexcept {
+        if (tick_raw_ <= 0) {
+            return false;
+        }
+        const std::int64_t delta = price.raw() - center_raw_;
+        const std::int64_t span = static_cast<std::int64_t>(kHalf) * tick_raw_;
+        return delta >= -span && delta < span;
+    }
+
     [[nodiscard]] std::size_t live_levels() const noexcept { return live_levels_; }
     [[nodiscard]] std::int64_t tick_raw() const noexcept { return tick_raw_; }
     [[nodiscard]] std::int64_t center_raw() const noexcept { return center_raw_; }
@@ -134,7 +147,124 @@ public:
         return written;
     }
 
+    // Re-indexes the whole ladder onto a window centred on ``center``, keeping
+    // the tick. Every level the new window can hold is kept: the slots are
+    // translated by a constant, so the move is a memmove plus a bitmap shift
+    // rather than a level-by-level copy, and nothing is allocated. Levels that
+    // fall outside the new window are dropped, because the grid they were
+    // indexed on no longer exists.
+    void retarget(std::int64_t center) noexcept {
+        if (tick_raw_ <= 0) {
+            return;
+        }
+        const std::int64_t delta = center_raw_ - center;
+        center_raw_ = center;
+        if (delta % tick_raw_ != 0) {
+            // The new window sits off this ladder's grid, so no level has a
+            // slot to land on. Same outcome as an out-of-window frame: the
+            // feed rebuilds the book.
+            clear_all();
+            return;
+        }
+        const std::int64_t shift = delta / tick_raw_;
+        if (shift == 0) {
+            return;
+        }
+        const auto span = static_cast<std::int64_t>(MaxTicks);
+        if (shift <= -span || shift >= span) {
+            clear_all();
+            return;
+        }
+        if (shift > 0) {
+            const auto moved = static_cast<std::size_t>(shift);
+            std::memmove(quantities_.data() + moved, quantities_.data(),
+                         (MaxTicks - moved) * sizeof(std::int64_t));
+            std::fill_n(quantities_.data(), moved, std::int64_t{0});
+            shift_occupancy(moved, /*up=*/true);
+        } else {
+            const auto moved = static_cast<std::size_t>(-shift);
+            std::memmove(quantities_.data(), quantities_.data() + moved,
+                         (MaxTicks - moved) * sizeof(std::int64_t));
+            std::fill_n(quantities_.data() + (MaxTicks - moved), moved, std::int64_t{0});
+            shift_occupancy(moved, /*up=*/false);
+        }
+        refresh_index();
+    }
+
 private:
+    void clear_all() noexcept {
+        quantities_.fill(0);
+        occupancy_.fill(0);
+        best_slot_ = -1;
+        live_levels_ = 0;
+    }
+
+    // Moves the occupancy bitmap by ``by`` bits, in the same direction as the
+    // quantities. Iterating in the direction of the move means every word is
+    // read before it is overwritten.
+    void shift_occupancy(std::size_t by, bool up) noexcept {
+        const std::size_t words = by / 64;
+        const unsigned bits = static_cast<unsigned>(by % 64);
+        if (words >= kWords) {
+            occupancy_.fill(0);
+            return;
+        }
+        if (up) {
+            for (std::size_t i = kWords; i-- > 0;) {
+                std::uint64_t value = 0;
+                if (i >= words) {
+                    const std::size_t src = i - words;
+                    value = occupancy_[src] << bits;
+                    if (bits != 0 && src > 0) {
+                        value |= occupancy_[src - 1] >> (64U - bits);
+                    }
+                }
+                occupancy_[i] = value;
+            }
+        } else {
+            for (std::size_t i = 0; i < kWords; ++i) {
+                std::uint64_t value = 0;
+                const std::size_t src = i + words;
+                if (src < kWords) {
+                    value = occupancy_[src] >> bits;
+                    if (bits != 0 && src + 1 < kWords) {
+                        value |= occupancy_[src + 1] << (64U - bits);
+                    }
+                }
+                occupancy_[i] = value;
+            }
+        }
+    }
+
+    // Recomputes the touch and the live count from the bitmap after a move:
+    // 128 word operations instead of a slot-by-slot rescan of the ladder.
+    void refresh_index() noexcept {
+        std::int32_t live = 0;
+        for (std::size_t word = 0; word < kWords; ++word) {
+            live += static_cast<std::int32_t>(std::popcount(occupancy_[word]));
+        }
+        live_levels_ = live;
+        best_slot_ = -1;
+        if (higher_is_better_) {
+            for (std::size_t word = kWords; word-- > 0;) {
+                if (occupancy_[word] != 0) {
+                    best_slot_ = static_cast<std::int32_t>(
+                        word * 64 + 63 -
+                        static_cast<std::size_t>(std::countl_zero(occupancy_[word])));
+                    break;
+                }
+            }
+        } else {
+            for (std::size_t word = 0; word < kWords; ++word) {
+                if (occupancy_[word] != 0) {
+                    best_slot_ = static_cast<std::int32_t>(
+                        word * 64 + static_cast<std::size_t>(std::countr_zero(occupancy_[word])));
+                    break;
+                }
+            }
+        }
+    }
+
     [[nodiscard]] bool slot_for(Price price, std::size_t& out) const noexcept {
         const std::int64_t delta = price.raw() - center_raw_;
         if (tick_raw_ <= 0 || delta % tick_raw_ != 0) {
@@ -252,13 +382,47 @@ public:
 
     void configure(Price tick_size, Price center) noexcept {
         begin_write();
-        bid_.configure(tick_size, center, true);
-        ask_.configure(tick_size, center, false);
+        configure_owned(tick_size, center);
+        end_write();
+    }
+
+    // Re-anchors the price window on `center`, keeping the tick. Levels the new
+    // window can still hold are carried across, so a re-anchor does not throw
+    // away depth it could keep; anything outside the new window is dropped,
+    // because the grid it was indexed on no longer exists. The move is a slot
+    // translation on both ladders (memmove plus a bitmap shift), so it keeps
+    // every representable level without allocating and without a level count.
+    //
+    // A ladder anchored on a stale constant is blind -- it accepts nothing and
+    // reports an empty book rather than a bad price, which is the failure this
+    // method exists to undo. Note that a *diff* depth feed only repeats a level
+    // when it changes, so a dropped level is not rebuilt on its own: after a
+    // re-anchor that loses depth, a live deployment must reseed from a REST
+    // snapshot (``seed_from_snapshot``) rather than trust the near touch.
+    void recenter(Price center) noexcept {
+        begin_write();
+        bid_.retarget(center.raw());
+        ask_.retarget(center.raw());
         last_exchange_ts_ = 0;
         last_recv_ts_ = 0;
         last_sequence_ = 0;
         updates_ = 0;
         end_write();
+    }
+
+    [[nodiscard]] Price center() const noexcept {
+        return center_price();
+    }
+
+    // A side with no levels means the feed cannot be represented at all, which
+    // is different from a genuinely empty market: no venue quotes one-sided
+    // forever, so a blind ladder is always a configuration/grid problem.
+    [[nodiscard]] bool blind() const noexcept {
+        return bid_.live_levels() == 0 || ask_.live_levels() == 0;
+    }
+
+    [[nodiscard]] bool contains(Price price) const noexcept {
+        return bid_.contains(price);
     }
 
     // L2 semantics: absolute quantity at a price. Zero removes the level.
@@ -274,6 +438,12 @@ public:
         }
         end_write();
         return ok;
+    }
+
+    // Displayed quantity resting at ``price`` on one side; zero when the level
+    // is empty or the price is outside the ladder. Read-only, allocation-free.
+    [[nodiscard]] Quantity quantity_at(Side side, Price price) const noexcept {
+        return ladder(side).quantity_at(price);
     }
 
     // Signed delta update, useful for L3 aggregation or trade prints.
@@ -332,7 +502,11 @@ public:
                 return bbo;
             }
         }
-        return bbo;  // best-effort under pathological writer pressure
+        // Every retry lost the race with the writer. Reporting the last torn
+        // read would hand the caller a book that was never consistent, so
+        // report an invalid one instead: every consumer of `top()` already
+        // fails closed on `is_valid()` (no quote, no order, no mark).
+        return Bbo{};
     }
 
     [[nodiscard]] bool snapshot(BookSnapshot& out) const noexcept {
@@ -386,6 +560,16 @@ public:
 private:
     using Ladder = detail::LadderSide<MaxTicks>;
 
+    // The write half of ``configure``, for callers already holding the seqlock.
+    void configure_owned(Price tick_size, Price center) noexcept {
+        bid_.configure(tick_size, center, true);
+        ask_.configure(tick_size, center, false);
+        last_exchange_ts_ = 0;
+        last_recv_ts_ = 0;
+        last_sequence_ = 0;
+        updates_ = 0;
+    }
+
     [[nodiscard]] const Ladder& ladder(Side side) const noexcept {
         return side == Side::Buy ? bid_ : ask_;
     }
@@ -427,6 +611,101 @@ private:
 };
 
 using L2Book = L2OrderBook<8192>;
+
+// Whether a depth frame proves the ladder is anchored on a price the window can
+// no longer hold, and if so where it must move.
+//
+// A ladder covers `center +/- kHalf` ticks. Anchor it on a constant that the
+// live market has left behind and every level is rejected while `top()` keeps
+// returning an empty book -- a failure that looks exactly like a quiet market,
+// so it can survive a whole study unnoticed. The book that is merely out of date
+// is worse: once it holds levels it is no longer ``blind()``, so the next time
+// the market leaves the window it rejects the whole frame while still publishing
+// that believable -- and wrong -- BBO to the quoting and matching paths, with
+// ``unpriced_frames`` at zero. The test is therefore the frame, not the book:
+// when this frame carries a touch the window cannot hold, the anchor is
+// demonstrably wrong whatever the ladder currently contains. The frame's own
+// touch is the only evidence available about where the market is.
+//
+// The tick is never touched: it is the venue's grid, and a wrong tick has to
+// stay visible (as rejected levels) instead of being guessed around. The rule is
+// idempotent -- once the anchor equals the frame's touch it returns zero -- so an
+// unrepresentable grid cannot make the book thrash, clearing itself every frame.
+// Two conditions are required as evidence, not one: the touch must be outside
+// *and* most of the frame must be unrepresentable, so a corrupt print cannot
+// drag the book onto a price the market never traded at. A frame that is an even
+// split -- one level inside the window, one outside -- is not evidence either
+// way, and the tie goes to keeping the populated book: moving on it would drop
+// every level it holds on the strength of a single stray price.
+//
+// Returns the price to re-anchor on, or a default (zero) Price for "no move".
+template <std::size_t MaxTicks>
+[[nodiscard]] inline Price reframe_anchor(const L2OrderBook<MaxTicks>& book,
+                                          const DepthUpdate& update) noexcept {
+    Price best_bid{};
+    Price best_ask{};
+    bool has_bid = false;
+    bool has_ask = false;
+    // How much of this frame the current window can hold. The touch alone is not
+    // evidence: real captures carry stray levels thousands of ticks away, and a
+    // frame with one implausible price would otherwise drag the anchor onto a
+    // corrupt level and lose the whole book with it.
+    std::uint32_t levels = 0;
+    std::uint32_t held = 0;
+    for (std::uint32_t i = 0; i < update.bid_count; ++i) {
+        const LevelDelta& level = update.bids[i];
+        if (level.quantity.raw() <= 0) {
+            continue;
+        }
+        ++levels;
+        if (book.contains(level.price)) {
+            ++held;
+        }
+        if (!has_bid || level.price.raw() > best_bid.raw()) {
+            best_bid = level.price;
+            has_bid = true;
+        }
+    }
+    for (std::uint32_t i = 0; i < update.ask_count; ++i) {
+        const LevelDelta& level = update.asks[i];
+        if (level.quantity.raw() <= 0) {
+            continue;
+        }
+        ++levels;
+        if (book.contains(level.price)) {
+            ++held;
+        }
+        if (!has_ask || level.price.raw() < best_ask.raw()) {
+            best_ask = level.price;
+            has_ask = true;
+        }
+    }
+    if (levels == 0) {
+        return Price{};
+    }
+    if ((!has_bid || book.contains(best_bid)) && (!has_ask || book.contains(best_ask))) {
+        return Price{};  // the window can hold this frame: nothing is wrong yet
+    }
+    // The touch is outside the window. Move the anchor only when most of the frame
+    // cannot be held either -- a lone bad price is a bad print, not proof that the
+    // market has left -- unless the book is blind, in which case it has nothing to
+    // lose and nothing to keep it right. ``held * 2 == levels`` is a tie, so the
+    // comparison is ``>=``: at half the frame held, the frame does not prove the
+    // window is wrong, and a move would drop the levels that did fit.
+    if (!book.blind() && static_cast<std::uint64_t>(held) * 2 >= levels) {
+        return Price{};
+    }
+    // Mid of whatever sides this frame touches, floored onto the tick grid.
+    const Price::rep mid = has_bid && has_ask
+                               ? (best_bid.raw() + best_ask.raw()) / 2
+                               : (has_bid ? best_bid.raw() : best_ask.raw());
+    const Price::rep tick = book.tick_size().raw();
+    const Price::rep anchor = tick > 0 ? mid - (mid % tick) : mid;
+    if (anchor == book.center().raw()) {
+        return Price{};  // already anchored there: the grid, not the anchor, is wrong
+    }
+    return Price::from_raw(anchor);
+}
 
 // ---------------------------------------------------------------------------
 // L3 order book: fixed order pool + open-addressed order-id index.

@@ -157,6 +157,46 @@ void test_l2_book() {
     CHECK(book.updates() >= 5);
 }
 
+// A reader that never wins the seqlock race must not be handed the torn book it
+// just read. ``top()`` reports an invalid Bbo instead, and every consumer of it
+// already fails closed: the paper engine marks nothing, the trading engine
+// quotes nothing, and no order is submitted against a book it cannot vouch for.
+void test_top_never_returns_a_half_written_book() {
+    hft::L2Book book{hft::Price::from_int(1), hft::Price::from_int(30'000)};
+    CHECK(book.apply_level(hft::Side::Buy, hft::Price::from_int(29'999),
+                           hft::Quantity::from_int(5)));
+    CHECK(book.apply_level(hft::Side::Sell, hft::Price::from_int(30'001),
+                           hft::Quantity::from_int(5)));
+    CHECK(book.top().is_valid());
+
+    std::atomic<bool> stop{false};
+    std::thread writer([&] {
+        std::int64_t quantity = 1;
+        while (!stop.load(std::memory_order_relaxed)) {
+            (void)book.apply_level(hft::Side::Buy, hft::Price::from_int(29'999),
+                                   hft::Quantity::from_int(quantity));
+            (void)book.apply_level(hft::Side::Sell, hft::Price::from_int(30'001),
+                                   hft::Quantity::from_int(quantity));
+            quantity = quantity == 1 ? 2 : 1;
+        }
+    });
+    for (int i = 0; i < 200'000; ++i) {
+        const hft::Bbo bbo = book.top();
+        if (bbo.is_valid()) {
+            CHECK(bbo.bid_price == hft::Price::from_int(29'999));
+            CHECK(bbo.ask_price == hft::Price::from_int(30'001));
+            continue;
+        }
+        // Fail closed: no prices, no clocks, no sequence -- never one side of a
+        // write paired with the other side of the next.
+        CHECK(bbo.bid_price.raw() == 0);
+        CHECK(bbo.ask_price.raw() == 0);
+        CHECK(bbo.exchange_ts == 0 && bbo.recv_ts == 0 && bbo.sequence == 0);
+    }
+    stop.store(true);
+    writer.join();
+}
+
 void test_l3_book() {
     hft::L3Book book{hft::Price::from_int(1), hft::Price::from_int(30'000)};
     CHECK(book.add_order(1, hft::Side::Buy, hft::Price::from_int(29'999),
@@ -395,6 +435,98 @@ void test_json_parser() {
     hft::TradeTick bad_trade;
     CHECK(!hft::JsonFeedParser::parse_trade(R"({"e":"trade","p":"oops","q":"1"})",
                                             bad_trade));
+}
+
+void test_re_anchor_keeps_every_level_the_window_can_hold() {
+    // Retention used to copy at most 64 levels a side, so a deep ladder lost
+    // levels that still fitted the new window. The whole ladder is translated
+    // now, and this test carries more levels than that old bound.
+    hft::L2Book book{hft::Price::from_int(1), hft::Price::from_int(30'000)};
+    for (std::int64_t i = 0; i < 200; ++i) {
+        CHECK(book.apply_level(hft::Side::Buy, hft::Price::from_int(30'000 - i),
+                               hft::Quantity::from_int(1)));
+        CHECK(book.apply_level(hft::Side::Sell, hft::Price::from_int(30'001 + i),
+                               hft::Quantity::from_int(1)));
+    }
+    // Parked on the low edge of the window: it fits now, and the re-anchor
+    // below is what takes it out.
+    CHECK(book.apply_level(hft::Side::Buy, hft::Price::from_int(25'904),
+                           hft::Quantity::from_int(7)));
+    CHECK(book.live_levels(hft::Side::Buy) == 201);
+
+    book.recenter(hft::Price::from_int(30'100));
+
+    CHECK(book.center() == hft::Price::from_int(30'100));
+    CHECK(book.live_levels(hft::Side::Buy) == 200);   // only the edge level went
+    CHECK(book.live_levels(hft::Side::Sell) == 200);
+    CHECK(book.best_bid() == hft::Price::from_int(30'000));
+    CHECK(book.best_ask() == hft::Price::from_int(30'001));
+    CHECK(book.quantity_at(hft::Side::Buy, hft::Price::from_int(29'801)) ==
+          hft::Quantity::from_int(1));
+    CHECK(book.quantity_at(hft::Side::Sell, hft::Price::from_int(30'200)) ==
+          hft::Quantity::from_int(1));
+    CHECK(book.quantity_at(hft::Side::Buy, hft::Price::from_int(25'904)).raw() == 0);
+
+    // And back again, which is the other direction of the same translation.
+    book.recenter(hft::Price::from_int(30'000));
+    CHECK(book.live_levels(hft::Side::Buy) == 200);
+    CHECK(book.best_bid() == hft::Price::from_int(30'000));
+    CHECK(book.quantity_at(hft::Side::Buy, hft::Price::from_int(29'801)) ==
+          hft::Quantity::from_int(1));
+}
+
+void test_re_anchor_off_the_grid_drops_the_book_instead_of_moving_it() {
+    // A centre that is not a multiple of the tick leaves every level between
+    // slots; moving them by a truncated number of ticks would rewrite their
+    // prices. The book is emptied instead and rebuilt from the feed.
+    hft::L2Book book{hft::Price::from_int(1), hft::Price::from_int(30'000)};
+    CHECK(book.apply_level(hft::Side::Buy, hft::Price::from_int(29'999),
+                           hft::Quantity::from_int(1)));
+    CHECK(book.apply_level(hft::Side::Sell, hft::Price::from_int(30'001),
+                           hft::Quantity::from_int(1)));
+
+    book.recenter(hft::Price::from_double(30'100.5));
+
+    CHECK(book.live_levels(hft::Side::Buy) == 0);
+    CHECK(book.live_levels(hft::Side::Sell) == 0);
+    CHECK(book.blind());
+}
+
+void test_json_parser_keeps_the_levels_nearest_the_touch() {
+    // A partial-book burst carries more levels than the update buffer holds, and
+    // the venue promises no ordering. Here the bids are listed ascending from
+    // 30,000 and the asks descending from 40,039, so keeping the first
+    // come-first-served would make the engine's "best bid" the lowest bid in the
+    // frame and its "best ask" the highest ask -- neither of which the market
+    // ever quoted.
+    std::string json = "{\"e\":\"depthUpdate\",\"E\":1700000000000,\"U\":1,\"u\":2,";
+    json += "\"s\":\"BTCUSDT\",\"b\":[";
+    for (int i = 0; i < 40; ++i) {
+        json += (i == 0 ? "" : ",");
+        json += "[\"" + std::to_string(30000 + i) + ".0\",\"1.0\"]";
+    }
+    json += "],\"a\":[";
+    for (int i = 0; i < 40; ++i) {
+        json += (i == 0 ? "" : ",");
+        json += "[\"" + std::to_string(40039 - i) + ".0\",\"1.0\"]";
+    }
+    json += "]}";
+
+    hft::DepthUpdate update;
+    CHECK(hft::JsonFeedParser::parse_depth_update(json, update));
+    CHECK(update.bid_count == hft::kMaxDepthLevels);
+    CHECK(update.ask_count == hft::kMaxDepthLevels);
+    hft::Price::rep best_bid = 0;
+    for (std::uint32_t i = 0; i < update.bid_count; ++i) {
+        best_bid = std::max(best_bid, update.bids[i].price.raw());
+    }
+    hft::Price::rep best_ask = update.asks[0].price.raw();
+    for (std::uint32_t i = 1; i < update.ask_count; ++i) {
+        best_ask = std::min(best_ask, update.asks[i].price.raw());
+    }
+    CHECK(best_bid == P("30039").raw());  // the highest bid, not the first
+    CHECK(best_ask == P("40000").raw());  // the lowest ask, not the last
+    CHECK(update.bids[0].quantity == Q("1.0"));
 }
 
 void test_websocket_decoder() {
@@ -1075,6 +1207,44 @@ void test_risk_manager_in_engine() {
     CHECK(!plain.risk_manager_config().enabled);
 }
 
+void test_order_entry_refuses_a_book_it_cannot_see() {
+    // ``top()`` reports an invalid Bbo rather than a torn one, so order entry has
+    // to turn that into a refusal: the fat-finger gate is skipped (there is no
+    // mid to band against) and ``risk_.check()`` names the reason. Without this
+    // the engine would price a live order against half a book -- or, before the
+    // fail-closed read, against one side of one write and the other of the next.
+    hft::EngineConfig config;
+    config.tick_size = hft::Price::from_double(0.5);
+    config.center = hft::Price::from_int(30'000);
+    config.risk_manager = base_risk_config();
+    hft::TradingEngine engine(config);
+
+    hft::OrderRequest request;
+    request.side = hft::Side::Buy;
+    request.type = hft::OrderType::Limit;
+    request.quantity = Q("1");
+    request.price = P("29999.5");
+
+    const hft::OrderAck empty_book = engine.submit(request);
+    CHECK(!empty_book.accepted());
+    CHECK(empty_book.reason == hft::RejectReason::BookUnavailable);
+    CHECK(engine.metrics().orders_rejected == 1);
+
+    // A bid with no ask is still not a book, and the frame that produced it is
+    // counted as unpriced instead of becoming a mark of zero.
+    hft::DepthUpdate depth;
+    depth.exchange_ts = 1'000;
+    depth.bids[0] = {P("29999.5"), Q("50")};
+    depth.bid_count = 1;
+    engine.apply_depth(depth);
+    CHECK(engine.metrics().unpriced_frames == 1);
+
+    const hft::OrderAck one_sided = engine.submit(request);
+    CHECK(!one_sided.accepted());
+    CHECK(one_sided.reason == hft::RejectReason::BookUnavailable);
+    CHECK(engine.metrics().orders_rejected == 2);
+}
+
 void test_kill_switch_basic() {
     hft::KillSwitch kill;
     CHECK(!kill.is_tripped());
@@ -1543,11 +1713,15 @@ int main() {
     test_fixed_point();
     test_ring_buffer();
     test_l2_book();
+    test_top_never_returns_a_half_written_book();
     test_l3_book();
     test_order_manager();
     test_risk_guard();
     test_latency_histogram();
     test_json_parser();
+    test_json_parser_keeps_the_levels_nearest_the_touch();
+    test_re_anchor_keeps_every_level_the_window_can_hold();
+    test_re_anchor_off_the_grid_drops_the_book_instead_of_moving_it();
     test_websocket_decoder();
     test_l2_clear_resets_timestamps();
     test_crossing_limit_fill_preserves_price();
@@ -1562,6 +1736,7 @@ int main() {
     test_risk_manager_rate_limit();
     test_risk_manager_concurrent_burst();
     test_risk_manager_in_engine();
+    test_order_entry_refuses_a_book_it_cannot_see();
     test_kill_switch_basic();
     test_kill_switch_guards();
     test_kill_switch_hooks_and_threads();

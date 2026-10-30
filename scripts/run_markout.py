@@ -11,8 +11,12 @@ Two modes:
 
 * **replay** (default) — replays the same archives, the same frozen parameter
   lock and the same window slicing as ``run_walk_forward.py`` and marks the
-  fills it produces. Simulated fills carry a ``steady_clock`` stamp, so they can
-  only be measured inside the replay; there is no post-hoc join to fake.
+  fills it produces. Simulated fills carry a ``steady_clock`` stamp for their
+  local record time, so they can only be measured inside the replay; the engine
+  also carries the venue event time of whatever filled the order
+  (``Fill.event_ts``: the depth frame, or the print under ``--fill-model trade``)
+  and that is the clock the markout marks against. There is no post-hoc join to
+  fake.
 * **--fills FILE** — marks venue-timestamped fills (an export from a real
   session) against ``--source`` captures. Both sides must share the venue clock.
 
@@ -108,6 +112,10 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--frames-per-hook", type=int, default=1,
                         help="frames per strategy hook; bounds markout resolution "
                              "(default 1 = every frame)")
+    parser.add_argument("--fill-model", default="touch",
+                        choices=("touch", "queue", "trade"),
+                        help="fill model used to reproduce the fills; match the "
+                             "study's --fill-model (default: touch)")
     parser.add_argument("--fills", default=None,
                         help="JSON of venue-timestamped fills; skips the replay and marks "
                              "these against --source instead")
@@ -160,7 +168,8 @@ def markouts_from_replay(args: argparse.Namespace, parameters: LockedParameters,
     window boundary impossible to mistake for a price move.
     """
     paths = resolve_sources(args.source)
-    runner = WalkForwardRunner(parameters, window_events=args.window_events)
+    runner = WalkForwardRunner(parameters, window_events=args.window_events,
+                               fill_model=args.fill_model)
     rows: List[Any] = []
     windows: List[Dict[str, Any]] = []
     for path, offset, lines in runner.iter_slices(paths):
@@ -173,6 +182,7 @@ def markouts_from_replay(args: argparse.Namespace, parameters: LockedParameters,
             initial_cash=parameters.initial_cash,
             frames_per_hook=args.frames_per_hook,
             order_quantity=parameters.order_quantity,
+            fill_model=args.fill_model,
         )
         replayer.replay_lines(lines, parameters.build_strategy())
         window_rows = replayer.markout_rows()
@@ -236,6 +246,9 @@ def build_payload(args: argparse.Namespace, parameters: LockedParameters,
         "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "inputs": {
             "mode": "fills" if args.fills else "replay",
+            # No model produced the fills in ``--fills`` mode, so recording one
+            # would attribute an edge to a simulator that never ran.
+            "fill_model": None if args.fills else str(args.fill_model),
             "sources": [str(path) for path in resolve_sources(args.source)],
             "lock_file": str(args.lock_file),
             "lock_fingerprint": parameters.fingerprint,
@@ -282,7 +295,8 @@ def run(args: argparse.Namespace) -> int:
     if args.fills:
         print(f"  fills         : {args.fills} (clock={args.clock})")
     else:
-        print(f"  window_events : {args.window_events or 'per-archive'}"
+        print(f"  replay        : {args.fill_model} fill model"
+              f"  window_events {args.window_events or 'per-archive'}"
               f"  frames_per_hook {args.frames_per_hook}")
     print("-" * 100)
 
@@ -325,8 +339,11 @@ def run(args: argparse.Namespace) -> int:
                              report_dir / f"{args.stem}_fills.csv")
         markdown_path = report_dir / f"{args.stem}.md"
         markdown_path.parent.mkdir(parents=True, exist_ok=True)
-        markdown_path.write_text("\n".join(render_markdown(summary, verdict)) + "\n",
-                                 encoding="utf-8")
+        markdown_path.write_text(
+            "\n".join(render_markdown(summary, verdict,
+                                      fill_model=None if args.fills else args.fill_model))
+            + "\n",
+            encoding="utf-8")
         print("-" * 100)
         print(f"  wrote: {json_path}")
         print(f"  wrote: {markdown_path}")

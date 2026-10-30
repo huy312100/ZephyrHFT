@@ -74,7 +74,7 @@ used at the orchestration/analytics boundary.
 | 3 | Batch replay, OFI alpha, optimisation, chaos | Complete | [`docs/phase3_backtesting_architecture.md`](docs/phase3_backtesting_architecture.md) |
 | 3.1 / 3.2 | Network chaos injection, heartbeat dead-man's switch | Complete | [Chaos & stress testing](#chaos--stress-testing-phase-31--32) |
 | **4** | **Walk-forward OOS validation, fingerprinted parameter lock** | **Complete / verified** | [`docs/phase4_walk_forward.md`](docs/phase4_walk_forward.md) |
-| **5** | **Production readiness gate, build + alpha verdicts** | **Complete / verified (build GO 15/15; alpha NO-GO at retail fees)** | [`docs/phase5_production_readiness.md`](docs/phase5_production_readiness.md) |
+| **5** | **Production readiness gate, build + alpha verdicts** | **Complete / verified (build GO 16/16; alpha NO-GO at retail fees)** | [`docs/phase5_production_readiness.md`](docs/phase5_production_readiness.md) |
 
 The final pre-live check is one command:
 
@@ -366,6 +366,7 @@ python3 -m pytest --cov=python_analytics --cov-fail-under=80
 | `source` | `data/sample_events.ndjson` | archive whose Phase 1 integrity is verified |
 | `evidence-events` | `2000` | synthetic frames behind the engine/chaos/OOS evidence |
 | `max-engine-p99-us` | `50` | engine p99 ceiling; relax it on a noisy runner, not in code |
+| `max-reanchor-p99-us` | `200` | p99 ceiling for frames that move the priced window; its own budget, because a re-anchor translates the whole ladder |
 | `min-oos-sharpe` | *(empty)* | set it to make profitability blocking; empty keeps it `info` |
 | `recompute-walk-forward` | `false` | ignore `reports/walk_forward.json` and rerun the study |
 
@@ -947,7 +948,7 @@ python3 scripts/run_walk_forward.py --source data/raw_l2/*.ndjson.gz \
 
 ## Production readiness gate (Phase 5)
 
-> **Status: build complete and verified — `GO`, 15/15 gated checks; alpha
+> **Status: build complete and verified — `GO`, 16/16 gated checks; alpha
 > `NO-GO` at retail fees (2 bps maker / 5 bps taker).**
 >
 > Gate inventory, thresholds, latency-budget policy, chaos/heartbeat invariants,
@@ -983,24 +984,25 @@ Sample verdict — the honest combination at retail fees:
 ==============================================================================
   BUILD READINESS:     GO
   ALPHA (PROFITABILITY): NO-GO
-  BUILD: GO (15/15 gated checks passed)
-  ALPHA: NO-GO (1/2 profitability checks passed at 2.0 / 5.0 bps maker/taker)
-    ALPHA FAIL alpha.net_pnl: -16.4743 USDT (-0.0165%); -2.7413 before +13.7330 of fees
+  BUILD: GO (16/16 gated checks passed)
+  ALPHA: NO-GO (1/3 profitability checks passed at 2.0 / 5.0 bps maker/taker)
+    ALPHA FAIL alpha.net_pnl: -15.7830 USDT (-0.0158%); -2.0500 before +13.7330 of fees
+    ALPHA FAIL alpha.fee_wall: gross edge -0.299 bps vs 2 bps maker fee (break-even maker fee -0.299 bps)
     Phase 1 - data ingestion               3/3 checks
-    Phase 2 - paper execution              6/6 checks
+    Phase 2 - paper execution              7/7 checks
     Phase 3 - resilience                   3/3 checks
     Phase 4 - out-of-sample validation     5/5 checks
-    Alpha - profitability at modelled fees 1/2 checks
+    Alpha - profitability at modelled fees 1/3 checks
 ==============================================================================
 ```
 
 | Phase | Gates |
 | --- | --- |
 | 1 — ingestion | settings self-consistency (positive tick/center, kill switch armed), archive integrity (`0` malformed, `0` sequence gaps) on the real NDJSON, ingest rate (info) |
-| 2 — execution | engine p99 ≤ 50 µs, p999 ≤ 500 µs, replay ≥ 1,000 depth events/s, equity-vs-PnL ledger residual ≤ 1e-2, `0` rejected orders, fill activity > 0 % |
+| 2 — execution | engine p99 ≤ 50 µs, p999 ≤ 500 µs, re-anchor p99 ≤ 200 µs over frames that actually move the window, replay ≥ 1,000 depth events/s, equity-vs-PnL ledger residual ≤ 1e-2, `0` rejected orders, fill activity > 0 % |
 | 3 — resilience | disconnect storm self-heals (`reconnects == outages`, every frame accounted for), latency injection spikes but never exceeds its ceiling, dead-man's switch trips on silence, blocks orders, releases only on an explicit reset and can trip again |
 | 4 — validation | parameter lock re-verified, look-ahead chronology verified on every boundary, aggregate ledger residual ≤ 2e-2, ≥ 2 OOS windows, optional `--min-oos-sharpe` |
-| alpha | `net_pnl >= 0` after modelled fees, and `maker_bps >= 0` (no rebate assumed) — reported on every run, gating only with `--require-positive-alpha` |
+| alpha | `net_pnl >= 0` after modelled fees, `maker_bps >= 0` (no rebate assumed), and — when the study traded notional — a break-even maker fee above the gross edge (`fee_wall`) — reported on every run, gating only with `--require-positive-alpha` |
 
 Engine, chaos and walk-forward evidence come from a seeded synthetic book
 (`--evidence-events`, `--seed`), so every deterministic check reproduces on any
@@ -1008,7 +1010,7 @@ machine (latency is the exception — see the budget note below);
 `reports/walk_forward.json` is reused when present (`--recompute-walk-forward`
 forces a fresh study). Build and alpha are never merged: a green build with a
 losing parameter set is the *expected* state of this repository at retail fees
-(`alpha.net_pnl` is `-16.47 USDT` on the committed lock, `-2.74` even at zero
+(`alpha.net_pnl` is `-15.78 USDT` on the committed lock, `-2.05` even at zero
 fees), and printing both is what keeps a cost assumption from laundering a red
 strategy into a green one. Artefacts: `reports/production_readiness_report.{json,md}`.
 
@@ -1016,7 +1018,10 @@ strategy into a green one. Artefacts: `reports/production_readiness_report.{json
 shared runners, not the performance target. The budget a co-located trading host
 must hold is **engine p99 <= 5.0 µs**, applied at promotion time with
 `--max-engine-p99-us 5.0` (measured: `1.4 µs` p99 at 20 k frames on an idle host,
-`8–11 µs` under load). See
+`8–11 µs` under load). Tightening that ceiling does not tighten the re-anchor
+row: frames that move the priced window keep their own `--max-reanchor-p99-us`
+(`200 µs` by default), because they translate the whole ladder and their p99
+tracks host memory bandwidth rather than the code. See
 [`docs/phase5_production_readiness.md` §3](docs/phase5_production_readiness.md#3-latency-and-throughput-policy)
 for the measured bands, the p999 noise caveat and the reasoning.
 
@@ -1146,7 +1151,7 @@ python3 scripts/run_live_trader.py --cancel-all
 | No real money without evidence | Production needs `--live` **and** a fresh positive alpha in `reports/production_readiness_report.json`; `--cancel-all` is exempt, because the kill switch must not depend on an arming flag |
 
 The last row is the one that matters today: the committed study is `NO-GO`
-(`net_pnl = -16.47 USDT` after fees), so `--live` exits `3` until either the
+(`net_pnl = -15.78 USDT` after fees), so `--live` exits `3` until either the
 study turns green or someone writes `--override-alpha "<reason>"`, which is
 recorded in the order store's audit trail. The remaining gaps — markout,
 funding, a re-quoting loop, alerting — are listed in
@@ -1179,29 +1184,36 @@ python3 scripts/run_markout.py --fills state/fills.json --source 'data/raw_l2/*.
 | `ADVERSE_SELECTION` | the mid moves against the fills, so resting *adds* a cost | `1` |
 | `INCONCLUSIVE` | fewer than `--min-samples` marked fills | `3` |
 
-A simulated fill carries a `steady_clock` stamp, so it cannot be joined to an
-archive afterwards; `MarkoutReplayer` measures it inside the replay instead,
-where the mid behind `h = 0` is the book that produced the fill. Fills missing a
-sample within `--tolerance-ms` are reported as truncated rather than
-interpolated, because an invented price is indistinguishable from an edge once
-it reaches a report.
+A simulated fill's local record time is a `steady_clock` stamp, so it cannot be
+joined to an archive afterwards; the engine also carries the venue event time of
+whatever filled it (`Fill.event_ts`), and `MarkoutReplayer` measures the fill
+inside the replay against that, where the mid behind `h = 0` is the book that
+produced the fill. Fills missing a sample within `--tolerance-ms` are reported
+as truncated rather than interpolated, because an invented price is
+indistinguishable from an edge once it reaches a report.
 
 **What the committed study shows** (`python3 scripts/run_markout.py`):
 
 | horizon | fills | mean bps | t | win % | net of 2 bps fee |
 | --- | --- | --- | --- | --- | --- |
-| 0 s | 230 | −0.434 | n/a (σ≈0) | 0.0% | −2.43 |
-| 1 s | 227 | −0.429 | −6.48 | 36.1% | −2.43 |
-| 10 s | 199 | −0.505 | −2.62 | 42.7% | −2.51 |
-| 60 s | 55 | −0.810 | −1.19 | 45.5% | −2.81 |
+| 0 s | 230 | −0.334 | n/a (σ≈0) | 0.0% | −2.334 |
+| 1 s | 227 | −0.328 | −4.96 | 36.1% | −2.328 |
+| 10 s | 199 | −0.405 | −2.10 | 42.7% | −2.405 |
+| 60 s | 55 | −0.709 | −1.04 | 45.5% | −2.709 |
 
-Verdict `ADVERSE_SELECTION`: the average resting quote fills 0.43 bps *through*
-the mid (the trade prints better than the quote), so it never captures the
-0.33 bps half-spread it is trying to earn. On the 55 fills that have a 60 s
-sample, the mean drifts from −0.434 to −0.810 bps — a −0.38 bps move on the same
-fills, not a comparison of two different populations.
+Verdict `ADVERSE_SELECTION`: the average resting quote is marked 0.334 bps
+*through* the mid, so it never captures the half-spread it is trying to earn.
+That offset is what the fill rule produces, not a reading of the tape: this
+sample carries no prints, and under the `touch` model a resting order fills on
+the frame the opposite touch reaches its price, which leaves the mid exactly
+half a spread away by construction. The doc's §11.4 makes the same point at
+length. On the 55 fills that have a 60 s sample, the mean drifts from −0.334 to
+−0.709 bps — a −0.38 bps move on the same fills, not a comparison of two
+different populations. (The `h = 0` column is the starting point, not the 1 s
+mean: on those same 55 fills the 1 s mean is −0.155 bps, so quoting −0.328 here
+would mix a 227-fill average into a same-fill comparison.)
 
-The 1 s markout totals −2.92 USDT against the study's gross PnL of −2.74 USDT.
+The 1 s markout totals −2.23 USDT against the study's gross PnL of −2.05 USDT.
 This comparison is indicative only: the markout covers 227 of the study's 230
 fills and values each at its own 1 s mid, while gross PnL uses the study's
 position accounting and valuation times. The proximity of these totals does

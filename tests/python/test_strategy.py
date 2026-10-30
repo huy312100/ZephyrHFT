@@ -114,3 +114,87 @@ def test_stock_rounds_quotes_to_tick() -> None:
     assert strategy.round_to_tick(100.125) == pytest.approx(100.13)
     # The string adapter normalises to the MarketType enum.
     assert strategy._config.market_type == MarketType.STOCK
+
+
+def test_crypto_quotes_land_on_the_tick_grid() -> None:
+    """A quote between two ticks is not representable, so it must not be sent.
+
+    Crypto used to skip the adapter entirely, which produced quotes like
+    30000.8008 on a 0.5 tick: the ladder cannot hold them and a real venue
+    rejects them. The only reason such an order ever "filled" was a fill model
+    that ignored the book it was trading against.
+    """
+    config = _config(tick_size=0.5, market_type="CRYPTO")
+    strategy = AvellanedaStoikovStrategy(config)
+
+    for micro in (30000.9, 30001.0, 30001.4, 30001.9):
+        bid, ask = strategy.adjusted_quotes(micro, 0.0, 59.9)
+        for quote in (bid, ask):
+            assert math.isclose((quote - 30000) / 0.5, round((quote - 30000) / 0.5),
+                                abs_tol=1e-9)
+        # Outward rounding can only widen the market, never cross it.
+        assert ask > bid
+
+
+def test_a_quote_already_on_the_grid_keeps_its_price() -> None:
+    """``80000.2 / 0.1`` is ``800001.9999999999``, so blind rounding loses a tick.
+
+    A quote the venue can already represent must not be moved: snapping it down
+    silently changes the price, and therefore which orders fill.
+    """
+    config = _config(tick_size=0.1, market_type="CRYPTO")
+    strategy = AvellanedaStoikovStrategy(config)
+
+    assert strategy.snap_to_tick(80000.2, round_down=True) == 80000.2
+    assert strategy.snap_to_tick(80000.2, round_down=False) == 80000.2
+    assert strategy.snap_to_tick(80000.0, round_down=True) == 80000.0
+
+    # A genuinely off-grid quote still rounds in the direction asked for, so
+    # snapping can only widen the market. ``abs`` is a thousandth of a tick:
+    # ``approx``'s default relative tolerance is 0.08 at this price, which is
+    # 800 ticks wide and would accept a quote left a whole tick off grid.
+    assert strategy.snap_to_tick(80000.25, round_down=True) == pytest.approx(
+        80000.2, rel=0, abs=1e-7)
+    assert strategy.snap_to_tick(80000.25, round_down=False) == pytest.approx(
+        80000.3, rel=0, abs=1e-7)
+
+
+def test_a_half_tick_quote_is_not_mistaken_for_a_grid_price() -> None:
+    """The on-grid tolerance must not scale with the price-to-tick ratio.
+
+    Ten thousand steps a side is enough to break a step-relative tolerance: at
+    ``80000`` on a ``1e-4`` grid the step count is ``8e8``, so ``1e-9`` of it is
+    most of a tick and a half-tick quote would be declared representable. The
+    tolerance is the price's own float resolution instead, which stays nine
+    orders of magnitude below half a tick and cannot absorb a real offset.
+    """
+    config = _config(tick_size=0.0001, market_type="CRYPTO")
+    strategy = AvellanedaStoikovStrategy(config)
+
+    # Half a tick off the grid: snapped outward, never submitted as it stands.
+    # The tolerance is a tenth of the offset being detected, with the relative
+    # term off, so a quote left where it started or moved by one tick fails.
+    assert strategy.snap_to_tick(80000.00005, round_down=True) == pytest.approx(
+        80000.0, rel=0, abs=1e-9)
+    assert strategy.snap_to_tick(80000.00005, round_down=False) == pytest.approx(
+        80000.0001, rel=0, abs=1e-9)
+
+    # And a real grid price survives the same extremes untouched.
+    assert strategy.snap_to_tick(80000.0001, round_down=True) == pytest.approx(
+        80000.0001, rel=0, abs=1e-9)
+    assert strategy.snap_to_tick(80000.0001, round_down=False) == pytest.approx(
+        80000.0001, rel=0, abs=1e-9)
+
+
+def test_crypto_quote_never_collapses_into_a_crossed_market() -> None:
+    """A spread narrower than one tick still yields a valid two-sided quote."""
+    # The committed fit (k=5.0, sigma=0.02) quotes ~0.20 wide, well under the
+    # 0.5 tick, so a nearest-tick rule would map both sides onto one price.
+    config = _config(tick_size=0.5, market_type="CRYPTO",
+                     k=5.0, sigma=0.02, time_horizon=60.0)
+    strategy = AvellanedaStoikovStrategy(config)
+
+    assert strategy.optimal_half_spread(59.9) < config.tick_size
+    bid, ask = strategy.adjusted_quotes(30001.0, 0.0, 59.9)
+    assert ask - bid >= config.tick_size
+    assert ask > bid

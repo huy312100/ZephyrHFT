@@ -13,7 +13,7 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Union
 from ..bridge import iter_gzip_ndjson, iter_ndjson
 from ..native import factory, hft_native
 from ..strategies.base import Strategy
-from ..utils.config import AppSettings
+from ..utils.config import AppSettings, require_aligned_center
 from ..costs import DEFAULT_MAKER_BPS, DEFAULT_TAKER_BPS
 from .metrics import distribution, fill_rows, quant_summary, summarize
 
@@ -154,6 +154,25 @@ def _wide_risk_limits() -> "hft_native.RiskLimits":
     return limits
 
 
+# Maker fill models exposed by the native engine. ``touch`` is the legacy
+# book-crossing model; ``queue`` infers trades from depth depletion; ``trade``
+# fills from the aggregated tape. See ``cpp_engine/include/paper_engine.hpp``.
+FILL_MODELS = {
+    "touch": "TOUCH",
+    "queue": "QUEUE",
+    "trade": "TRADE",
+}
+
+
+def resolve_fill_model(name: str) -> "hft_native.FillModel":
+    """Maps a CLI fill-model name to the native enum, rejecting typos loudly."""
+    key = str(name).strip().lower()
+    if key not in FILL_MODELS:
+        choices = ", ".join(sorted(FILL_MODELS))
+        raise ValueError(f"unknown fill model {name!r} (choose from {choices})")
+    return getattr(hft_native.FillModel, FILL_MODELS[key])
+
+
 class BacktestEngine:
     """Adapter exposing the ``TradingEngine``-style surface used by strategies.
 
@@ -273,9 +292,13 @@ class BulkReplayer:
                  initial_cash: float = 0.0, batch_size: int = 64,
                  frames_per_hook: int = 1,
                  seed: Optional[Mapping[str, Any]] = None,
-                 order_quantity: Union[str, float] = "0.05") -> None:
+                 order_quantity: Union[str, float] = "0.05",
+                 fill_model: str = "touch") -> None:
         self._tick_size = str(tick_size)
         self._center = str(center)
+        # A centre off the tick grid cannot index a single price, so it is
+        # rejected here rather than after a silently empty study.
+        require_aligned_center(self._center, self._tick_size)
         # Fee rates are fractional basis points: 0.5 is a valid 0.5 bps charge,
         # so they are kept as floats and passed straight to the C++ ledger, which
         # freezes them into micro-bps. Never round/truncate them here.
@@ -286,6 +309,9 @@ class BulkReplayer:
         self._frames_per_hook = max(1, int(frames_per_hook))
         self._seed = seed
         self._order_quantity = order_quantity
+        # Resolved before the engine is built so a typo fails at construction.
+        self._fill_model = str(fill_model).strip().lower()
+        resolve_fill_model(self._fill_model)
         self._engine = self._build_engine()
         self._adapter = BacktestEngine(self._engine, order_quantity)
         self._snapshot_last_id = 0
@@ -299,7 +325,13 @@ class BulkReplayer:
             self._maker_bps,
             self._taker_bps,
             hft_native.Notional.from_string(f"{self._initial_cash:.8f}"),
+            resolve_fill_model(self._fill_model),
         )
+
+    @property
+    def fill_model(self) -> str:
+        """The maker fill model this replayer was configured with."""
+        return self._fill_model
 
     @property
     def engine(self) -> "hft_native.PaperEngine":
@@ -409,6 +441,18 @@ class BulkReplayer:
         stats["lines"] = self._totals["lines"]
         stats["malformed_events"] = self._totals["malformed"]
         stats["inventory_std"] = _stddev(self._position_curve)
+        # Trade prints are the fill source under the tape model; surfacing the
+        # count makes "zero fills" legible as "no tape" rather than "no signal".
+        stats["trade_events"] = metrics.trade_events
+        stats["fill_model"] = self._fill_model
+        # Grid health. A blind ladder (stale anchor, wrong venue tick) rejects
+        # every level and still reports a plausible-looking run, so the study has
+        # to carry the counters that expose it. ``unpriced_frames`` is the one
+        # that means it: wide feeds legitimately drop far-away levels, but a
+        # frame that leaves no two-sided top is a book that is not the market.
+        stats["rejected_levels"] = metrics.rejected_levels
+        stats["book_recenters"] = metrics.book_recenters
+        stats["unpriced_frames"] = metrics.unpriced_frames
 
         return ReplaySummary(
             stats=stats,

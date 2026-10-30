@@ -20,12 +20,13 @@ and the fee it pays is a *further* deduction::
 
 Two clocks, never mixed
 -----------------------
-This module never guesses a timestamp's clock. The C++ paper engine stamps
-fills with ``steady_clock`` (:func:`cpp_engine.types.now_ns`), which has an
-arbitrary epoch and therefore **cannot** be joined to an archive's exchange
-timestamps. That is why simulated markouts are measured in-loop by
-:class:`MarkoutReplayer` on the engine's own event clock — the same clock the
-capture carries — rather than by looking a fill's timestamp up in a file.
+This module never guesses a timestamp's clock. A fill carries both: its local
+record time is ``steady_clock`` (:func:`cpp_engine.types.now_ns`), which has an
+arbitrary epoch and therefore **cannot** be joined to an archive, while
+``Fill.event_ts`` is the venue event time of whatever filled the order (the
+depth frame, or the print that traded into the quote under the tape model).
+Markouts are measured in-loop by :class:`MarkoutReplayer` on ``event_ts`` -- the
+same clock the capture carries -- instead of looking a fill up in a file.
 Venue-timestamped fills (a real session, exported as JSON) use
 :func:`build_timeline` plus :func:`resolve_markouts` on the venue's clock.
 
@@ -1052,9 +1053,15 @@ def _format_horizon_row(label: str, stats: Mapping[str, Any], fee_bps: float) ->
     )
 
 
-def render_markdown(summary: Mapping[str, Any],
-                    verdict: Mapping[str, Any]) -> List[str]:
-    """Renders a study-grade markdown report (no terminal-width assumptions)."""
+def render_markdown(summary: Mapping[str, Any], verdict: Mapping[str, Any],
+                    fill_model: Optional[str] = None) -> List[str]:
+    """Renders a study-grade markdown report (no terminal-width assumptions).
+
+    ``fill_model`` names the maker model the fills were reproduced under. It is
+    not part of ``summary`` -- the vocabulary is the engine's, not the study's --
+    but a markout that cannot say which model produced its fills cannot be
+    compared with another one.
+    """
     known = MarkoutConfig.__dataclass_fields__
     config = MarkoutConfig(**{
         key: value for key, value in (summary.get("config") or {}).items()
@@ -1071,12 +1078,20 @@ def render_markdown(summary: Mapping[str, Any],
         f"Horizons: {', '.join(horizon_label(h) for h in config.horizons_s)} "
         f"(tolerance {config.tolerance_s:g} s, maker fee {fee:.2f} bps).",
         "",
+    ]
+    if fill_model:
+        lines.extend([
+            f"Fill model: `{fill_model}` -- the maker model that produced every "
+            "fill marked below.",
+            "",
+        ])
+    lines.extend([
         "## Verdict",
         "",
         f"**{verdict['verdict']}** at {verdict['primary_horizon']} "
         f"({verdict['samples']} maker fills, t={verdict['t_stat']:+.2f}).",
         "",
-    ]
+    ])
     lines.extend(f"- {reason}" for reason in verdict.get("reasons", []))
     lines.extend([
         "",
@@ -1144,11 +1159,12 @@ def render_markdown(summary: Mapping[str, Any],
 class MarkoutReplayer(BulkReplayer):
     """A :class:`BulkReplayer` that marks its own fills on the engine's clock.
 
-    Simulated fills are stamped with ``steady_clock`` inside the C++ engine, so
-    they cannot be joined to an archive's exchange timestamps after the fact.
-    Measuring them *inside* the replay removes the join entirely: the mid behind
-    ``h = 0`` is the book that produced the fill, and each later horizon is a
-    later frame of the same feed.
+    Simulated fills are stamped locally with ``steady_clock``, so they cannot be
+    joined to an archive's exchange timestamps after the fact; the venue event
+    time of the fill travels separately in ``Fill.event_ts`` (the depth frame, or
+    the print under the tape model). Measuring them *inside* the replay removes
+    any join: the mid behind ``h = 0`` is the book that produced the fill, and
+    each later horizon is a later frame of the same feed.
 
     ``frames_per_hook`` bounds the resolution of a markout: with a batch of ``n``
     frames, a fill and its mid are both attributed to the hook that ended the
@@ -1200,9 +1216,22 @@ class MarkoutReplayer(BulkReplayer):
                 self._unpriced_frames += 1
         else:
             self._unpriced_frames += 1
+        # Two clocks reach this hook, and a fill carries its own event time: under
+        # the tape model the engine stamps it with the print that filled it
+        # (``match_trade``), which is a venue millisecond like ``E``, while an
+        # archive without venue timestamps is on the synthetic nanosecond
+        # counter. ``Fill.event_ts`` is zero when the event had no clock, and a
+        # fill is only read on the venue clock when the frame itself is.
+        venue_clock = exchange_ts > 0
         for fill in new_fills:
+            stamped_ms = int(fill.event_ts)
+            fill_ts_ns = (
+                stamped_ms * NANOS_PER_MS
+                if venue_clock and stamped_ms > 0
+                else frame_ts_ns
+            )
             self._fill_log.append(MarkoutFill(
-                ts_ns=frame_ts_ns,
+                ts_ns=fill_ts_ns,
                 side=str(fill.side),
                 price=float(fill.price),
                 quantity=float(fill.quantity),

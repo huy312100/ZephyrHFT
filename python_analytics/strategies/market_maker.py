@@ -158,6 +158,13 @@ def _quantity(text: str) -> int:
 # Fixed-point scale shared by Price/Quantity/Notional (8 decimal digits).
 _FIXED_SCALE = hft_native.Price.from_int(1).raw()
 
+# How far off a grid price a quote may sit and still count as on it, measured in
+# ulps of that quote. A price is only as precise as its own float resolution, so
+# this is the width of the error that ``price / tick`` can carry for a price on
+# the grid -- and it stays nine orders of magnitude below half a tick even at
+# 80,000 on a 0.0001 grid.
+_GRID_TOLERANCE_ULPS = 8.0
+
 
 class AvellanedaStoikovStrategy(Strategy):
     """Avellaneda-Stoikov inventory-aware market maker.
@@ -274,13 +281,50 @@ class AvellanedaStoikovStrategy(Strategy):
                         time_remaining: float,
                         sigma: Optional[float] = None,
                         ofi_z: float = 0.0) -> tuple[float, float]:
-        """Raw quotes with market-specific adapter rules applied."""
+        """Raw quotes snapped onto the venue's price grid.
+
+        Every venue this engine trades quotes on a discrete tick grid, and an
+        order priced between two ticks is not representable: the ladder cannot
+        hold it, and a real exchange rejects it. Rounding is therefore applied
+        to all market types, and it is directional — the bid rounds **down** and
+        the ask rounds **up** — so snapping can only widen the market. Nearest-
+        tick rounding could pull both sides into the same tick and produce a
+        crossed or degenerate quote from a perfectly valid one. A quote that is
+        already on the grid is returned untouched: the division that tests it is
+        inexact, so rounding blindly would move a representable price by a tick.
+        """
         bid, ask = self.raw_quotes(micro_price, inventory, time_remaining,
                                    sigma=sigma, ofi_z=ofi_z)
-        if self._config.market_type in (MarketType.STOCK, MarketType.COMMODITIES):
-            bid = self.round_to_tick(bid)
-            ask = self.round_to_tick(ask)
+        tick = self._config.tick_size
+        if tick > 0.0:
+            bid = self.snap_to_tick(bid, round_down=True)
+            ask = self.snap_to_tick(ask, round_down=False)
         return bid, ask
+
+    def snap_to_tick(self, price: float, *, round_down: bool) -> float:
+        """Snaps ``price`` onto the tick grid, leaving an on-grid price alone.
+
+        ``price / tick`` is not exact in binary: ``80000.2 / 0.1`` evaluates to
+        ``800001.9999999999``, so a bare ``floor`` moves a price that the venue
+        can already represent down a whole tick (and a bare ``ceil`` moves an ask
+        up one), changing which orders fill. A price within a few ulps of a grid
+        price is therefore returned unchanged; only a genuinely off-grid price is
+        rounded, in the direction asked for.
+
+        The tolerance is in *price* units -- the float resolution of the price
+        itself -- not a fraction of the step count. A step-relative tolerance
+        grows with the price-to-tick ratio, and at ``80000`` on a ``1e-4`` tick
+        the step count is ``8e8``, so a fractional tolerance of ``1e-9`` would
+        declare a half-tick price representable and submit an order the venue
+        has no price for.
+        """
+        tick = self._config.tick_size
+        if tick <= 0.0:
+            return price
+        steps = price / tick
+        if abs(price - round(steps) * tick) <= _GRID_TOLERANCE_ULPS * math.ulp(price):
+            return price
+        return (math.floor(steps) if round_down else math.ceil(steps)) * tick
 
     def round_to_tick(self, price: float) -> float:
         """Rounds a quote to the nearest ``tick_size`` (round half away from 0)."""

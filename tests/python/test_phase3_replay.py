@@ -51,6 +51,17 @@ def test_bulk_replay_produces_fills_and_telemetry() -> None:
     assert "engine_p50_ns" in stats["latency_ns"]
 
 
+def test_an_off_grid_centre_is_refused_before_the_replay_starts() -> None:
+    """A centre between ticks cannot index a price, so the study comes back empty."""
+    with pytest.raises(ValueError, match="not a whole number of ticks"):
+        BulkReplayer(tick_size="0.5", center="100.2")
+
+    # The same quote pair, snapped to the grid, still replays.
+    summary = BulkReplayer(tick_size="0.5", center="100").replay_lines(
+        _lines(), strategy=_strategy())
+    assert summary.stats["fills"] > 0
+
+
 def test_fractional_bps_reach_the_ledger() -> None:
     """0.5 bps must survive to C++ (regression: ``int()`` truncated it to 0)."""
     from python_analytics.native import hft_native

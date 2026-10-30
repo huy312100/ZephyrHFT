@@ -48,7 +48,7 @@ from typing import Any, Dict, Iterator, List, Mapping, Optional, Sequence, Tuple
 
 from ..bridge import iter_gzip_ndjson, iter_ndjson
 from ..strategies import AvellanedaStoikovStrategy, MarketConfig, MarketType
-from ..costs import DEFAULT_MAKER_BPS, DEFAULT_TAKER_BPS
+from ..costs import DEFAULT_MAKER_BPS, DEFAULT_TAKER_BPS, FeeWall, gross_edge_bps
 from .metrics import (
     max_drawdown,
     profit_factor,
@@ -57,7 +57,7 @@ from .metrics import (
     sortino_ratio,
     win_rate,
 )
-from .replay import BulkReplayer
+from .replay import BulkReplayer, resolve_fill_model
 
 logger = logging.getLogger(__name__)
 
@@ -530,6 +530,10 @@ def aggregate_windows(windows: Sequence[WalkForwardWindow], *,
     boundary_settled = sum(unrealized_per_window[:-1])
     unrealized = unrealized_per_window[-1] if unrealized_per_window else 0.0
     net_pnl = (curve[-1] - float(initial_cash)) if curve else 0.0
+    # What the study earned before fees, per unit of notional traded. This is the
+    # break-even maker fee: the single number a fee tier (or a venue) has to beat,
+    # and the one that stays comparable when the quotes are widened or narrowed.
+    edge = gross_edge_bps(net_pnl + fees, notional_traded)
     # Sharpe/Sortino are defined on per-period returns, not on equity *levels*
     # (levels are ~1e5 with tiny variance, which would inflate the ratio by
     # ~1e4). Same convention as ``metrics.quant_summary``.
@@ -563,6 +567,7 @@ def aggregate_windows(windows: Sequence[WalkForwardWindow], *,
         "unrealized_pnl": round(unrealized, 8),
         "fees_paid": round(fees, 8),
         "traded_notional": round(notional_traded, 8),
+        "gross_edge_bps": None if edge is None else round(edge, 6),
         "fills": sum(int(window.stats.get("fills", 0) or 0) for window in windows),
         "trades": len(trips),
         "wins": wins,
@@ -607,6 +612,7 @@ class WalkForwardRunner:
                  periods_per_year: float = 252.0,
                  ledger_tolerance: float = 1e-2,
                  max_curve_points: int = 2000,
+                 fill_model: str = "touch",
                  lock_source: str = "cli") -> None:
         if window_events < 0:
             raise ValueError("window_events must be >= 0")
@@ -624,6 +630,12 @@ class WalkForwardRunner:
         self._ledger_tolerance = abs(float(ledger_tolerance))
         self._max_curve_points = int(max_curve_points)
         self._lock_source = lock_source
+        # A measurement choice, deliberately outside the frozen parameter lock:
+        # changing the fill model changes what the study measures, not what it
+        # trades, and folding it into the fingerprint would invalidate every
+        # committed lock for a model comparison.
+        self._fill_model = str(fill_model).strip().lower()
+        resolve_fill_model(self._fill_model)  # fail at construction, not mid-run
 
     @property
     def parameters(self) -> LockedParameters:
@@ -686,6 +698,7 @@ class WalkForwardRunner:
                 batch_size=self._batch_size,
                 frames_per_hook=self._frames_per_hook,
                 order_quantity=self._parameters.order_quantity,
+                fill_model=self._fill_model,
             )
             summary = replayer.replay_lines(lines, strategy)
 
@@ -746,6 +759,20 @@ class WalkForwardRunner:
             elapsed_s=elapsed,
             periods_per_year=self._periods_per_year,
         )
+        # Recorded with the evidence, because a net PnL is only interpretable
+        # next to the model that produced its fills.
+        aggregate["fill_model"] = self._fill_model
+        aggregate["trade_events"] = sum(
+            int(window.stats.get("trade_events", 0) or 0) for window in windows)
+        # Grid health travels with the PnL: a ladder that rejected the feed still
+        # produces a tidy-looking run, and that has to be visible next to the
+        # number rather than discovered later.
+        aggregate["rejected_levels"] = sum(
+            int(window.stats.get("rejected_levels", 0) or 0) for window in windows)
+        aggregate["book_recenters"] = sum(
+            int(window.stats.get("book_recenters", 0) or 0) for window in windows)
+        aggregate["unpriced_frames"] = sum(
+            int(window.stats.get("unpriced_frames", 0) or 0) for window in windows)
         tolerance = self._ledger_tolerance * max(1, len(windows))
         if abs(float(aggregate["ledger_residual"])) > tolerance:
             raise WalkForwardError(
@@ -884,9 +911,27 @@ class WalkForwardReport:
         return self.to_json(root / f"{stem}.json"), self.to_markdown(root / f"{stem}.md")
 
     # ------------------------------------------------------------- narrative
+    def fee_wall(self) -> "Optional[FeeWall]":
+        """The measured gross edge priced against the locked maker fee.
+
+        Read from the aggregate ledger rather than from the lock alone: a study
+        that traded nothing has no unit to charge a fee against and returns
+        ``None`` (see :func:`python_analytics.costs.gross_edge_bps`).
+        """
+        agg = self.aggregate
+        return FeeWall.from_study(
+            pre_fee_pnl=float(agg.get("net_pnl", 0.0) or 0.0)
+            + float(agg.get("fees_paid", 0.0) or 0.0),
+            traded_notional=float(agg.get("traded_notional", 0.0) or 0.0),
+            maker_bps=float(self.parameters.maker_bps),
+            fills=int(agg.get("fills", 0) or 0),
+        )
+
     def summary_lines(self) -> List[str]:
         """Console block printed by ``scripts/run_walk_forward.py``."""
         agg = self.aggregate
+        wall = self.fee_wall()
+        wall_line = [f"fee wall: {wall.describe()}"] if wall is not None else []
         return [
             f"walk-forward: {agg['windows']} window(s) / {agg['events']} events / "
             f"{len(self.sources)} archive(s) in {self.elapsed_s:.2f}s",
@@ -903,6 +948,11 @@ class WalkForwardReport:
             f"trades {agg['trades']} (wins {agg['wins']} / losses {agg['losses']}, "
             f"win rate {_num(agg['win_rate_pct'], 2)}%, profit factor "
             f"{_num(agg['profit_factor'], 3)})",
+            f"fills {agg['fills']} under the {agg.get('fill_model', 'touch')} model | "
+            f"tape {agg.get('trade_events', 0)} print(s) | book: "
+            f"{agg.get('unpriced_frames', 0)} unpriced frame(s), "
+            f"{agg.get('book_recenters', 0)} re-anchor(s)",
+            *wall_line,
             f"realized {agg['realized_pnl']:+,.4f} (of which "
             f"{agg['boundary_settled_pnl']:+,.4f} boundary settlements) | "
             f"open unrealized {agg['unrealized_pnl']:+,.4f}",
@@ -916,6 +966,14 @@ class WalkForwardReport:
         """Human-readable companion to :meth:`as_dict`."""
         agg = self.aggregate
         lock = self.parameters.as_dict()
+        # The fee wall belongs in the metrics table because it, not the net PnL,
+        # is what a deployment decision has to clear.
+        wall = self.fee_wall()
+        wall_rows = [] if wall is None else [
+            f"| Gross edge (pre-fee) | {wall.gross_bps:+.3f} bps |",
+            f"| Break-even maker fee | {wall.gross_bps:+.3f} bps "
+            f"(charged {wall.maker_bps:g} bps) |",
+        ]
         lines: List[str] = [
             "# Walk-forward out-of-sample validation",
             "",
@@ -957,6 +1015,7 @@ class WalkForwardReport:
             f"{_num(agg['boundary_settled_pnl'])} |",
             f"| Fees paid | {_num(agg['fees_paid'])} |",
             f"| Traded notional | {_num(agg['traded_notional'])} |",
+            *wall_rows,
             f"| Fills | {agg['fills']:,} |",
             f"| Trades (round trips) | {agg['trades']:,} |",
             f"| Wins / losses | {agg['wins']} / {agg['losses']} |",

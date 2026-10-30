@@ -100,10 +100,33 @@ template <typename T>
     return false;
 }
 
+// Index of the kept level furthest from the touch: the lowest bid, the highest ask.
+[[nodiscard]] std::uint32_t furthest_slot(const LevelDelta* levels, std::uint32_t count,
+                                         bool keep_highest) noexcept {
+    std::uint32_t worst = 0;
+    for (std::uint32_t i = 1; i < count; ++i) {
+        const Price::rep candidate = levels[i].price.raw();
+        const Price::rep current = levels[worst].price.raw();
+        if (keep_highest ? candidate < current : candidate > current) {
+            worst = i;
+        }
+    }
+    return worst;
+}
+
 // Parses [["price","qty"],...] starting at `p` (which must point at '[').
+//
+// A partial-book frame can carry hundreds of levels -- one burst on this venue
+// carried 440 -- while the buffer holds `kMaxDepthLevels`. Keep the levels
+// nearest the touch (the highest bids, the lowest asks) rather than whichever
+// arrive first: the venue promises no ordering, and a frame that lists its bids
+// ascending from 30,000 would otherwise hand the engine a "best bid" the market
+// never quoted. The far levels are the ones a ladder window rejects anyway.
 [[nodiscard]] bool parse_levels(const char* p, const char* end, LevelDelta* levels,
-                                std::uint32_t& count) noexcept {
+                                std::uint32_t& count, bool keep_highest) noexcept {
     count = 0;
+    std::uint32_t furthest = 0;
+    bool have_furthest = false;
     if (p == nullptr || p == end || *p != '[') {
         return false;
     }
@@ -152,6 +175,20 @@ template <typename T>
         if (count < kMaxDepthLevels) {
             levels[count] = LevelDelta{price, quantity};
             ++count;
+        } else {
+            // Buffer full: drop the level furthest from the touch, but only when
+            // this one is nearer. ``furthest`` is recomputed after a swap and
+            // never otherwise, so an over-full frame costs one compare per level.
+            if (!have_furthest) {
+                furthest = furthest_slot(levels, count, keep_highest);
+                have_furthest = true;
+            }
+            const Price::rep candidate = price.raw();
+            const Price::rep current = levels[furthest].price.raw();
+            if (keep_highest ? candidate > current : candidate < current) {
+                levels[furthest] = LevelDelta{price, quantity};
+                furthest = furthest_slot(levels, count, keep_highest);
+            }
         }
         const char* close = simd::find_char(quantity_close + 1, end, ']');
         if (close == end) {
@@ -190,8 +227,10 @@ bool JsonFeedParser::parse_depth_update(std::string_view json, DepthUpdate& out)
         return false;
     }
     const char* end = json.data() + json.size();
-    return parse_levels(bids.begin, end, out.bids.data(), out.bid_count) &&
-           parse_levels(asks.begin, end, out.asks.data(), out.ask_count);
+    return parse_levels(bids.begin, end, out.bids.data(), out.bid_count,
+                        /*keep_highest=*/true) &&
+           parse_levels(asks.begin, end, out.asks.data(), out.ask_count,
+                        /*keep_highest=*/false);
 }
 
 bool JsonFeedParser::parse_trade(std::string_view json, TradeTick& out) noexcept {

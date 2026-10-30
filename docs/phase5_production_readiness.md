@@ -32,16 +32,17 @@ verdicts** against **explicit, named thresholds**:
 ==============================================================================
   BUILD READINESS:     GO
   ALPHA (PROFITABILITY): NO-GO
-  generated 2026-10-24T16:30:57+00:00
+  generated 2026-10-30T00:39:08+00:00
 ------------------------------------------------------------------------------
-  BUILD: GO (15/15 gated checks passed)
-  ALPHA: NO-GO (1/2 profitability checks passed at 2.0 / 5.0 bps maker/taker)
-    ALPHA FAIL alpha.net_pnl: -16.4743 USDT (-0.0165%); -2.7413 before +13.7330 of fees (required >= 0 after modelled fees)
+  BUILD: GO (16/16 gated checks passed)
+  ALPHA: NO-GO (1/3 profitability checks passed at 2.0 / 5.0 bps maker/taker)
+    ALPHA FAIL alpha.net_pnl: -15.7830 USDT (-0.0158%); -2.0500 before +13.7330 of fees (required >= 0 after modelled fees)
+    ALPHA FAIL alpha.fee_wall: gross edge -0.299 bps vs 2 bps maker fee | break-even maker fee -0.299 bps (required gross edge > maker fee)
     Phase 1 - data ingestion               3/3 checks
-    Phase 2 - paper execution              6/6 checks
+    Phase 2 - paper execution              7/7 checks
     Phase 3 - resilience                   3/3 checks
     Phase 4 - out-of-sample validation     5/5 checks
-    Alpha - profitability at modelled fees 1/2 checks
+    Alpha - profitability at modelled fees 1/3 checks
 ------------------------------------------------------------------------------
   wrote: reports/production_readiness_report.json
   wrote: reports/production_readiness_report.md
@@ -82,8 +83,8 @@ never lets one impersonate the other:
 
 | Verdict | Answers | Gates the exit code by default | Contains |
 | --- | --- | --- | --- |
-| **BUILD** | Does the machinery keep the promises of phases 1–4? | yes (`0` / `1`) | the 15 gated build checks, plus informational rows |
-| **ALPHA** | Does *this* parameter set earn after the fees a retail account actually pays? | no — only with `--require-positive-alpha` (`3`) | `alpha.net_pnl`, `alpha.fee_assumption` |
+| **BUILD** | Does the machinery keep the promises of phases 1–4? | yes (`0` / `1`) | the 16 gated build checks, plus informational rows |
+| **ALPHA** | Does *this* parameter set earn after the fees a retail account actually pays? | no — only with `--require-positive-alpha` (`3`) | `alpha.net_pnl`, `alpha.fee_assumption`, `alpha.fee_wall` |
 
 Both are always measured and both are printed; `summary.blocking` (build) and
 `summary.alpha_blocking` (alpha) are separate keys, and a failing alpha check can
@@ -98,6 +99,7 @@ The alpha block is deliberately blunt about costs:
 | --- | --- | --- |
 | `alpha.net_pnl` | Phase 4 aggregate `net_pnl` after fees, plus the same number with fees added back | `>= 0` after modelled fees |
 | `alpha.fee_assumption` | The fee assumption itself (maker/taker bps, round-trip cost) | `maker_bps >= 0` — a rebate is not a retail rate |
+| `alpha.fee_wall` | The same result in fee units: gross edge per unit of traded notional vs the maker fee, naming the break-even fee | `gross edge > maker fee`; emitted only when the study traded notional |
 
 Fees are already inside realized/unrealized PnL (both come from the cash ledger),
 so `pnl_before_fees = net_pnl + fees_paid` reports what the study would have earned
@@ -109,9 +111,9 @@ signal, not the fee tier.
 
 ## 2. Gate inventory
 
-15 gated build checks by default across 17 table rows (15 gates + 2
-informational rows); enabling `--min-oos-sharpe` adds one gate for 16 gated
-checks across 18 rows. The two alpha checks (§1.3) are reported alongside these
+16 gated build checks by default across 18 table rows (16 gates + 2
+informational rows); enabling `--min-oos-sharpe` adds one gate for 17 gated
+checks across 19 rows. The three alpha checks (§1.3) are reported alongside these
 but are gated separately, so they are not counted here.
 
 ### 2.1 Phase 1 — data ingestion
@@ -133,6 +135,7 @@ refuses to call an archive healthy when the venue skipped updates.
 | --- | --- | --- |
 | `phase2.engine_latency_p99` | Engine p99 over the evidence replay (C++ `apply_depth`: book update + mark + resting match) | `<= 50 µs` (`--max-engine-p99-us`) |
 | `phase2.engine_latency_p999` | Engine p999 | `<= 500 µs` (`--max-engine-p999-us`) |
+| `phase2.reanchor_latency_p99` | Engine p99 over `--reanchor-frames` frames that each move the priced window (the `recenter` path) | `<= 200 µs` (`--max-reanchor-p99-us`); fails unless the run actually re-anchored |
 | `phase2.replay_throughput` | Depth events/s through the replay path | `>= 1,000` (`--min-throughput-fps`) |
 | `phase2.ledger_residual` | `Δequity − realized − unrealized` | `<= 1e-2` (`--ledger-tolerance`) |
 | `phase2.order_rejections` | Rejected / submitted orders | exactly `0` rejected |
@@ -141,6 +144,21 @@ refuses to call an archive healthy when the venue skipped updates.
 A rejected order is a **configuration error, not bad luck**: the strategy quoted
 outside its own risk limits. Fill activity exists to prove the evidence book
 actually trades — a book that cannot fill would make every PnL figure vacuous.
+
+The evidence replay never leaves the window it was seeded on, so its p99 covers
+`apply_depth` but never `recenter`. `phase2.reanchor_latency_p99` closes that
+gap: it alternates between two books more than a window apart, so every frame
+proves the anchor is wrong and every frame re-anchors a populated ladder. The
+check also fails when the run never re-anchored, because a comfortable p99 for a
+path that was never taken is not evidence.
+
+Its ceiling is **not** the engine budget, and it is deliberately looser
+(`--max-reanchor-p99-us`, 200 µs). A re-anchor moves the whole ladder -- two
+`memmove`s of the quantity array plus the bitmap shift -- so it costs roughly
+12× a seeded frame on the same host (§3.3), and its p99 tracks host memory
+bandwidth rather than the code. Reusing the engine's 50 µs here would turn a
+5 µs production run into a NO-GO on the re-anchor row alone while measuring the
+memmove's share of a loaded machine.
 
 ### 2.3 Phase 3 — resilience
 
@@ -180,7 +198,7 @@ alpha checks exist to prevent. Decimal-string fields (`tick_size`, `center`,
 grid, while a fee change is always drift.
 
 > **The two studies are not interchangeable.** The committed artefact is the
-> bundled-sample study (Sharpe `-4.132`); a recompute runs over the *synthetic
+> bundled-sample study (Sharpe `-3.987`); a recompute runs over the *synthetic
 > evidence book*, which is a zero-drift random walk and therefore scores ~`0.18`.
 > Recomputing is how you check that the pipeline still produces a valid study —
 > it is not how you re-derive a market edge. Gate profitability
@@ -194,6 +212,7 @@ grid, while a fee change is always drift.
 | --- | --- | --- |
 | `max_engine_p99_us` | `50.0` | `--max-engine-p99-us` |
 | `max_engine_p999_us` | `500.0` | `--max-engine-p999-us` |
+| `max_reanchor_p99_us` | `200.0` | `--max-reanchor-p99-us` |
 | `min_throughput_fps` | `1000` | `--min-throughput-fps` |
 | `ledger_tolerance` | `0.01` | `--ledger-tolerance` |
 | `max_archive_malformed` | `0` | *fixed* |
@@ -228,13 +247,14 @@ Percentiles are **bucket upper edges** from a 100 ns histogram: `p99 = 1.10 µs`
 means the true p99 lies in `(1.00, 1.10] µs`. Every latency figure in this
 project is therefore a conservative (upper-bound) reading.
 
-### 3.2 The three latency tiers
+### 3.2 The four latency tiers
 
 | Tier | Metric | Target | Enforced by | Scope |
 | --- | --- | --- | --- | --- |
 | **Production budget** | engine p99 | **<= 5.0 µs** | `--max-engine-p99-us 5.0` | The ceiling we accept for a co-located trading host; pass the flag explicitly when promoting a build |
 | **Default gate** | engine p99 | `<= 50 µs` | default of `--max-engine-p99-us` | Machine-tolerant tripwire that catches order-of-magnitude regressions on shared runners, where scheduler noise dominates |
 | **Tail** | engine p999 | `<= 500 µs` | default of `--max-engine-p999-us` | Includes cache-cold first touches of the book ladder; a genuine tail-latency bug blows straight through it |
+| **Re-anchor** | p99 over frames that move the window | `<= 200 µs` | default of `--max-reanchor-p99-us` | Its own budget, never the engine's: the frame translates the whole ladder, so it costs ~12× a seeded frame and tracks host memory bandwidth (§3.3) |
 
 The comparison is inclusive: the gate passes when `p99_us <= max_p99_us`, so a
 reading of exactly `5.0 µs` is a **GO** and `5.1 µs` is a NO-GO.
@@ -271,6 +291,7 @@ Every row below was produced by this code base on the same developer host
 | 2,000-frame evidence book, idle host | `0.5 µs` | `3.2 µs` | `723.9 µs` | NO-GO (p999 only) | NO-GO |
 | 2,000-frame evidence book, concurrent load | `0.5 µs` | `8.2–11.3 µs` | `93–724 µs` | GO, unless the tail trips | NO-GO |
 | Phase 2 warm ingest harness (`docs/phase2_technical_specification.md`) | `0.9 µs` | `1.10–1.30 µs` | — | GO | GO |
+| Re-anchor path, 1,000 frames that each move the window | `4.9–24.8 µs` | `5.8–63 µs` | `11–139 µs` | GO (own `200 µs` gate) | n/a (not a seeded frame) |
 
 Reading the table:
 
@@ -283,9 +304,22 @@ Reading the table:
   ceiling while three consecutive re-runs passed. A single p999 breach is a
   statement about the machine, not about the code — re-run on an idle host before
   investigating.
+- **Re-anchoring costs one memmove.** The last row is the frame that moves the
+  price window: the ladder is translated in place (two `memmove`s of the quantity
+  array plus a 128-word bitmap shift each), so the p50 goes from ~1 µs to
+  `4.9 µs` on a quiet host and `24.8 µs` on one at load 3–5, with the p99 moving
+  from `5.8` to `63 µs`. The ratio to the seeded frame on the *same* host stays
+  ~12–13× in both cases, which is the memmove's share of a frame and not a
+  property of the translate; the absolute numbers scale with memory bandwidth.
+  That is why the check has its own ceiling (`--max-reanchor-p99-us`, 200 µs)
+  rather than borrowing the engine's 50 µs — a borrowed ceiling would have
+  failed this row on the loaded host while the code was unchanged.
 - **The 5.0 µs budget is achievable here** when the host is idle and the book is
   warm (1.4 µs at 20k frames) and fails when it is not. That is exactly how a
-  budget should behave; it is not a number to chase on a laptop.
+  budget should behave; it is not a number to chase on a laptop, and it is a
+  statement about *seeded* frames — a re-anchor is a market-structure event, not
+  a steady-state frame, and it is the only place where the whole ladder moves at
+  once.
 
 The warm Phase 2 harness remains the reference for what the engine costs when
 nothing else is running: ~30–40 k frames/s at 0.9 µs p50 and 1.10–1.30 µs p99.
@@ -416,7 +450,7 @@ proof would be vacuous.
 | Evidence | `--source`, `--evidence-events`, `--seed`, `--chaos-frames`, `--window-events`, `--min-windows` | `data/sample_events.ndjson`, `2000`, `7`, `200`, `0`, `2` |
 | Frozen parameters | `--gamma`, `--sigma`, `--k`, `--time-horizon`, `--inventory-limit`, `--ofi-sensitivity`, `--ofi-decay`, `--ofi-cap` | `0.1`, `0.02`, `5.0`, `60.0`, `5.0`, `0.0`, `0.95`, `3.0` |
 | Venue / costs | `--market-type`, `--tick-size`, `--center`, `--maker-bps`, `--taker-bps`, `--initial-cash`, `--order-quantity` | `CRYPTO`, settings, settings, `2.0`, `5.0`, `100000.0`, `0.01` |
-| Gates | `--max-engine-p99-us`, `--max-engine-p999-us`, `--min-throughput-fps`, `--ledger-tolerance`, `--min-oos-sharpe`, `--require-positive-alpha` | `50.0`, `500.0`, `1000`, `1e-2`, `None`, off |
+| Gates | `--max-engine-p99-us`, `--max-engine-p999-us`, `--max-reanchor-p99-us`, `--reanchor-frames`, `--min-throughput-fps`, `--ledger-tolerance`, `--min-oos-sharpe`, `--require-positive-alpha` | `50.0`, `500.0`, `200.0`, `1000`, `1000`, `1e-2`, `None`, off |
 | Walk-forward evidence | `--walk-forward-json`, `--recompute-walk-forward` | `reports/walk_forward.json`, off |
 | Output | `--report-dir`, `--stem`, `--no-report`, `--log-level` | `reports`, `production_readiness_report`, off, `ERROR` |
 
@@ -455,7 +489,8 @@ PASS/FAIL rows to find the reason for a NO-GO:
 
 | Check | Measured | Required |
 | --- | --- | --- |
-| `alpha.net_pnl` | -16.4743 USDT (-0.0165%); -2.7413 before +13.7330 of fees | >= 0 after modelled fees |
+| `alpha.net_pnl` | -15.7830 USDT (-0.0158%); -2.0500 before +13.7330 of fees | >= 0 after modelled fees |
+| `alpha.fee_wall` | gross edge -0.299 bps vs 2 bps maker fee | gross edge > maker fee |
 
 ### Blocking failures
 
@@ -481,7 +516,7 @@ mistaken for gates.
 | `thresholds` | The exact ceilings in force for this run (§2.5), including `maker_bps`, `taker_bps`, `round_trip_cost_bps` and `require_positive_alpha` |
 | `inputs` | Source archive, evidence description, parameter fingerprint, walk-forward origin (plus `walk_forward_drift` when a reused artefact was rejected), `costs` |
 | `checks[]` | One object per check: `id`, `phase`, `title`, `measured`, `threshold`, `passed`, `gated`, `note` (`phase: "alpha"` marks profitability) |
-| `evidence` | Raw measurements: `configuration`, `ingestion`, `engine`, `chaos`, `deadman`, `walk_forward`, `alpha` |
+| `evidence` | Raw measurements: `configuration`, `ingestion`, `engine`, `reanchor`, `chaos`, `deadman`, `walk_forward`, `alpha` |
 
 `summary.blocking` is the machine-readable form of the same fact the console
 prints, so a pipeline can gate on the JSON without parsing prose:
@@ -505,17 +540,19 @@ reading the committed `reports/walk_forward.json` (retail fees: 2 bps maker /
 | Phase | Representative measurement | Status |
 | --- | --- | --- |
 | 1 — ingestion | `0` malformed / `0` gaps in 800 lines; ~496 k lines/s | PASS |
-| 2 — execution | p99 `1.7 µs`, p999 `10.8 µs` (host-dependent — §3.3), `16.7 k` depth events/s, residual `-1.1e-7`, `0/3480` rejected, fills `16.4 %` | PASS |
+| 2 — execution | p99 `1.7 µs`, p999 `10.8 µs` (host-dependent — §3.3), re-anchor p99 `5.8–63 µs` over 1,000 moving frames, `16.7 k` depth events/s, residual `-1.1e-7`, `0/3480` rejected, fills `16.4 %` | PASS |
 | 3 — resilience | 2 outages / 2 reconnects / 2 frames dropped; 36 spikes, max `19.8 ms`; switch tripped on `heartbeat_timeout: silence=600ms>=limit=500ms` | PASS |
 | 4 — validation | lock `b29a62ed93caf69a` (4 checks); 1 chronology check across 2 windows; residual `+1.4e-7`; 2 windows / 800 events | PASS |
-| **Build verdict** | **15/15 gated checks passed** | **GO** |
-| Alpha (profitability) | `-16.4743 USDT` (`-2.7413` before `+13.7330` of fees) at 2/5 bps; Sharpe `-4.132` (info); `0/2` windows positive | **NO-GO (1/2)** |
+| **Build verdict** | **16/16 gated checks passed** | **GO** |
+| Alpha (profitability) | `-15.7830 USDT` (`-2.0500` before `+13.7330` of fees) at 2/5 bps; Sharpe `-3.987` (info); `0/2` windows positive | **NO-GO (1/3)** |
 
 Read that last row as the headline: **the machinery is ready and the strategy is
 not**. At the rebate assumption this branch removed (`maker_bps = -1.0`) the same
-800 events reported `+4.13 USDT`; the fee change alone was worth ~`20.6 USDT`, and
-even at *zero* fees the run loses `2.74 USDT`. That is the honest state of the
-alpha workstream, and no fee-tier editing can turn it green.
+800 events reported `+4.82 USDT` (Sharpe `1.31`, `2/0` windows positive; a
+different lock, since the fees are part of the fingerprint); the fee change alone
+was worth `20.60 USDT`, and even at *zero* fees the run loses `2.05 USDT`. That is
+the honest state of the alpha workstream, and no fee-tier editing can turn it
+green.
 
 Latency and throughput vary per run (§3.3); the ledger, window, lock, chaos and
 alpha counts are deterministic.
@@ -595,7 +632,7 @@ Other failure shapes:
 | Limitation | Consequence |
 | --- | --- |
 | Engine, chaos and OOS evidence come from a **synthetic book** | The verdict proves the machinery, not a market edge. `--source` only drives the Phase 1 integrity check, so judging alpha requires a Phase 4 study over a real capture (`run_walk_forward.py --source <capture> ...`) passed explicitly with `--walk-forward-json <path>` — do not rely on the default `reports/walk_forward.json` — plus an explicit `--min-oos-sharpe` |
-| The synthetic book is a zero-drift random walk | Expect Sharpe ≈ 0 with a fee drag; the committed sample reports `-4.132` (negative because it is charged 2 bps of maker fees on both sides), which is a cost-model statement, not a market verdict |
+| The synthetic book is a zero-drift random walk | Expect Sharpe ≈ 0 with a fee drag; the committed sample reports `-3.987` (negative because it is charged 2 bps of maker fees on both sides), which is a cost-model statement, not a market verdict |
 | Engine p99 is host-sensitive | Two runs on the same machine, differing only in background load, move p99 from `1.4 µs` to `11.3 µs` and p999 from `8 µs` to `724 µs` (§3.3). The 5.0 µs budget is only meaningful with the cores and the load characterised |
 | Chaos runs on a fake monotonic clock | Deterministic and fast, but it does not exercise the socket, the TLS stack or the kernel's retransmit timers |
 | The dead-man's switch is driven directly | It proves monitor + kill-switch semantics, not the full live feed loop that must eventually beat into it |
@@ -700,11 +737,11 @@ venue before assuming the book is flat.
 
 ### 11.3 What is still missing before this is a business
 
-1. **An edge.** The committed study is `NO-GO`: `net_pnl = -16.47 USDT` over 229
+1. **An edge.** The committed study is `NO-GO`: `net_pnl = -15.78 USDT` over 229
    fills with `2.0 bps` maker / `5.0 bps` taker charged. Nothing in this layer
    changes that sign. Real capture + a re-run study is the work.
 2. **~~Markout.~~** Shipped in §11.4. It answers the question item 1 cannot: the
-   study's maker fills are marked at `-0.43 bps` one second after the trade, so
+   study's maker fills are marked at `-0.33 bps` one second after the trade, so
    the quote is being picked off and the fee is not the only problem.
 3. **Funding.** Perpetual funding is charged every 8h and is currently not in
    the ledger; a carry-heavy session will drift from the paper model.
@@ -740,13 +777,18 @@ per horizon, per maker/taker and per maker side, and prints one verdict.
 
 Three design decisions matter more than the statistics:
 
-* **Simulated fills are marked in-loop, never joined.** The C++ engine stamps
-  `Fill.timestamp` with `steady_clock`, which has an arbitrary epoch, so a
-  replay fill cannot be looked up in a capture. `MarkoutReplayer` measures it
-  during the replay instead — the mid behind `h = 0` is the book that produced
-  the fill, and later horizons are later frames of the same feed. Venue-clock
-  fills (a real session exported as JSON) go through `--fills` instead, where
-  the join is legitimate because both sides carry the exchange timestamp.
+* **Simulated fills are marked in-loop, never joined.** A fill carries two
+  clocks. `Fill.timestamp` is the local record time, a `steady_clock` stamp with
+  an arbitrary epoch, so it can never be looked up in a capture;
+  `Fill.event_ts` is the venue event time of whatever filled the order (the
+  depth frame, or the trade print under the tape model), copied from the event
+  that the engine matched against. `MarkoutReplayer` measures the fill during the
+  replay instead — the mid behind `h = 0` is the book that produced the fill, and
+  later horizons are later frames of the same feed — stamping each fill with
+  `event_ts` so a `trade`-model fill is placed at its print, not at the depth
+  frame that preceded it. Venue-clock fills (a real session exported as JSON) go
+  through `--fills` instead, where the join is legitimate because both sides
+  carry the exchange timestamp.
 * **A missing sample is truncated, not interpolated.** A horizon with no sample
   inside `--tolerance-ms` is counted and excluded. Carrying the last mid forward
   across a feed outage is how a hole becomes a fake edge.
@@ -766,32 +808,34 @@ Three design decisions matter more than the statistics:
 
 | horizon | fills | mean bps | median | t | win % | net of fee |
 | --- | --- | --- | --- | --- | --- | --- |
-| 0 s | 230 | −0.434 | −0.434 | n/a (σ≈0) | 0.0% | −2.43 |
-| 1 s | 227 | −0.429 | −0.434 | −6.48 | 36.1% | −2.43 |
-| 10 s | 199 | −0.505 | −0.434 | −2.62 | 42.7% | −2.51 |
-| 60 s | 55 | −0.810 | −1.101 | −1.19 | 45.5% | −2.81 |
+| 0 s | 230 | −0.334 | −0.333 | n/a (σ≈0) | 0.0% | −2.33 |
+| 1 s | 227 | −0.328 | −0.334 | −4.96 | 36.1% | −2.33 |
+| 10 s | 199 | −0.405 | −0.334 | −2.10 | 42.7% | −2.41 |
+| 60 s | 55 | −0.709 | −1.000 | −1.04 | 45.5% | −2.71 |
 
 Verdict: **`ADVERSE_SELECTION`**. Two readings, both uncomfortable:
 
-* **The quote never captures the spread.** Mean entry offset is `-0.434 bps`
-  against a `0.667 bps` spread, i.e. every fill prints *through* the mid. The
-  paper engine fills a resting quote when the touch crosses it, so a quote that
-  the strategy posted inside the spread is filled only by the move that runs it
-  over. This is also a fidelity gap: live `post_only` (`timeInForce=GTX`) would
-  have rejected such a quote instead of filling it.
+* **The entry offset is exactly half the spread.** Mean entry offset is
+  `−0.334 bps` against a `0.667 bps` spread, and the `0 s` distribution has
+  `sd = 0.000` and `t = −48289`. A statistic that lands on half the spread with
+  zero variance on every fill is not measuring a market: it is measuring the
+  fill rule. Under the legacy `touch` model a resting order fills on the frame
+  the opposite touch reaches its price, so the mid is *always* half a spread
+  away by construction. §11.5 is the rest of this argument.
 * **It keeps getting worse on the same fills.** Over the 55 fills that have a
-  60 s sample at both ends, the mean moves from `-0.434 bps` to `-0.810 bps`, a
-  `-0.38 bps` drift. Separately, the `1 s` markout totals `-2.92 USDT` against
-  the study's gross PnL of `-2.74 USDT`; that comparison is indicative only —
+  60 s sample at both ends, the mean moves from `−0.334 bps` to `−0.709 bps`, a
+  `−0.38 bps` drift. Separately, the `1 s` markout totals `−2.23 USDT` against
+  the study's gross PnL of `−2.05 USDT`; that comparison is indicative only —
   the markout covers 227 of the study's 230 fills and values each at its own
   1 s mid, while gross PnL uses the study's position accounting and valuation
   times. The proximity of these totals does not establish a ledger
   reconciliation; that would require the same fills and valuation time in both
   calculations.
 
-Neither reading can be fixed by tuning costs. The next study has to post a quote
-that actually rests behind the touch (and model post-only rejection), or find an
-edge large enough to survive being filled adversely.
+Neither reading can be fixed by tuning costs. The next study has to post a
+quote that actually rests behind the touch (and model post-only rejection), or
+find an edge large enough to survive being filled adversely — and it has to be
+measured by a fill model that can distinguish the two (§11.5).
 
 #### Known limits of the measurement
 
@@ -802,3 +846,438 @@ edge large enough to survive being filled adversely.
 * With `--frames-per-hook n`, a fill and its mid are both attributed to the hook
   that ended the batch, so horizons shorter than `n` frames are not measurable.
   Keep the study's `--frames-per-hook` when comparing to its report.
+
+### 11.5 Fill models: the difference between a market and a rule
+
+Every profitability number in this document is produced by the paper engine's
+matching logic, so the matching logic decides the answer. Until it was made
+selectable, there was only one model, and it had a structural bias:
+
+> `match_resting()` filled the **entire** resting quantity at the order's price
+> on the frame the opposite touch reached it. It never filled on the far more
+> common event — a trade printing at the quote's own price while the book is
+> unchanged — because a depth snapshot cannot show one.
+
+Selecting only the frames where the market moved *through* the quote is
+selecting adverse fills by construction. The `−0.334 bps` markout in §11.4 is
+that rule printed back out, with `sd = 0`.
+
+The engine now implements three models, selected with `--fill-model`:
+
+| Model | A resting order fills when | Needs | Bias |
+| --- | --- | --- | --- |
+| `touch` (default) | the opposite touch reaches its price; full size, immediately | depth only | fills only on price moves through the quote → adverse by construction |
+| `queue` | displayed depth at its own price is consumed, after the queue ahead of it | depth only | blind to quotes resting inside the spread, which never appear in the book → under-fills |
+| `trade` | an aggressor print at or through its price, after the queue ahead of it | depth **and** trade prints | the reference model: queue priority, partial fills, no book-crossing guess |
+
+`touch` remains the default so committed studies stay reproducible, but a study
+whose fills were produced by it cannot answer a question about maker economics.
+
+#### Measured: the same study, three models
+
+The committed lock (`b29a62ed93caf69a`), `data/sample_events.ndjson`,
+`--window-events 400`, retail fees:
+
+| Fill model | fills | fill ratio | net PnL | trade prints seen |
+| --- | --- | --- | --- | --- |
+| `touch` | 229 | 16.47 % | −15.78 USDT | 0 |
+| `queue` | 0 | 0.00 % | 0.00 USDT | 0 |
+| `trade` | 0 | 0.00 % | 0.00 USDT | 0 |
+
+Two facts fall out, and they are the honest state of the alpha workstream:
+
+1. **The archive has no trades.** `trade_events` is the count of prints the
+   engine consumed; it is `0`, so the tape model correctly refuses to invent
+   fills. `data/sample_events.ndjson` and the 93-frame `data/raw_l2` capture are
+depth only. **A maker-fill study is not possible on either.**
+2. **The depth-only queue model fills nothing here**, because the strategy posts
+   inside the spread, where no displayed depth exists to be consumed. That is
+   not a bug in the model; it is the model telling you what L2 snapshots cannot
+   see.
+
+So the choice is: capture `trade` alongside `depth@100ms` and study fills
+from the tape (§11.5.2), or keep quoting on a model that answers a different
+question.
+
+#### 11.5.1 Quotes must exist on the venue's grid
+
+The audit that produced this section also found a second defect in the same
+path. `adjusted_quotes()` rounded to the tick **only** for `STOCK` and
+`COMMODITIES`, so every crypto quote was priced between ticks:
+
+```text
+raw quotes: 30000.80077572704 / 30001.19922427296   (tick 0.5)
+```
+
+An order at `30000.80077572704` cannot be represented in the ladder and a real
+venue rejects it. Quotes are now snapped for every venue, **outwardly** — bid
+down, ask up — so snapping can only widen the market and can never turn a valid
+two-sided quote into a crossed or degenerate one. Nearest-tick rounding would
+collapse both sides onto one price whenever the modelled spread is under a tick,
+which is exactly the case for the committed fit (`~0.20` against a `0.5` tick).
+
+This did not change the build verdict; it moved the study by `+0.69 USDT`
+(`−16.47` → `−15.78`), and `reports/walk_forward.json` has been regenerated so
+the committed artefact matches the code that produced it. A `GO` from an
+artefact older than the strategy is not evidence about the strategy.
+
+#### 11.5.2 What the next study needs
+
+The tape model is only as good as its input:
+
+| Requirement | Why |
+| --- | --- |
+| `trade` captured next to `depth@100ms` | without prints, `--fill-model trade` fills nothing and says so. `@aggTrade` is documented but silent on this endpoint (§11.6.1), so the stream to archive is `trade` |
+| Hours-to-days of capture, not 9 seconds | the repro `data/raw_l2` file holds 93 frames; it cannot carry a study |
+| A spread that clears the fee | a `0.667 bps` book against `2 bps` maker is a structural loss: you need `> 4 bps` of round-trip edge or a fee tier near zero |
+| `--fill-model trade` recorded with the artefact | `aggregate.fill_model` now carries it, so a net PnL is never read without its model |
+
+Run the comparison yourself:
+
+```bash
+for m in touch queue trade; do
+  python3 scripts/run_walk_forward.py \
+    --source data/sample_events.ndjson --window-events 400 \
+    --from-lock --lock-file config/walk_forward_lock.json \
+    --fill-model $m --report-dir reports/fillmodel --stem wf_$m
+done
+python3 scripts/run_markout.py --fill-model trade
+```
+
+The economic ceiling is worth stating plainly: at USDⓈ-M VIP 0 a maker pays
+`2 bps` per fill and earns half the spread. On a book quoting `0.667 bps`, a
+passive strategy **cannot** be profitable from spread capture alone, whatever
+the fill model says. The fee tier — not the quoting logic — is the binding
+constraint, and no amount of parameter search moves it.
+
+### 11.6 The first study on a real tape
+
+§11.5 ended with a requirement: capture the tape, then re-run. That capture is
+now implemented (`data_ingestion.aux_streams`), and this section records what
+happened when it was pointed at the live venue — including one defect that no
+synthetic archive could ever have exposed.
+
+#### 11.6.1 Capturing the tape: `@aggTrade` is silent, `@trade` is not
+
+The client now subscribes to the *combined* stream
+(`<endpoint>/stream?streams=<sym>@depth@100ms/<sym>@trade`) so prints and depth
+share one socket, in one arrival order, in one archive. Two facts were
+established empirically rather than from documentation:
+
+| Subscription | Frames in 5 s | Result |
+| --- | --- | --- |
+| `btcusdt@aggTrade` | 0 | accepted, then silent — also inside `/stream?streams=` |
+| `btcusdt@trade` | ~40/s | individual prints, `e=trade`, `p/q/T/m` complete |
+| `btcusdt@bookTicker` | ~40/s | works (not captured: `depth` gives the same touch) |
+
+So `aggTrade` is documented but empty on this endpoint, while `trade` delivers.
+Both parse identically (`JsonFeedParser::classify` accepts `trade` and
+`aggTrade`), which is why the config names `trade` and the flag still accepts
+anything the venue serves. A depth-only capture now logs a warning at startup
+instead of letting `--fill-model trade` fail silently later.
+
+The combined envelope `{"stream":..,"data":..}` is sliced off **textually**
+before archiving, so each line stays the venue's own payload bytes. Round-tripping
+through `json` would reformat numbers and the archive would stop being ground
+truth; the `stream` name is redundant because the payload carries `s` itself.
+
+A 151 s capture (7,756 records: 1,466 depth + 6,290 prints, 1.34 MiB gzipped)
+is committed at
+`data/raw_l2/binance_futures_btcusdt_depth_100ms_trade_20261029T163929Z_00001.ndjson.gz`.
+It is a smoke test, not a study.
+
+#### 11.6.2 The ladder was quoting against nothing
+
+Feeding that archive to the engine produced `bbo = (0, 0)` on **every frame**:
+the book was empty and the mark price stayed pinned at the configured `30000`.
+
+The cause is structural, not a bug in the feed. The price ladder is a
+direct-indexed array of `8192` ticks anchored at `engine.center`, so with
+`tick_size=0.50`, `center=30000` it covers only `[27952, 32048]`. The live market
+was at `81 200`. Every level was rejected by `slot_for`, `top()` kept returning
+an empty book, and the study reported a plausible flat run — a failure that is
+indistinguishable from a quiet market and can survive an entire research cycle
+unnoticed. `TradingEngine` (the live path) had the identical defect: it
+configured the book once from `EngineConfig` and never re-anchored.
+
+Both engines now re-anchor. `reframe_anchor()` (in `orderbook.hpp`) moves the
+window onto the frame's own touch when the frame carries a price the window
+cannot hold. Four properties matter:
+
+- **The test is the frame, not the book.** The first version of this rule only
+  fired while the book was *blind* (one side empty). That leaves the second
+  failure open: once the ladder holds levels it is no longer blind, so a market
+  that leaves the window again is rejected in full while the old, believable
+  BBO keeps being published to the quoting and matching paths — and
+  `unpriced_frames` stays at zero, so nothing looks wrong. A populated book
+  that cannot hold the frame is exactly as useless as an empty one, so the rule
+  now fires for it too.
+- **The tick is never guessed.** It is the venue's grid; a tick that does not
+  divide the venue's prices is a configuration error. Faking a finer grid would
+  hide it, so instead `metrics.unpriced_frames` exposes it.
+- **The rule is idempotent.** Once the anchor equals the frame's touch it returns
+  "no move", so an unrepresentable grid cannot make the book clear itself on
+  every frame.
+- **Depth is carried across.** `recenter()` keeps every level the new window can
+  still hold instead of dropping the lot. Re-anchoring is a constant slot shift,
+  so it is a `memmove` of the ladder plus a shift of the occupancy bitmap and a
+  recount of the live set — no allocation, no per-level copy, and no cap on how
+  many levels survive (a 200-level-per-side book keeps all 200 across a move and
+  loses only the level that leaves the window). The swap is published through the
+  seqlock so a reader never sees a half-rebuilt book, and an off-grid centre
+  clears the ladder rather than mis-indexing it. What cannot fit is gone —
+  and because the default `depth@100ms` feed is a *diff* stream, a dropped level
+  is not repeated until it changes. After a re-anchor that loses depth, a live
+  deployment must reseed from a REST snapshot (`seed_from_snapshot`) instead of
+  trusting the near touch; the `depth20@100ms` partial-book stream is a
+  snapshot-style exception and does not make the diff path safe.
+- **A frame is truncated toward the touch, not from the front.** `DepthUpdate`
+  holds `kMaxDepthLevels` (32) levels per side, but a partial-book burst on this
+  feed carries hundreds — one frame here listed 407 bids and 440 asks — and the
+  venue promises no ordering: those bids arrived *ascending*, starting at
+  `30 895`. Keeping the first 32 therefore discarded the real touch, and the
+  parser's "best bid" became a price ~800 USDT below the market — which the
+  re-anchor rule above then dutifully chased: 78 re-anchors and 37 unpriced
+  frames on the same archive. `parse_levels` now keeps the highest bids and the
+  lowest asks, evicting the furthest level instead, because the touch is the only
+  quantity the engine reads. `test_json_parser_keeps_the_levels_nearest_the_touch`
+  pins it.
+- **It is observable.** `book_recenters`, `rejected_levels` and
+  `unpriced_frames` are carried through `ReplaySummary` into
+  `aggregate`, and printed on the study's own summary line:
+
+```
+fills 147 under the trade model | tape 6290 print(s) | book: 1 unpriced frame(s), 4 re-anchor(s)
+```
+
+`rejected_levels` alone is not a health signal — a real feed legitimately quotes
+levels thousands of ticks away (this capture carried one at `1000.00`), and they
+are all dropped by design. One unpriced frame out of 1,466 means the book was the
+market for 99.93 % of the capture; the 7,864 rejected levels are the far ones,
+not the touch.
+
+#### 11.6.3 Touch versus tape, on real prints
+
+Same archive, same venue lock (`config/venue_binance_futures_btcusdt.json`:
+tick `0.10`, seed centre `80000`), 4 windows of 2,000 events:
+
+| model | fills | trades | net PnL | fees | **before fees** |
+| --- | --- | --- | --- | --- | --- |
+| `touch` | 61 | 8 | `-9.32` | `9.93` | `+0.61` |
+| `trade` | 147 | 45 | `-7.64` | `8.09` | `+0.45` |
+
+Two things changed with the model, and both matter:
+
+1. The tape model fills **more** often (147 vs 61): a print at the quote fills an
+   order the touch model cannot see, so the legacy model was not "conservative",
+   it was measuring a different (and rarer) event. It also completes five times
+   as many round trips (45 vs 8), which is why its numbers mean more.
+2. Loss per trade fell from `-1.16` to `-0.17` USDT, and pre-fee PnL is `+0.61`
+   (touch) against `+0.45` (trade): at this sample size the strategy captures
+   slightly *more* than nothing before the fee, and the whole loss is the `2 bps`
+   maker charge. The earlier `-15.57` was mostly a symptom of the phantom anchor
+   described in §11.6.2, not of the strategy.
+
+The markout study tells the same story with more resolution:
+
+| model | h=0 mean | h=0 median | h=0 sd | win % | h=1s mean | t | verdict |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `touch` | `+0.139 bps` | `+0.086` | `0.61` | 57.1 | `-0.412` | `-4.91` | INCONCLUSIVE (n=6) |
+| `trade` | `+0.232 bps` | `+0.092` | `0.36` | 100.0 | `-0.404` | `-11.92` | INCONCLUSIVE (n=28) |
+
+Both models agree on the shape, and it is not a tail. At `h=0` every tape-model
+fill is positive (100 % win) because the fill is marked against the mid it was
+quoted *away* from — that number measures the quote offset, not an edge. One
+second later every single fill is negative (`-0.404 bps`, 0 % win, `t = -11.92`):
+**the capture decays to nothing inside the marking window**, uniformly, rather
+than being destroyed by a minority of toxic prints. Neither column clears the
+`30`-sample bar, so both verdicts stay INCONCLUSIVE — the 1 s sign is
+consistent (`28/28` → `0/28` positive on the tape model's 28 marked fills) but
+it is still one 151 s capture.
+
+The conclusion it sharpens: the strategy is not "wrong", it is
+**mis-priced against its own fee**:
+
+- `h=0` net after `2 bps` maker = `-1.77 bps` per fill.
+- `h=1s` net after `2 bps` maker = `-2.40 bps` per fill.
+- To break even on a `2 bps` fee, the fill needs `> +2 bps` of markout edge; it
+  delivers `+0.23 bps` at `h=0` and `-0.40 bps` at the horizon that matters.
+
+#### 11.6.4 The OFI knob does not rescue it (yet)
+
+The strategy carries `ofi_sensitivity` (order-flow-imbalance coupling), disabled
+at `0.0` in the lock. Swept on this capture with the tape model:
+
+| `ofi_sensitivity` | fills | trades | net PnL | gross edge |
+| --- | --- | --- | --- | --- |
+| `0.0` (locked) | 147 | 45 | `-7.64` | `+0.110 bps` |
+| `0.5` | 172 | 51 | `-7.88` | `-0.132 bps` |
+| `1.0` | 175 | 50 | `-8.66` | `-0.318 bps` |
+| `2.0` | 153 | 44 | `-10.25` | `-0.489 bps` |
+| `4.0` | 188 | 57 | `-10.59` | `-0.556 bps` |
+
+It makes things worse at every setting: the skew does add fills (147 → 188) but
+it takes the pre-fee capture from `+0.11 bps` to `-0.56 bps`, so it is buying
+fills that lose money. One caveat on the sweep itself: `--from-lock` makes the
+lock file the single source of truth and *ignores* CLI overrides, so these rows
+are run with explicit `--k 1.5 --gamma 0.1 --tick-size 0.1 --center 80000
+--maker-bps 2 --taker-bps 5 --ofi-sensitivity ...` and no lock. With 151 s of
+data this is a hint, not a finding — fitting a toxicity filter needs hours of
+tape and a proper in-sample/out-of-sample split, which is exactly what §11.5.2
+asks for.
+
+#### 11.6.5 What this leaves as the next decision
+
+The machinery is now honest end to end: the archive carries the tape, the
+engine follows the market, a blind book is reported instead of hidden, and every
+PnL is stamped with the model and grid that produced it. The remaining gap is
+commercial, not engineering, and the options are ordered by what the evidence
+supports:
+
+1. **Fix the fee.** `+0.23 bps` of mean capture at `h=0` against a `2 bps` maker
+   fee is not a parameter problem. Either reach a fee tier where the capture
+   clears (VIP/BNB discounts, or a rebate venue), or trade a book whose spread is
+   several bps wide. This is the only lever that moves the sign.
+2. **Attack the decay.** The `h=0 → 1s` flip is uniform (100 % → 0 % positive),
+   not a fat tail, so a filter cannot fix it by dropping bad fills — it has to
+   change *when the quote is present*, i.e. predict the mid move rather than
+   select among fills. Needs hours of tape; the sweep in §11.6.4 is the shape of
+   the experiment, not its answer.
+3. **Accumulate data.** 151 s cannot separate alpha from noise. `ingest_l2.py`
+   already runs for days (reconnects, rotation, graceful drain); the study just
+   needs the archive.
+
+Until (1) is resolved, the ALPHA verdict stays **NO-GO**, and it should: the
+report is telling the truth about a strategy that cannot pay its own fees.
+
+
+### 11.7 The fee wall: what the sign actually depends on
+
+§11.6 measured the strategy's capture. This section measures the other side of
+the ledger and answers the only question that decides whether the codebase can
+ever be profitable: **what maker fee can this edge pay?**
+
+#### 11.7.1 The arithmetic of the wall
+
+Read directly from the committed 151 s archive (1,466 depth frames):
+
+| Quantity | Value |
+| --- | --- |
+| Median quoted spread | `0.01229 bps` = **1 tick** (0.10 on ~81,370) |
+| Spread p90 / max | `0.467 bps` (38 ticks) / `13.75 bps` |
+| Retail VIP 0 maker fee | `2.0 bps` = **16.27 USDT** = **162.7 ticks** |
+| Fee as a multiple of the whole median spread | **163x** |
+| Fee as a multiple of the half-spread available at the touch | **325x** |
+| Depth frames whose spread is wide enough to capture 2 bps per side | **0.205 %** |
+
+A passive maker at the touch earns half the spread when filled — about
+`0.006 bps` here — and pays `2 bps`. The instrument's entire quoted spread is
+smaller than 1 % of one fill's fee, so no amount of queue skill changes the
+sign. The strategy must therefore earn *outside* the spread, i.e. it needs the
+mid to move in its favour after the fill, and that is exactly the quantity
+adverse selection eats.
+
+#### 11.7.2 Where the gross edge peaks
+
+The strategy's quote width is set by the Avellaneda-Stoikov `k`
+(`half = (1/gamma) * ln(1 + gamma/k)`, `gamma = 0.1`). Sweeping it on the same
+archive, tape fill model, 4 windows x 2,000 events, `2.0 bps` maker fee
+(diagnostic sweep with explicit `--tick-size 0.1 --center 80000 --k ...`; these
+rows are not a locked study):
+
+| `k` | half-spread | fills | trades | pre-fee PnL | **gross edge** | net at 2 bps |
+| --- | --- | --- | --- | --- | --- | --- |
+| `1.5` (locked) | `0.08 bps` | 147 | 45 | `+0.45` | `+0.110 bps` | `-7.64` |
+| `0.2` | `0.50 bps` | 117 | 19 | `+0.91` | `+0.259 bps` | `-6.09` |
+| `0.05` | `1.35 bps` | 73 | 9 | `+2.07` | `+0.848 bps` | `-2.81` |
+| `0.018` | `2.31 bps` | 36 | 0 | `+2.57` | `+1.264 bps` | `-1.50` |
+| `0.006` | `3.53 bps` | 28 | 0 | `+2.18` | `+1.916 bps` | `-0.10` |
+| `0.002` | `4.83 bps` | 11 | 0 | `+1.59` | `+2.441 bps` | `+0.29` |
+| `0.0008` | `5.94 bps` | 11 | 0 | `+1.01` | `+3.096 bps` | `+0.36` |
+
+The shape is the finding, and it is not the shape a parameter search would want:
+
+* Gross edge climbs monotonically, `+0.11 bps` at the locked width to
+  `+3.10 bps` at the widest — but the fill count falls from 147 to 11 and the
+  completed round trips from 45 to **zero** over the same range.
+* From `k = 0.018` down nothing closes inside a window: every fill stays open
+  until the window boundary flattens it, so the PnL is a mark, not a trade. The
+  two positive net rows are 11 one-way fills with 0 round trips, and their gross
+  edge is computed against 3,254–6,509 USDT of notional that barely moved. That
+  is not a measured edge; it is a small sample divided by a small denominator.
+* Among the widths that still complete round trips (`k >= 0.05`), the capture is
+  `+0.11 … +0.85 bps` and net is negative at every single row.
+
+So the break-even maker fee on this tape is at most **~0.85 bps** at a width that
+still completes trades, and `+0.110 bps` at the locked `k` — against a retail
+maker fee of `2.0 bps`. The earlier reading of a `+1.015 bps` peak was measured
+before the depth parser kept the levels nearest the touch (§11.6.2); the peak it
+found was traded against a phantom book and does not survive the fix.
+
+Two different runs feed the numbers in this section, and they are not
+interchangeable. Every `+0.110 bps` above comes from the real archive; the
+`-0.299 bps` that §11.7.3 shows in the gate's output is the committed *sample*
+study, a different dataset:
+
+| Run | Data | Fills / trades | Notional | Pre-fee | Gross edge |
+| --- | --- | --- | --- | --- | --- |
+| Real tape, locked `k` | the 151 s archive, tick `0.1` | 147 / 45 | `40,444.89 USDT` | `+0.445` | `+0.110 bps` |
+| Committed sample study | `data/sample_events.ndjson`, tick `0.5`, centre `30,000` | 229 / 105 | `68,664.88 USDT` | `-2.050` | `-0.299 bps` |
+
+#### 11.7.3 What the code now reports
+
+The measurement above is only useful if it cannot be lost again, so the
+break-even fee is now a first-class number:
+
+* `python_analytics/costs.py` — `gross_edge_bps(pre_fee_pnl, traded_notional)`
+  and the `FeeWall` dataclass. Gross PnL over the notional it was earned on is
+  the *only* unit in which an edge and a fee rate are directly comparable, and
+  the break-even maker fee is exactly that ratio.
+* `walk_forward` — the aggregate carries `gross_edge_bps`, the console prints
+
+  ```
+  fee wall: gross edge +0.110 bps vs 2 bps maker fee | break-even maker fee +0.110 bps
+  ```
+
+  and the markdown gains `Gross edge (pre-fee)` and `Break-even maker fee` rows.
+* `generate_readiness_report.py` — a third alpha check, `alpha.fee_wall`,
+  restates `alpha.net_pnl` in fee units:
+
+  ```
+  ALPHA FAIL alpha.fee_wall: gross edge -0.299 bps vs 2 bps maker fee
+                             | break-even maker fee -0.299 bps
+  ```
+
+  with `breakeven_maker_bps`, `fee_wall_viable` and `fee_wall_multiple` in the
+  evidence block. It is emitted only when the study traded notional — an empty
+  run has no unit to charge a fee against, and reporting `0.0` would read as a
+  measured edge.
+
+That last check is what a production arming decision already consumes:
+`run_live_trader.py --live` refuses to arm without a fresh alpha GO, so a fee
+tier that cannot be paid now blocks the deployment in code instead of in a
+meeting.
+
+#### 11.7.4 The decision this forces
+
+1. **The fee tier is the business case, not a detail.** `+0.11 … +0.85 bps` is
+   the ceiling this edge can pay on this instrument at a width that still
+   completes round trips. Retail VIP 0 charges `2.0 bps`. Only a materially
+   better maker rate — a high volume tier, a market-maker/rebate programme, or a
+   venue whose quoted spread is a few bps wide — clears it. No parameter set
+   moves the sign on its own: `k` widens the capture by `~0.74 bps` in total
+   before the trade count collapses to zero.
+2. **The wide end is unmeasured, not better.** The only rows whose net PnL is
+   positive (`k = 0.002` and `0.0008`) hold 11 fills and 0 completed round trips
+   apiece; they are a boundary mark on a position that never round-tripped, so
+   they cannot be read as an edge. Either way the fee wall does not depend on
+   them — it comes from the spread and the fee schedule §11.7.1 — but the shape
+   does, so accumulating hours of tape is still the prerequisite for quoting at
+   the peak width.
+3. **Everything else is second order.** Toxicity filters, micro-price and OFI
+   skew act on a `0.1–0.8 bps` capture against a `2 bps` cost. They are worth
+   building once the edge is larger than the fee, not before.
+
+With `alpha.fee_wall` in the report, the promotion checklist in §10 cannot pass
+a study whose edge is smaller than the fee it will be charged, and the number
+that has to change is now named on every run.

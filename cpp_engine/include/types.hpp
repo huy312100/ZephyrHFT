@@ -371,6 +371,11 @@ struct Fill {
     Quantity quantity{};
     Notional fee{};
     Nanos timestamp{0};
+    // Venue event time of whatever filled this order (the depth frame or the
+    // trade print), in the feed's own clock; zero when the event carried none.
+    // ``timestamp`` stays the local record time, so a study can tell the two
+    // apart instead of treating a wall-clock value as an exchange one.
+    Nanos event_ts{0};
     Side side{Side::Buy};
     std::uint8_t is_maker{0};
 };

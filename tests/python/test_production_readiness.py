@@ -20,8 +20,9 @@ SCRIPT = ROOT / "scripts" / "generate_readiness_report.py"
 
 PHASE1 = {"phase1.configuration", "phase1.archive_integrity"}
 PHASE2 = {"phase2.engine_latency_p99", "phase2.engine_latency_p999",
-          "phase2.replay_throughput", "phase2.ledger_residual",
-          "phase2.order_rejections", "phase2.fill_activity"}
+          "phase2.reanchor_latency_p99", "phase2.replay_throughput",
+          "phase2.ledger_residual", "phase2.order_rejections",
+          "phase2.fill_activity"}
 PHASE3 = {"phase3.disconnect_storm", "phase3.latency_injection",
           "phase3.deadman_switch"}
 PHASE4 = {"phase4.parameter_lock", "phase4.no_look_ahead",
@@ -108,6 +109,48 @@ def test_deadman_switch_proves_trip_and_recovery(green) -> None:
     assert evidence["orders_allowed_after_reset"] is True
     assert evidence["retripped_after_recovery"] is True
     assert evidence["trip_reason"].startswith("heartbeat_timeout")
+
+
+def test_reanchor_check_measures_the_path_it_names(gate) -> None:
+    """The re-anchor p99 must come from frames that actually moved the window."""
+    parameters = gate.LockedParameters()
+    checks, evidence = gate.measure_reanchor(parameters, frames=50, max_p99_us=1e6)
+    assert evidence["frames"] == 50
+    assert evidence["recenters"] > 0
+    assert evidence["latency_us"]["p99"] > 0.0
+    assert checks[0].passed
+
+
+def test_reanchor_check_fails_when_the_window_never_moves(gate) -> None:
+    """A comfortable p99 for a path the run never took is not evidence."""
+    # One frame next to the seeded centre proves nothing about the anchor.
+    parameters = gate.LockedParameters()
+    checks, evidence = gate.measure_reanchor(parameters, frames=1, max_p99_us=1e6)
+    assert evidence["recenters"] == 0
+    assert not checks[0].passed
+
+
+def test_the_reanchor_ceiling_is_its_own_budget(gate, green) -> None:
+    """The 5 us production tier gates seeded frames, not window moves."""
+    args = gate.parse_args(["--max-engine-p99-us", "5.0"])
+    assert args.max_reanchor_p99_us == 200.0
+    assert green[1].thresholds["max_reanchor_p99_us"] == 200.0
+
+    # The ceiling handed in is the one enforced, not the engine budget.
+    parameters = gate.LockedParameters()
+    checks, _ = gate.measure_reanchor(parameters, frames=20, max_p99_us=0.0)
+    assert checks[0].threshold == "<= 0 us"
+    assert not checks[0].passed
+
+
+def test_the_reanchor_ceiling_cannot_be_disabled(gate) -> None:
+    """`inf` would make every finite p99 pass, so the budget is refused, not trusted."""
+    for unbounded in ("inf", "-inf", "nan"):
+        with pytest.raises(SystemExit) as raised:
+            gate.parse_args(["--max-reanchor-p99-us", unbounded])
+        # argparse's usage refusal is the same code the script uses for config.
+        assert raised.value.code == gate.EXIT_USAGE
+    assert gate.parse_args(["--max-reanchor-p99-us", "0.5"]).max_reanchor_p99_us == 0.5
 
 
 def test_chaos_profiles_are_attributed(green) -> None:
@@ -293,7 +336,7 @@ def test_no_artefacts_without_consent(gate, green, tmp_path) -> None:
 # --------------------------------------------------------------------------- #
 # Alpha: profitability is measured separately and never flatters the build
 # --------------------------------------------------------------------------- #
-ALPHA = {"alpha.net_pnl", "alpha.fee_assumption"}
+ALPHA = {"alpha.net_pnl", "alpha.fee_assumption", "alpha.fee_wall"}
 
 
 def test_alpha_is_always_measured_but_never_gated(gate, green) -> None:
@@ -362,3 +405,31 @@ def test_measure_alpha_passes_a_genuinely_profitable_run(gate) -> None:
     checks, evidence = gate.measure_alpha(payload, maker_bps=2.0, taker_bps=5.0)
     assert all(check.passed for check in checks), [c.measured for c in checks]
     assert evidence["pre_fee_profitable"] is True
+
+
+def test_measure_alpha_names_the_break_even_maker_fee(gate) -> None:
+    """Net PnL says the study loses; the wall says which fee would stop it."""
+
+    # 0.5 USDT earned before fees on 60,000 USDT of notional is 0.0833 bps, so a
+    # 2 bps maker fee is ~24x what the strategy can pay.
+    payload = {"aggregate": {"net_pnl": -11.5, "net_pnl_pct": -0.0115,
+                             "gross_pnl": -11.5, "fees_paid": 12.0,
+                             "traded_notional": 60_000.0, "fills": 120}}
+    checks, evidence = gate.measure_alpha(payload, maker_bps=2.0, taker_bps=5.0)
+    wall = next(check for check in checks if check.id == "alpha.fee_wall")
+    assert wall.passed is False
+    assert "break-even maker fee +0.083 bps" in wall.measured
+    assert "2 bps maker fee" in wall.measured
+    assert evidence["breakeven_maker_bps"] == pytest.approx(0.0833, abs=1e-4)
+    assert evidence["fee_wall_viable"] is False
+    assert evidence["fee_wall_multiple"] == pytest.approx(24.0, abs=1e-2)
+
+
+def test_measure_alpha_omits_the_fee_wall_when_nothing_was_traded(gate) -> None:
+    """A run with no fills has no notional, so there is no break-even fee to state."""
+
+    payload = {"aggregate": {"net_pnl": 0.0, "net_pnl_pct": 0.0,
+                             "gross_pnl": 0.0, "fees_paid": 0.0, "fills": 0}}
+    checks, evidence = gate.measure_alpha(payload, maker_bps=2.0, taker_bps=5.0)
+    assert "alpha.fee_wall" not in {check.id for check in checks}
+    assert "breakeven_maker_bps" not in evidence

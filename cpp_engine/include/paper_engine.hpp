@@ -18,6 +18,30 @@
 
 namespace hft {
 
+// How a resting (maker) order earns a fill.
+//
+// touch  — legacy model: the order fills in full at its limit price as soon as
+//          the opposite touch reaches it. Fast, deterministic, and optimistic
+//          in both directions: it ignores the queue in front of the order and
+//          it only ever fills on the frame where the market moved through the
+//          quote, so every fill it reports is adversarially selected by
+//          construction.
+// queue  — depth-only volume-at-price model: the order fills only from quantity
+//          that actually traded at its own price after it was posted, and only
+//          once the displayed depth ahead of it has been consumed. Fills are
+//          partial and a quote that merely rests at the touch is not handed a
+//          fill. Inferred from level decreases, so it is blind to a quote that
+//          rests inside the spread (where the tape, not the book, records the
+//          trade) and therefore under-reports fills.
+// trade  — tape-driven model, the reference for maker economics: a resting
+//          order fills when an aggressor trade prints at or through its price,
+//          after the displayed queue ahead of it has been consumed. Requires
+//          trade prints in the archive; without them nothing fills, which is
+//          the honest answer rather than a fabricated one.
+//
+// Select with --fill-model; the legacy default keeps historic studies stable.
+enum class fill_model : std::uint8_t { touch = 0, queue = 1, trade = 2 };
+
 struct paper_ack {
     OrderId order_id{0};
     RejectReason reason{RejectReason::None};
@@ -44,6 +68,16 @@ struct paper_metrics {
     std::uint32_t open_orders{0};
     Nanos last_update_ts{0};
     Nanos last_frame_latency_ns{0};
+    std::uint64_t trade_events{0};
+    // Grid health. ``unpriced_frames`` counts depth frames applied while the
+    // book still had no two-sided top: it is the only counter that separates a
+    // healthy book from a blind one, because a wide venue feed legitimately
+    // carries levels far outside the window (those are counted separately as
+    // ``rejected_levels`` and are not, on their own, a problem).
+    // ``book_recenters`` counts how often the window had to be re-anchored.
+    std::uint64_t rejected_levels{0};
+    std::uint64_t book_recenters{0};
+    std::uint64_t unpriced_frames{0};
     paper_account_snapshot account{};
 };
 
@@ -54,21 +88,38 @@ public:
 
     // Fee rates accept fractional basis points (e.g. 0.5); the ledger freezes
     // them into micro-bps so the matching path remains integer-only.
+    // ``model`` selects the maker fill model (see ``fill_model`` above).
     paper_engine(Price tick_size, Price center, double maker_bps = 0.0,
                  double taker_bps = 5.0,
-                 Notional initial_cash = Notional{}) noexcept
+                 Notional initial_cash = Notional{},
+                 fill_model model = fill_model::touch) noexcept
         : book_(tick_size, center),
           center_(center),
+          configured_center_(center),
           mark_price_(center),
           maker_bps_(maker_bps),
           taker_bps_(taker_bps),
-          initial_cash_(initial_cash) {
+          initial_cash_(initial_cash),
+          fill_model_(model) {
         reset();
     }
     paper_engine(const paper_engine&) = delete;
     paper_engine& operator=(const paper_engine&) = delete;
 
+    // Switching models mid-session is allowed; resting orders restart their
+    // queue accounting from the book they are looking at now, because a queue
+    // depth carried over from the previous model describes a fill rule that is
+    // no longer in force.
+    void set_fill_model(fill_model model) noexcept {
+        fill_model_ = model;
+        orders_.for_each_live([&](DefaultOrderManager::Slot& slot) {
+            seed_queue_state(slot.id, slot.side, slot.price);
+        });
+    }
+    [[nodiscard]] fill_model model() const noexcept { return fill_model_; }
+
     void reset() noexcept {
+        center_ = configured_center_;
         book_.configure(book_.tick_size(), center_);
         orders_.reset();
         account_.reset(initial_cash_, maker_bps_, taker_bps_);
@@ -81,17 +132,23 @@ public:
         last_final_update_id_ = 0;
         last_slippage_ = Notional{};
         mark_price_ = center_;
+        queue_slots_.fill(queue_slot{});
     }
 
     void process_update(const DepthUpdate& update) noexcept {
         const Nanos start = now_ns();
+        reframe_if_out_of_window(update);
         for (std::uint32_t i = 0; i < update.bid_count; ++i) {
-            (void)book_.apply_level(Side::Buy, update.bids[i].price,
-                                    update.bids[i].quantity, update.exchange_ts);
+            if (!book_.apply_level(Side::Buy, update.bids[i].price,
+                                   update.bids[i].quantity, update.exchange_ts)) {
+                ++counters_.rejected_levels;
+            }
         }
         for (std::uint32_t i = 0; i < update.ask_count; ++i) {
-            (void)book_.apply_level(Side::Sell, update.asks[i].price,
-                                    update.asks[i].quantity, update.exchange_ts);
+            if (!book_.apply_level(Side::Sell, update.asks[i].price,
+                                   update.asks[i].quantity, update.exchange_ts)) {
+                ++counters_.rejected_levels;
+            }
         }
         if (update.prev_final_update_id != 0 && last_final_update_id_ != 0 &&
             update.prev_final_update_id != last_final_update_id_) {
@@ -105,11 +162,25 @@ public:
         const Bbo top = book_.top();
         if (top.is_valid()) {
             mark_price_ = top.mid();
+        } else {
+            ++counters_.unpriced_frames;
         }
         account_.mark(mark_price_);
         match_resting(update.exchange_ts);
         counters_.last_frame_latency_ns = now_ns() - start;
         latency_.record(counters_.last_frame_latency_ns);
+    }
+
+    // Applies an aggressor trade print. Under ``fill_model::trade`` this is the
+    // only event that can fill a resting order; under the other models the print
+    // is recorded (``paper_metrics::trade_events``) and otherwise ignored.
+    void process_trade(const TradeTick& trade) noexcept {
+        last_trade_ = trade;
+        ++counters_.trade_events;
+        if (fill_model_ != fill_model::trade) {
+            return;
+        }
+        match_trade(trade);
     }
 
     [[nodiscard]] paper_ack submit(const OrderRequest& request) noexcept {
@@ -146,6 +217,7 @@ public:
             if (id == 0) {
                 return reject(ack, RejectReason::OrderPoolExhausted);
             }
+            seed_queue_state(id, request.side, request.price);
             ack.order_id = id;
             if (request.time_in_force == TimeInForce::IOC) {
                 Quantity cancelled;
@@ -182,7 +254,8 @@ public:
                                      remaining);
             const Notional fee =
                 account_.apply_fill(leg.price, leg.quantity, request.side, false);
-            push_fill(id, leg.price, leg.quantity, request.side, false, fee);
+            push_fill(id, leg.price, leg.quantity, request.side, false, fee,
+                      request.timestamp);
             ++counters_.fills;
             counters_.filled_quantity += leg.quantity;
             counters_.traded_notional += notional(leg.price, leg.quantity);
@@ -264,9 +337,48 @@ public:
 
     [[nodiscard]] std::size_t pending_fills() const noexcept { return fill_count_; }
     [[nodiscard]] Price tick_size() const noexcept { return book_.tick_size(); }
+    // The window the ladder is anchored on *now*; it follows the feed when the
+    // configured centre cannot hold it (see ``reframe_if_out_of_window``).
     [[nodiscard]] Price center() const noexcept { return center_; }
 
 private:
+    // A ladder anchored on a stale constant rejects every level of a live feed
+    // and reports an empty book, which is indistinguishable from a quiet market.
+    // ``reframe_anchor`` decides from the frame itself whether the window can
+    // no longer hold it; a populated ladder is reframed too, because rejecting
+    // the whole frame would keep publishing its stale BBO to the strategy.
+    // ``recenter`` carries across the levels still representable, and the venue's
+    // absolute levels rebuild the rest on the next frames.
+    void reframe_if_out_of_window(const DepthUpdate& update) noexcept {
+        const Price anchor = reframe_anchor(book_, update);
+        if (anchor.raw() <= 0) {
+            return;
+        }
+        book_.recenter(anchor);
+        center_ = anchor;
+        mark_price_ = anchor;
+        ++counters_.book_recenters;
+    }
+
+    // Per-order queue accounting for the volume-at-price and tape models. Kept
+    // out of the order slot, which is pinned to exactly one cache line; indexed
+    // by order id and validated on read, so a recycled entry degrades to
+    // "freshly posted at the depth now displayed".
+    struct queue_slot {
+        OrderId id{0};
+        std::int64_t queue_ahead{0};
+        std::int64_t ref_qty{0};
+    };
+
+    // A maker fill detected during iteration and booked once the live-order
+    // list is no longer being walked.
+    struct staged_fill {
+        OrderId id;
+        Price price;
+        Side side;
+        Quantity quantity;
+    };
+
     [[nodiscard]] paper_ack reject(paper_ack ack, RejectReason reason) noexcept {
         ack.reason = reason;
         ++counters_.orders_rejected;
@@ -274,13 +386,14 @@ private:
     }
 
     void push_fill(OrderId id, Price price, Quantity quantity, Side side, bool is_maker,
-                   Notional fee) noexcept {
+                   Notional fee, Nanos event_ts = 0) noexcept {
         Fill& fill = fills_[fill_head_ & (kFillRing - 1)];
         fill.order_id = id;
         fill.price = price;
         fill.quantity = quantity;
         fill.fee = fee;
         fill.timestamp = now_ns();
+        fill.event_ts = event_ts;
         fill.side = side;
         fill.is_maker = static_cast<std::uint8_t>(is_maker ? 1 : 0);
         if (fill_count_ == kFillRing) {
@@ -291,9 +404,27 @@ private:
         fill_head_ = (fill_head_ + 1) & (kFillRing - 1);
     }
 
+    // Seeds the queue model so a freshly posted order joins the back of the
+    // displayed queue at its price instead of being granted the front of it.
+    void seed_queue_state(OrderId id, Side side, Price price) noexcept {
+        const std::int64_t displayed = book_.quantity_at(side, price).raw();
+        queue_slot& state = queue_state(id);
+        state.id = id;
+        state.queue_ahead = displayed;
+        state.ref_qty = displayed;
+    }
+
     void match_resting(Nanos timestamp) noexcept {
         const Bbo bbo = book_.top();
         if (!bbo.is_valid()) {
+            return;
+        }
+        if (fill_model_ == fill_model::queue) {
+            match_resting_queue(timestamp);
+            return;
+        }
+        if (fill_model_ != fill_model::touch) {
+            // Tape model: a depth frame alone can never fill a maker order.
             return;
         }
         struct resting_cross {
@@ -327,13 +458,275 @@ private:
             const Notional fee = account_.apply_fill(
                 crossed[i].price, crossed[i].remaining, crossed[i].side, true);
             push_fill(crossed[i].id, crossed[i].price, crossed[i].remaining,
-                      crossed[i].side, true, fee);
+                      crossed[i].side, true, fee, timestamp);
             ++counters_.fills;
             counters_.filled_quantity += crossed[i].remaining;
             counters_.traded_notional +=
                 notional(crossed[i].price, crossed[i].remaining);
         }
         account_.mark(mark_price_);
+    }
+
+    // Volume-at-price maker fills. See ``fill_model::queue`` for the contract:
+    // only quantity that traded at the order's own price can fill it, and only
+    // after the depth ahead of it is consumed. A decrease in a level's displayed
+    // size is read as traded volume, which is the conservative assumption when
+    // the feed is L2 rather than L3 (cancels are indistinguishable from trades,
+    // so this errs toward filling too often, never too rarely).
+    void match_resting_queue(Nanos timestamp) noexcept {
+        std::array<staged_fill, kMaxCrossed> fills{};
+        std::size_t fill_count = 0;
+
+        // Trades are inferred per price level -- one depletion, one traded
+        // quantity -- so two of our orders on one level must share it. Without
+        // this the same depletion would fill both of them, and a level holding
+        // two quotes would trade twice its own depth. The shared quantity is
+        // what the level *absorbed*, which each order subtracts from its own
+        // queue: a quote posted into a deeper level sits further back, and
+        // handing it the front order's residual would fill it too early.
+        struct level_frame {
+            Price price{};
+            Side side{Side::Buy};
+            std::int64_t available{0};
+            std::int64_t absorbed{0};
+        };
+        std::array<level_frame, kMaxCrossed> levels{};
+        std::size_t level_count = 0;
+
+        // Pass 1: advance queue accounting. The live list must not be mutated
+        // here, so candidate fills are staged and applied afterwards.
+        orders_.for_each_live([&](DefaultOrderManager::Slot& slot) {
+            const std::int64_t displayed =
+                book_.quantity_at(slot.side, slot.price).raw();
+            queue_slot& state = queue_state(slot.id);
+            if (state.id != slot.id) {
+                // Never seeded, or the entry was recycled by a later order:
+                // treat it as freshly posted at the depth now displayed.
+                state.id = slot.id;
+                state.queue_ahead = displayed;
+                state.ref_qty = displayed;
+                return;
+            }
+            if (displayed == 0 && !book_.contains(slot.price)) {
+                // The price left the window, so the level was dropped by a
+                // re-anchor rather than traded away. Re-reading that drop as
+                // traded volume would stage a fill at a price the book no longer
+                // holds; reseed the reference instead and let the next frame
+                // that puts the price back do the accounting. Checked here rather
+                // than inside ``recenter`` because it is one comparison per live
+                // order on a frame that already walks them, and the re-anchor is
+                // a priced-latency path (§3.3 of the Phase 5 document).
+                state.ref_qty = 0;
+                return;
+            }
+            std::size_t level_index = level_count;
+            for (std::size_t i = 0; i < level_count; ++i) {
+                if (levels[i].price == slot.price && levels[i].side == slot.side) {
+                    level_index = i;
+                    break;
+                }
+            }
+            std::int64_t available = 0;
+            std::int64_t absorbed = 0;
+            if (level_index < level_count) {
+                // Another of our orders already read this level's depletion and
+                // spent the part of it that reached the queue. Take what it has
+                // not spent and how much of the level it has absorbed, so this
+                // order keeps its own place instead of inheriting a neighbour's.
+                available = levels[level_index].available;
+                absorbed = levels[level_index].absorbed;
+                state.ref_qty = displayed;
+            } else {
+                const std::int64_t traded =
+                    state.ref_qty > displayed ? state.ref_qty - displayed : 0;
+                state.ref_qty = displayed;
+                available = traded;
+                if (level_count < levels.size()) {
+                    levels[level_count] = {slot.price, slot.side, available, 0};
+                    level_index = level_count++;
+                }
+            }
+            const std::int64_t own = state.queue_ahead;
+            std::int64_t queue_left = own > absorbed ? own - absorbed : 0;
+            if (available > 0 && queue_left > 0) {
+                const std::int64_t consumed =
+                    available < queue_left ? available : queue_left;
+                queue_left -= consumed;
+                absorbed += consumed;
+                available -= consumed;
+            }
+            state.queue_ahead = queue_left;
+            if (level_index < level_count) {
+                levels[level_index].available = available;
+                levels[level_index].absorbed = absorbed;
+            }
+            if (available <= 0 || fill_count >= fills.size()) {
+                return;
+            }
+            const std::int64_t remaining = slot.quantity.raw() - slot.filled.raw();
+            if (remaining <= 0) {
+                return;
+            }
+            const std::int64_t filled = available < remaining ? available : remaining;
+            if (level_index < level_count) {
+                levels[level_index].available = available - filled;
+                levels[level_index].absorbed = absorbed + filled;
+            }
+            fills[fill_count++] = {slot.id, slot.price, slot.side,
+                                   Quantity::from_raw(filled)};
+        });
+
+        apply_staged_fills(fills, fill_count, timestamp);
+    }
+
+    // Tape-driven maker fills. A resting buy fills on a sell aggressor printing
+    // at or below its price; a resting sell fills on a buy aggressor printing at
+    // or above it. The print's size is allocated in price priority, and only
+    // after the displayed queue ahead of each order has been consumed.
+    void match_trade(const TradeTick& trade) noexcept {
+        if (trade.quantity.raw() <= 0) {
+            return;
+        }
+        const Side resting_side =
+            trade.aggressor == Side::Buy ? Side::Sell : Side::Buy;
+
+        struct eligible {
+            queue_slot* state;
+            OrderId id;
+            Price price;
+            Quantity remaining;
+        };
+        std::array<eligible, kMaxCrossed> candidates{};
+        std::size_t candidate_count = 0;
+
+        orders_.for_each_live([&](DefaultOrderManager::Slot& slot) {
+            if (slot.side != resting_side || candidate_count >= candidates.size()) {
+                return;
+            }
+            const bool eligible_price =
+                slot.side == Side::Buy ? trade.price.raw() <= slot.price.raw()
+                                       : trade.price.raw() >= slot.price.raw();
+            if (!eligible_price) {
+                return;
+            }
+            const std::int64_t remaining = slot.quantity.raw() - slot.filled.raw();
+            if (remaining <= 0) {
+                return;
+            }
+            queue_slot& state = queue_state(slot.id);
+            if (state.id != slot.id) {
+                const std::int64_t displayed =
+                    book_.quantity_at(slot.side, slot.price).raw();
+                state.id = slot.id;
+                state.queue_ahead = displayed;
+                state.ref_qty = displayed;
+            }
+            candidates[candidate_count++] = {&state, slot.id, slot.price,
+                                             Quantity::from_raw(remaining)};
+        });
+
+        // Price priority: the most aggressive resting price trades first.
+        for (std::size_t i = 1; i < candidate_count; ++i) {
+            eligible key = candidates[i];
+            std::size_t j = i;
+            while (j > 0) {
+                const bool better = resting_side == Side::Buy
+                                        ? key.price.raw() > candidates[j - 1].price.raw()
+                                        : key.price.raw() < candidates[j - 1].price.raw();
+                if (!better) {
+                    break;
+                }
+                candidates[j] = candidates[j - 1];
+                --j;
+            }
+            candidates[j] = key;
+        }
+
+        std::array<staged_fill, kMaxCrossed> fills{};
+        std::size_t fill_count = 0;
+        std::int64_t available = trade.quantity.raw();
+        // The displayed size belongs to the price level, not to each of our
+        // orders resting on it: two orders at one price are two places in one
+        // queue. The print therefore clears that queue once, before either of
+        // them is filled, and whatever is left is shared in posting order.
+        // Charging every order its own copy of the displayed size debits the
+        // level once per order -- the second order can then miss a print that
+        // covered the level.
+        //
+        // What the level absorbs is tracked once and subtracted from each
+        // order's *own* queue, which is not the same as handing the first
+        // order's residual to the others: a quote posted into a level that
+        // deepened after its neighbour has more size ahead of it, and a copy of
+        // the shallower residual would put it at the front of a queue it is
+        // not at the front of.
+        Price level_price{};
+        std::int64_t level_absorbed = 0;
+        bool level_open = false;
+        for (std::size_t i = 0; i < candidate_count; ++i) {
+            queue_slot& state = *candidates[i].state;
+            if (!level_open || candidates[i].price != level_price) {
+                level_open = true;
+                level_price = candidates[i].price;
+                level_absorbed = 0;
+            }
+            const std::int64_t own = state.queue_ahead;
+            std::int64_t queue_left = own > level_absorbed ? own - level_absorbed : 0;
+            if (available > 0 && queue_left > 0) {
+                const std::int64_t consumed =
+                    available < queue_left ? available : queue_left;
+                queue_left -= consumed;
+                level_absorbed += consumed;
+                available -= consumed;
+            }
+            // Every order on the level carries what is left of its own queue, so
+            // one this print never reaches is not left behind a stale queue.
+            state.queue_ahead = queue_left;
+            if (available <= 0) {
+                continue;
+            }
+            const std::int64_t remaining = candidates[i].remaining.raw();
+            const std::int64_t filled = available < remaining ? available : remaining;
+            if (filled <= 0) {
+                continue;
+            }
+            available -= filled;
+            // Volume that filled us moved the front of the level as well, so a
+            // later order on it is not charged the same size twice.
+            level_absorbed += filled;
+            fills[fill_count++] = {candidates[i].id, candidates[i].price,
+                                   resting_side, Quantity::from_raw(filled)};
+        }
+
+        apply_staged_fills(fills, fill_count, trade.exchange_ts);
+    }
+
+    // Books staged maker fills. Called after iteration so the live list is not
+    // mutated while it is being walked.
+    void apply_staged_fills(std::array<staged_fill, kMaxCrossed>& fills,
+                            std::size_t fill_count, Nanos timestamp) noexcept {
+        for (std::size_t i = 0; i < fill_count; ++i) {
+            Quantity remaining;
+            if (!orders_.apply_fill(fills[i].id, fills[i].quantity, fills[i].price,
+                                    timestamp, remaining)) {
+                continue;
+            }
+            const Notional fee = account_.apply_fill(
+                fills[i].price, fills[i].quantity, fills[i].side, true);
+            push_fill(fills[i].id, fills[i].price, fills[i].quantity,
+                      fills[i].side, true, fee, timestamp);
+            ++counters_.fills;
+            counters_.filled_quantity += fills[i].quantity;
+            counters_.traded_notional += notional(fills[i].price, fills[i].quantity);
+        }
+        account_.mark(mark_price_);
+    }
+
+    static constexpr std::size_t kQueueSlots = DefaultOrderManager::kCapacity;
+    static_assert((kQueueSlots & (kQueueSlots - 1)) == 0,
+                  "queue table must be a power of two to mask the order id");
+
+    [[nodiscard]] queue_slot& queue_state(OrderId id) noexcept {
+        return queue_slots_[static_cast<std::size_t>(id) & (kQueueSlots - 1)];
     }
 
     L2Book book_;
@@ -345,13 +738,17 @@ private:
     std::size_t fill_tail_{0};
     std::size_t fill_count_{0};
     paper_metrics counters_{};
-    Price center_{};
+    Price center_{};             // window anchor in use (follows the feed)
+    Price configured_center_{};  // what the caller asked for; restored on reset
     Price mark_price_{};
     double maker_bps_{0.0};  // basis points, fractions preserved
     double taker_bps_{5.0};  // basis points, fractions preserved
     Notional initial_cash_{};
     std::uint64_t last_final_update_id_{0};
     Notional last_slippage_{};
+    fill_model fill_model_{fill_model::touch};
+    std::array<queue_slot, kQueueSlots> queue_slots_{};
+    TradeTick last_trade_{};
 };
 
 }  // namespace hft

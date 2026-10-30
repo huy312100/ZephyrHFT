@@ -63,6 +63,13 @@ struct EngineMetrics {
     std::uint64_t p99_ns{0};
     std::uint64_t p999_ns{0};
     std::uint32_t open_orders{0};
+    // Grid health: depth levels the ladder could not represent, how often the
+    // price window had to be re-anchored on the feed, and how many frames left
+    // the book without a two-sided top (the only one of the three that means
+    // "the book is not the market").
+    std::uint64_t rejected_levels{0};
+    std::uint64_t book_recenters{0};
+    std::uint64_t unpriced_frames{0};
 };
 
 struct EngineConfig {
@@ -153,23 +160,35 @@ public:
     }
 
     void apply_depth(const DepthUpdate& update) noexcept {
+        reframe_if_out_of_window(update);
         for (std::uint32_t i = 0; i < update.bid_count; ++i) {
             const bool applied =
                 book_.apply_level(Side::Buy, update.bids[i].price, update.bids[i].quantity,
                                   update.exchange_ts);
-            (void)applied;
+            if (!applied) {
+                ++metrics_.rejected_levels;
+            }
         }
         for (std::uint32_t i = 0; i < update.ask_count; ++i) {
             const bool applied =
                 book_.apply_level(Side::Sell, update.asks[i].price, update.asks[i].quantity,
                                   update.exchange_ts);
-            (void)applied;
+            if (!applied) {
+                ++metrics_.rejected_levels;
+            }
         }
         book_.set_sequence(update.final_update_id, update.exchange_ts, update.recv_ts);
         ++metrics_.depth_events;
         metrics_.last_update_ts = std::max(metrics_.last_update_ts, update.exchange_ts);
-        if (book_.best_bid().raw() > 0 && book_.best_ask().raw() > 0) {
-            mark_price_ = book_.top().mid();
+        // One validated read decides both the mark and the counter: a second
+        // `top()` could see a different book, and after its retries are
+        // exhausted it reports an invalid one, which must not become a mark of
+        // zero.
+        const Bbo mark = book_.top();
+        if (mark.is_valid()) {
+            mark_price_ = mark.mid();
+        } else {
+            ++metrics_.unpriced_frames;
         }
         recompute_unrealized();
     }
@@ -290,8 +309,9 @@ public:
                     opposite(request.side), touch, -fill_quantity,
                     current.exchange_ts);
                 (void)applied;
-                if (book_.best_bid().raw() > 0 && book_.best_ask().raw() > 0) {
-                    mark_price_ = book_.top().mid();
+                const Bbo mark = book_.top();
+                if (mark.is_valid()) {
+                    mark_price_ = mark.mid();
                 }
                 recompute_unrealized();
             }
@@ -397,6 +417,7 @@ private:
         fill.price = price;
         fill.quantity = quantity;
         fill.timestamp = timestamp != 0 ? timestamp : now_ns();
+        fill.event_ts = timestamp;
         fill.side = side;
         fill.is_maker = static_cast<std::uint8_t>(is_maker ? 1 : 0);
         const bool queued = fills_.try_push(fill);
@@ -452,6 +473,22 @@ private:
 
     [[nodiscard]] static std::int64_t abs_raw(std::int64_t value) noexcept {
         return value < 0 ? -value : value;
+    }
+
+    // A live book whose ladder is anchored on a stale constant is blind: it
+    // rejects every level and looks like a quiet market while quoting against
+    // nothing. ``reframe_anchor`` says when a frame proves the window is wrong;
+    // the tree is re-based on the feed's own touch. A populated ladder is
+    // reframed as well -- keeping its stale BBO is worse than losing depth --
+    // and ``recenter`` carries across the levels the new window still holds.
+    void reframe_if_out_of_window(const DepthUpdate& update) noexcept {
+        const Price anchor = reframe_anchor(book_, update);
+        if (anchor.raw() <= 0) {
+            return;
+        }
+        book_.recenter(anchor);
+        mark_price_ = anchor;
+        ++metrics_.book_recenters;
     }
 
     EngineConfig config_{};

@@ -91,6 +91,12 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     # Replay controls.
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--frames-per-hook", type=int, default=1)
+    parser.add_argument("--fill-model", default="touch",
+                        choices=("touch", "queue", "trade"),
+                        help="how a resting maker order earns a fill: touch = "
+                             "legacy book-crossing, queue = depth-depletion with "
+                             "queue priority, trade = aggregated tape (needs trade "
+                             "prints in the archive; default: touch)")
     parser.add_argument("--periods-per-year", type=float, default=252.0,
                         help="annualisation factor for Sharpe/Sortino")
     parser.add_argument("--ledger-tolerance", type=float, default=1e-2,
@@ -173,6 +179,7 @@ def run(args: argparse.Namespace) -> int:
         frames_per_hook=args.frames_per_hook,
         periods_per_year=args.periods_per_year,
         ledger_tolerance=args.ledger_tolerance,
+        fill_model=args.fill_model,
         lock_source=lock_source,
     )
 

@@ -37,6 +37,9 @@ struct ingest_stats {
     if (kind == FeedMessageType::Trade) {
         TradeTick trade;
         if (JsonFeedParser::parse_trade(json, trade)) {
+            // Trade prints carry the fills under the tape-driven fill model;
+            // dropping them here made every maker fill a book-crossing guess.
+            engine.process_trade(trade);
             ++stats.trade_events;
         } else {
             ++stats.malformed;

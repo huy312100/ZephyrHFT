@@ -18,9 +18,11 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_CONFIG_PATH = PROJECT_ROOT / "config" / "settings.yaml"
 
 # Public market-data WebSocket endpoints keyed by the ``data_ingestion.exchange``
-# value. The stream URL is built as ``<endpoint>/<symbol>@<stream_type>``, so any
-# Binance-compatible venue that follows the same naming scheme can be added here
-# (or overridden per run with ``data_ingestion.ws_base_url``).
+# value. The stream URL is built as ``<endpoint>/<symbol>@<stream_type>`` for a
+# single stream, or ``<endpoint>/stream?streams=a/b`` when auxiliary streams are
+# configured (``data_ingestion.aux_streams``), so any Binance-compatible venue
+# that follows the same naming scheme can be added here (or overridden per run
+# with ``data_ingestion.ws_base_url``).
 EXCHANGE_ENDPOINTS: Dict[str, str] = {
     "binance_futures": "wss://fstream.binance.com/ws",
     "binance_futures_testnet": "wss://stream.binancefuture.com/ws",
@@ -132,6 +134,9 @@ class DataIngestionSettings:
 
     ``exchange`` selects the WebSocket endpoint (see ``EXCHANGE_ENDPOINTS``),
     ``symbol`` and ``stream_type`` are joined into ``<endpoint>/<symbol>@<type>``.
+    ``aux_streams`` adds more streams on the *same* socket (the combined-stream
+    form), so prints land in the archive interleaved with the depth frames they
+    moved: without the tape a backtest cannot tell a fill from a book crossing.
     ``storage_path`` is resolved against the repository root, so a relative value
     keeps captures inside the project; ``compression`` is ``gzip`` or ``none``.
     ``flush_interval_ms`` bounds how long a record sits in the write buffer, and
@@ -143,6 +148,7 @@ class DataIngestionSettings:
     exchange: str = "binance_futures"
     symbol: str = "btcusdt"
     stream_type: str = "depth@100ms"
+    aux_streams: Tuple[str, ...] = ()
     storage_path: str = "data/raw_l2"
     compression: str = "gzip"
     compression_level: int = 1
@@ -164,8 +170,38 @@ class DataIngestionSettings:
         return EXCHANGE_ENDPOINTS[self.exchange]
 
     @property
+    def stream_tags(self) -> Tuple[str, ...]:
+        """Stream suffixes on the subscription, depth first."""
+        return (self.stream_type, *self.aux_streams)
+
+    @property
+    def combined_stream_url(self) -> Optional[str]:
+        """Combined-stream URL for ``stream_tags``, or ``None`` for one stream.
+
+        Binance multiplexes several ``<symbol>@<type>`` streams on a single
+        socket only through ``<endpoint>/stream?streams=a/b``; each frame then
+        arrives wrapped as ``{"stream": .., "data": ..}``.
+        """
+        tags = self.stream_tags
+        if len(tags) < 2:
+            return None
+        base = self.endpoint
+        # ``/ws`` is the single-stream endpoint; the multiplexed one is its
+        # sibling ``/stream``. Measured on this venue (``docs/phase5`` §11.6.1):
+        # ``<sym>@depth@100ms`` and ``<sym>@trade`` share that socket and arrive
+        # interleaved, which is exactly what the tape capture needs. ``@aggTrade``
+        # is accepted there and then silent, so it is flagged at ingest startup
+        # (``silent_aux_streams``) instead of being routed to another path.
+        base = base[: -len("/ws")] if base.endswith("/ws") else base
+        streams = "/".join(f"{self.symbol}@{tag}" for tag in tags)
+        return f"{base}/stream?streams={streams}"
+
+    @property
     def stream_url(self) -> str:
         """Full subscription URL, e.g. ``wss://fstream.binance.com/ws/btcusdt@depth@100ms``."""
+        combined = self.combined_stream_url
+        if combined is not None:
+            return combined
         return f"{self.endpoint}/{self.symbol}@{self.stream_type}"
 
     @property
@@ -378,6 +414,106 @@ def _build_kill_switch(raw: Mapping[str, Any]) -> KillSwitchSettings:
     )
 
 
+def parse_stream_names(
+    value: Any, section: str = "data_ingestion.aux_streams"
+) -> Tuple[str, ...]:
+    """Validates auxiliary stream names, preserving their case.
+
+    Binance stream names are case-sensitive (``aggTrade``, ``markPrice@1s``),
+    so unlike ``_pattern`` this must not lower-case the value. Order is
+    preserved and duplicates are dropped.
+    """
+    if value is None:
+        return ()
+    if isinstance(value, (str, bytes)) or not isinstance(value, Sequence):
+        raise ConfigError(f"'{section}' must be a list of stream names")
+    names: list = []
+    for item in value:
+        text = str(item).strip()
+        if not re.fullmatch(r"[A-Za-z]{1,16}(@[A-Za-z0-9]{1,12})?", text):
+            raise ConfigError(
+                f"'{section}' entries must look like 'aggTrade' or 'markPrice@1s': "
+                f"{item!r}"
+            )
+        if text not in names:
+            names.append(text)
+    return tuple(names)
+
+
+def require_aligned_center(center: Any, tick_size: Any) -> None:
+    """Rejects a ladder centre that is not a whole number of ticks.
+
+    The native ladder indexes a price by ``(price - centre) / tick`` and refuses
+    any price whose delta does not divide exactly (``LadderSide::slot_for``), so
+    a centre off the grid rejects every frame, leaves resting orders unable to
+    match the depth in the book, and reads as a quiet market rather than as a
+    misconfiguration. Quotes are snapped *from zero* onto the tick grid
+    (``MarketMakerStrategy.adjusted_quotes``), so no quoting choice can fix an
+    unaligned centre: it has to be rejected before the run starts.
+    """
+    try:
+        tick = Decimal(str(tick_size))
+        price = Decimal(str(center))
+    except (InvalidOperation, ValueError) as exc:  # pragma: no cover - defensive
+        raise ValueError(
+            f"center {center!r} / tick size {tick_size!r} is not a decimal price"
+        ) from exc
+    # The tick is checked before the division: ``Decimal`` raises on a zero
+    # divisor, and a NaN comparison raises too, so neither can be left to the
+    # ``steps`` test below.
+    if not tick.is_finite() or tick <= 0:
+        raise ValueError(f"tick size must be positive, got {tick_size!r}")
+    if not price.is_finite():
+        raise ValueError(f"center {center!r} is not a finite price")
+    steps = price / tick
+    if steps != steps.to_integral_value():
+        raise ValueError(
+            f"center {center!r} is not a whole number of ticks ({tick_size!r}): "
+            f"{steps} steps, so every price would be off the ladder's grid"
+        )
+
+
+#: Aux streams a venue accepts and then never delivers (measured in
+#: ``docs/phase5_production_readiness.md`` §11.6.1: ``@aggTrade`` carries 0
+#: frames on the configured futures endpoint while ``@trade`` delivers ~40/s).
+#: Keyed by exchange because the naming is not shared: on spot ``aggTrade`` is a
+#: real, delivering stream, so warning about it there would be a lie, and no
+#: capture in this repository measures the testnet endpoint at all. The lookup
+#: goes through :func:`exchange_for_endpoint`, so a ``ws_base_url`` override is
+#: judged by the endpoint it points at rather than by ``exchange``.
+SILENT_AUX_STREAMS: Mapping[str, Tuple[str, ...]] = {
+    "binance_futures": ("aggTrade",),
+}
+
+
+def exchange_for_endpoint(ws_base_url: str) -> str:
+    """The exchange whose endpoint ``ws_base_url`` is, or ``""`` if unmapped.
+
+    ``exchange`` only selects a default URL; ``ws_base_url`` overrides it, so
+    anything keyed by venue has to read the endpoint actually dialled.
+    """
+    base = ws_base_url.rstrip("/")
+    for exchange, endpoint in EXCHANGE_ENDPOINTS.items():
+        if endpoint.rstrip("/") == base:
+            return exchange
+    return ""
+
+
+def silent_aux_streams(
+    aux_streams: Sequence[str], ws_base_url: str
+) -> Tuple[str, ...]:
+    """The aux streams ``ws_base_url`` accepts but never delivers.
+
+    Keyed on the endpoint rather than on ``exchange``: a ``ws_base_url``
+    override moves the frames to another venue, and a warning borrowed from the
+    endpoint named in the config would then be attached to a different one.
+    """
+    silent = SILENT_AUX_STREAMS.get(exchange_for_endpoint(ws_base_url), ())
+    return tuple(
+        tag for tag in aux_streams if tag.split("@", 1)[0] in silent
+    )
+
+
 def _build_data_ingestion(raw: Mapping[str, Any]) -> DataIngestionSettings:
     defaults = DataIngestionSettings()
     exchange = _choice(
@@ -418,6 +554,10 @@ def _build_data_ingestion(raw: Mapping[str, Any]) -> DataIngestionSettings:
             "data_ingestion.stream_type",
             r"[a-z0-9]{1,20}(@[a-z0-9]{1,12})?",
             "must look like 'depth@100ms'",
+        ),
+        aux_streams=parse_stream_names(
+            raw.get("aux_streams", defaults.aux_streams),
+            "data_ingestion.aux_streams",
         ),
         storage_path=storage_path,
         compression=_choice(
