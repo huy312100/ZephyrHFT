@@ -184,6 +184,49 @@ def test_queue_model_fills_once_depth_at_the_price_is_consumed():
     assert _drain(engine) == [("30000.00000000", "0.40000000", 1)]
 
 
+def test_two_quotes_at_one_price_share_one_displayed_queue():
+    """The displayed size belongs to the level, not to each order resting on it.
+
+    Two quotes at one price are two places in one queue: a print clears the
+    displayed size once and whatever is left of it fills them in posting order.
+    Charging each order its own copy of the level debits it twice -- so a print
+    that covers the level and both orders still leaves the second one unfilled --
+    and leaves that order behind a queue the market already cleared, so the next
+    print misses too.
+    """
+    engine = _engine(n.FillModel.TRADE)
+    engine.process_update(_depth(1000, [("30000", "1.0")], [("30000.5", "1.0")]))
+    assert _post(engine, n.Side.BUY, "30000", "0.5", 1000).accepted()
+    assert _post(engine, n.Side.BUY, "30000", "0.5", 1000).accepted()
+
+    # 1.5 traded at the price: 1.0 clears the displayed queue, 0.5 fills the
+    # first quote and nothing reaches the second.
+    engine.process_trade(_trade(1100, "30000", "1.5"))
+    assert _drain(engine) == [("30000.00000000", "0.50000000", 1)]
+
+    # The queue is behind it now, so this print is the second quote's.
+    engine.process_trade(_trade(1200, "30000", "0.5"))
+    assert _drain(engine) == [("30000.00000000", "0.50000000", 1)]
+
+
+def test_two_quotes_at_one_price_share_the_inferred_trades():
+    """One depletion is one traded quantity, however many orders sit on the level."""
+    engine = _engine(n.FillModel.QUEUE)
+    engine.process_update(_depth(1000, [("30000", "0.4")], [("30000.5", "1.0")]))
+    assert _post(engine, n.Side.BUY, "30000", "0.5", 1000).accepted()
+    assert _post(engine, n.Side.BUY, "30000", "0.5", 1000).accepted()
+
+    # Depth is added behind us: nothing traded, the 0.4 ahead is unchanged.
+    engine.process_update(_depth(1100, [("30000", "1.4")], [("30000.5", "1.0")]))
+    assert _drain(engine) == []
+
+    # 1.0 traded. The 0.4 queue goes first and the remaining 0.6 is shared by
+    # the two orders in posting order -- not handed to each of them in full.
+    engine.process_update(_depth(1200, [("30000", "0.4")], [("30000.5", "1.0")]))
+    assert _drain(engine) == [("30000.00000000", "0.50000000", 1),
+                              ("30000.00000000", "0.10000000", 1)]
+
+
 def test_a_re_anchor_does_not_replay_a_dropped_level_as_a_fill():
     """A level dropped by the re-anchor is not evidence that anything traded."""
     engine = _engine(n.FillModel.QUEUE)

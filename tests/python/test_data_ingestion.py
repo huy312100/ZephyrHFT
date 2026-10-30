@@ -185,10 +185,24 @@ def test_aux_streams_this_venue_accepts_but_never_delivers_are_named() -> None:
     at ~40/s. The capture therefore has to name the silent ones at startup
     instead of letting a tape study discover the empty archive later.
     """
-    assert silent_aux_streams(("trade",)) == ()
-    assert silent_aux_streams(()) == ()
-    assert silent_aux_streams(("aggTrade", "trade")) == ("aggTrade",)
-    assert silent_aux_streams(("aggTrade@100ms",)) == ("aggTrade@100ms",)
+    assert silent_aux_streams(("trade",), "binance_futures") == ()
+    assert silent_aux_streams((), "binance_futures") == ()
+    assert silent_aux_streams(("aggTrade", "trade"), "binance_futures") == (
+        "aggTrade",)
+    assert silent_aux_streams(("aggTrade@100ms",), "binance_futures") == (
+        "aggTrade@100ms",)
+
+
+def test_the_silent_stream_list_is_scoped_to_the_venue_that_was_measured() -> None:
+    """A warning is a claim about an endpoint, so it may only cover that one.
+
+    Spot names its aggregates stream ``aggTrade`` and delivers it, so the
+    futures measurement says nothing about spot; the testnet endpoint is not
+    measured at all. Warning there would be a statement the repository cannot
+    support, and on spot it would be false in the operator's favour.
+    """
+    assert silent_aux_streams(("aggTrade",), "binance_spot") == ()
+    assert silent_aux_streams(("aggTrade",), "binance_futures_testnet") == ()
 
 
 def test_storage_dir_is_absolute_and_repo_relative() -> None:

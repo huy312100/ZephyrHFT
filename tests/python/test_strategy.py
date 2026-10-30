@@ -155,6 +155,31 @@ def test_a_quote_already_on_the_grid_keeps_its_price() -> None:
     assert strategy.snap_to_tick(80000.25, round_down=False) == pytest.approx(80000.3)
 
 
+def test_a_half_tick_quote_is_not_mistaken_for_a_grid_price() -> None:
+    """The on-grid tolerance must not scale with the price-to-tick ratio.
+
+    Ten thousand steps a side is enough to break a step-relative tolerance: at
+    ``80000`` on a ``1e-4`` grid the step count is ``8e8``, so ``1e-9`` of it is
+    most of a tick and a half-tick quote would be declared representable. The
+    tolerance is the price's own float resolution instead, which stays nine
+    orders of magnitude below half a tick and cannot absorb a real offset.
+    """
+    config = _config(tick_size=0.0001, market_type="CRYPTO")
+    strategy = AvellanedaStoikovStrategy(config)
+
+    # Half a tick off the grid: snapped outward, never submitted as it stands.
+    assert strategy.snap_to_tick(80000.00005, round_down=True) == pytest.approx(
+        80000.0)
+    assert strategy.snap_to_tick(80000.00005, round_down=False) == pytest.approx(
+        80000.0001)
+
+    # And a real grid price survives the same extremes untouched.
+    assert strategy.snap_to_tick(80000.0001, round_down=True) == pytest.approx(
+        80000.0001)
+    assert strategy.snap_to_tick(80000.0001, round_down=False) == pytest.approx(
+        80000.0001)
+
+
 def test_crypto_quote_never_collapses_into_a_crossed_market() -> None:
     """A spread narrower than one tick still yields a valid two-sided quote."""
     # The committed fit (k=5.0, sigma=0.02) quotes ~0.20 wide, well under the

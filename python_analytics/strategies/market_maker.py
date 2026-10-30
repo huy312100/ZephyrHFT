@@ -158,6 +158,13 @@ def _quantity(text: str) -> int:
 # Fixed-point scale shared by Price/Quantity/Notional (8 decimal digits).
 _FIXED_SCALE = hft_native.Price.from_int(1).raw()
 
+# How far off a grid price a quote may sit and still count as on it, measured in
+# ulps of that quote. A price is only as precise as its own float resolution, so
+# this is the width of the error that ``price / tick`` can carry for a price on
+# the grid -- and it stays nine orders of magnitude below half a tick even at
+# 80,000 on a 0.0001 grid.
+_GRID_TOLERANCE_ULPS = 8.0
+
 
 class AvellanedaStoikovStrategy(Strategy):
     """Avellaneda-Stoikov inventory-aware market maker.
@@ -300,17 +307,22 @@ class AvellanedaStoikovStrategy(Strategy):
         ``price / tick`` is not exact in binary: ``80000.2 / 0.1`` evaluates to
         ``800001.9999999999``, so a bare ``floor`` moves a price that the venue
         can already represent down a whole tick (and a bare ``ceil`` moves an ask
-        up one), changing which orders fill. A step count within a rounding
-        tolerance of an integer is therefore taken as that integer, and the price
-        is returned unchanged; only a genuinely off-grid price is rounded, in the
-        direction asked for.
+        up one), changing which orders fill. A price within a few ulps of a grid
+        price is therefore returned unchanged; only a genuinely off-grid price is
+        rounded, in the direction asked for.
+
+        The tolerance is in *price* units -- the float resolution of the price
+        itself -- not a fraction of the step count. A step-relative tolerance
+        grows with the price-to-tick ratio, and at ``80000`` on a ``1e-4`` tick
+        the step count is ``8e8``, so a fractional tolerance of ``1e-9`` would
+        declare a half-tick price representable and submit an order the venue
+        has no price for.
         """
         tick = self._config.tick_size
         if tick <= 0.0:
             return price
         steps = price / tick
-        nearest = round(steps)
-        if abs(steps - nearest) <= 1e-9 * max(1.0, abs(steps)):
+        if abs(price - round(steps) * tick) <= _GRID_TOLERANCE_ULPS * math.ulp(price):
             return price
         return (math.floor(steps) if round_down else math.ceil(steps)) * tick
 

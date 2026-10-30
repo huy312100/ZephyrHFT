@@ -477,6 +477,19 @@ private:
         std::array<staged_fill, kMaxCrossed> fills{};
         std::size_t fill_count = 0;
 
+        // Trades are inferred per price level -- one depletion, one traded
+        // quantity -- so two of our orders on one level must share it. Without
+        // this the same depletion would fill both of them, and a level holding
+        // two quotes would trade twice its own depth.
+        struct level_frame {
+            Price price{};
+            Side side{Side::Buy};
+            std::int64_t available{0};
+            std::int64_t queue_ahead{0};
+        };
+        std::array<level_frame, kMaxCrossed> levels{};
+        std::size_t level_count = 0;
+
         // Pass 1: advance queue accounting. The live list must not be mutated
         // here, so candidate fills are staged and applied afterwards.
         orders_.for_each_live([&](DefaultOrderManager::Slot& slot) {
@@ -503,18 +516,38 @@ private:
                 state.ref_qty = 0;
                 return;
             }
-            const std::int64_t traded =
-                state.ref_qty > displayed ? state.ref_qty - displayed : 0;
-            state.ref_qty = displayed;
-            if (traded <= 0) {
-                return;
+            std::size_t level_index = level_count;
+            for (std::size_t i = 0; i < level_count; ++i) {
+                if (levels[i].price == slot.price && levels[i].side == slot.side) {
+                    level_index = i;
+                    break;
+                }
             }
-            std::int64_t available = traded;
-            if (state.queue_ahead > 0) {
-                const std::int64_t consumed =
-                    available < state.queue_ahead ? available : state.queue_ahead;
-                state.queue_ahead -= consumed;
-                available -= consumed;
+            std::int64_t available = 0;
+            if (level_index < level_count) {
+                // Another of our orders already read this level's depletion and
+                // spent the part of it that reached the queue. Take both the
+                // volume and the queue it left, so this order does not carry a
+                // queue that was already cleared into the next frame.
+                available = levels[level_index].available;
+                state.queue_ahead = levels[level_index].queue_ahead;
+                state.ref_qty = displayed;
+            } else {
+                const std::int64_t traded =
+                    state.ref_qty > displayed ? state.ref_qty - displayed : 0;
+                state.ref_qty = displayed;
+                available = traded;
+                if (available > 0 && state.queue_ahead > 0) {
+                    const std::int64_t consumed =
+                        available < state.queue_ahead ? available : state.queue_ahead;
+                    state.queue_ahead -= consumed;
+                    available -= consumed;
+                }
+                if (level_count < levels.size()) {
+                    levels[level_count] = {slot.price, slot.side, available,
+                                           state.queue_ahead};
+                    level_index = level_count++;
+                }
             }
             if (available <= 0 || fill_count >= fills.size()) {
                 return;
@@ -524,6 +557,9 @@ private:
                 return;
             }
             const std::int64_t filled = available < remaining ? available : remaining;
+            if (level_index < level_count) {
+                levels[level_index].available = available - filled;
+            }
             fills[fill_count++] = {slot.id, slot.price, slot.side,
                                    Quantity::from_raw(filled)};
         });
@@ -597,16 +633,35 @@ private:
         std::array<staged_fill, kMaxCrossed> fills{};
         std::size_t fill_count = 0;
         std::int64_t available = trade.quantity.raw();
-        for (std::size_t i = 0; i < candidate_count && available > 0; ++i) {
+        // The displayed size belongs to the price level, not to each of our
+        // orders resting on it: two orders at one price are two places in one
+        // queue. The print therefore clears that queue once, before either of
+        // them is filled, and whatever is left is shared in posting order.
+        // Charging every order its own copy of the displayed size debits the
+        // level once per order -- the second order can then miss a print that
+        // covered the level -- and leaves it holding a queue that was already
+        // cleared, so the print after that misses too.
+        Price level_price{};
+        std::int64_t level_queue = 0;
+        bool level_open = false;
+        for (std::size_t i = 0; i < candidate_count; ++i) {
             queue_slot& state = *candidates[i].state;
-            if (state.queue_ahead > 0) {
+            if (!level_open || candidates[i].price != level_price) {
+                level_open = true;
+                level_price = candidates[i].price;
+                level_queue = state.queue_ahead;
+            }
+            if (available > 0 && level_queue > 0) {
                 const std::int64_t consumed =
-                    available < state.queue_ahead ? available : state.queue_ahead;
-                state.queue_ahead -= consumed;
+                    available < level_queue ? available : level_queue;
+                level_queue -= consumed;
                 available -= consumed;
             }
+            // Every order on the level carries what is left of its queue, so
+            // one this print never reaches is not left behind a stale queue.
+            state.queue_ahead = level_queue;
             if (available <= 0) {
-                break;
+                continue;
             }
             const std::int64_t remaining = candidates[i].remaining.raw();
             const std::int64_t filled = available < remaining ? available : remaining;

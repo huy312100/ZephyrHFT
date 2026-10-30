@@ -473,16 +473,24 @@ def require_aligned_center(center: Any, tick_size: Any) -> None:
         )
 
 
-#: Aux streams the venue accepts and then never delivers (measured in
+#: Aux streams a venue accepts and then never delivers (measured in
 #: ``docs/phase5_production_readiness.md`` §11.6.1: ``@aggTrade`` carries 0
-#: frames on the configured endpoint while ``@trade`` delivers ~40/s).
-SILENT_AUX_STREAMS: Tuple[str, ...] = ("aggTrade",)
+#: frames on the configured futures endpoint while ``@trade`` delivers ~40/s).
+#: Keyed by exchange because the naming is not shared: on spot ``aggTrade`` is a
+#: real, delivering stream, so warning about it there would be a lie, and no
+#: capture in this repository measures the testnet endpoint at all.
+SILENT_AUX_STREAMS: Mapping[str, Tuple[str, ...]] = {
+    "binance_futures": ("aggTrade",),
+}
 
 
-def silent_aux_streams(aux_streams: Sequence[str]) -> Tuple[str, ...]:
-    """The configured aux streams that this venue accepts but never delivers."""
+def silent_aux_streams(
+    aux_streams: Sequence[str], exchange: str
+) -> Tuple[str, ...]:
+    """The configured aux streams ``exchange`` accepts but never delivers."""
+    silent = SILENT_AUX_STREAMS.get(exchange, ())
     return tuple(
-        tag for tag in aux_streams if tag.split("@", 1)[0] in SILENT_AUX_STREAMS
+        tag for tag in aux_streams if tag.split("@", 1)[0] in silent
     )
 
 

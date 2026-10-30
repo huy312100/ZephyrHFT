@@ -1201,11 +1201,15 @@ indistinguishable from an edge once it reaches a report.
 | 10 s | 199 | −0.405 | −2.10 | 42.7% | −2.405 |
 | 60 s | 55 | −0.709 | −1.04 | 45.5% | −2.709 |
 
-Verdict `ADVERSE_SELECTION`: the average resting quote fills 0.334 bps *through*
-the mid (the trade prints better than the quote), so it never captures the
-0.334 bps half-spread it is trying to earn. On the 55 fills that have a 60 s
-sample, the mean drifts from −0.328 to −0.709 bps — a −0.38 bps move on the same
-fills, not a comparison of two different populations.
+Verdict `ADVERSE_SELECTION`: the average resting quote is marked 0.334 bps
+*through* the mid, so it never captures the half-spread it is trying to earn.
+That offset is what the fill rule produces, not a reading of the tape: this
+sample carries no prints, and under the `touch` model a resting order fills on
+the frame the opposite touch reaches its price, which leaves the mid exactly
+half a spread away by construction. The doc's §11.4 makes the same point at
+length. On the 55 fills that have a 60 s sample, the mean drifts from −0.328 to
+−0.709 bps — a −0.38 bps move on the same fills, not a comparison of two
+different populations.
 
 The 1 s markout totals −2.23 USDT against the study's gross PnL of −2.05 USDT.
 This comparison is indicative only: the markout covers 227 of the study's 230

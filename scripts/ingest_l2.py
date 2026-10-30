@@ -1203,7 +1203,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "'--fill-model trade' can never fill from this archive"
         )
     else:
-        silent = silent_aux_streams(settings.aux_streams)
+        silent = silent_aux_streams(settings.aux_streams, settings.exchange)
         if silent:
             logger.warning(
                 "aux stream(s) %s were accepted and stayed silent on this "

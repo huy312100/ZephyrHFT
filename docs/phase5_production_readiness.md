@@ -741,7 +741,7 @@ venue before assuming the book is flat.
    fills with `2.0 bps` maker / `5.0 bps` taker charged. Nothing in this layer
    changes that sign. Real capture + a re-run study is the work.
 2. **~~Markout.~~** Shipped in §11.4. It answers the question item 1 cannot: the
-   study's maker fills are marked at `-0.41 bps` one second after the trade, so
+   study's maker fills are marked at `-0.33 bps` one second after the trade, so
    the quote is being picked off and the fee is not the only problem.
 3. **Funding.** Perpetual funding is charged every 8h and is currently not in
    the ledger; a carry-heavy session will drift from the paper model.
@@ -916,7 +916,7 @@ two-sided quote into a crossed or degenerate one. Nearest-tick rounding would
 collapse both sides onto one price whenever the modelled spread is under a tick,
 which is exactly the case for the committed fit (`~0.20` against a `0.5` tick).
 
-This did not change the build verdict; it changed the study by `−0.69 USDT`
+This did not change the build verdict; it moved the study by `+0.69 USDT`
 (`−16.47` → `−15.78`), and `reports/walk_forward.json` has been regenerated so
 the committed artefact matches the code that produced it. A `GO` from an
 artefact older than the strategy is not evidence about the strategy.
