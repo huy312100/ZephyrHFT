@@ -1338,58 +1338,60 @@ marked against the mid it was quoted away from.
 This first run read two things into that table: that `1 bps` was the only
 distance that paid, and that the tape never reached `1.5 bps` or beyond. **Both
 were artefacts of a two-and-a-half-minute window**, and 15 more minutes were
-enough to show it: `1.5` and `2 bps` fill, and `+0.13 bps` at `1 bps` does not
-survive three hours. The smoke test stays in this document because deleting it
-would hide the lesson — a 151 s capture cannot separate a plateau from a regime,
-which is exactly what §11.6.5 warned about.
+enough to show it: `1.5` and `2 bps` fill (38,694 and 25,637 times), and `+0.13
+bps` at `1 bps` does not survive three hours. The smoke test stays in this
+document because deleting it would hide the lesson — a 151 s capture cannot
+separate a plateau from a regime, which is exactly what §11.6.5 warned about.
 
 #### 11.8.3 Three hours of the same instrument
 
 A 3 h 20 m capture on the same endpoint (`scripts/ingest_l2.py --duration 12000`,
-`depth@100ms` + `trade`), 12 consecutive rolls, **613,900 prints over 10,800 s**.
+`depth@100ms` + `trade`), 14 consecutive rolls, **643,077 prints over 12,000 s**.
 The tape is not committed — `data/` is git-ignored — so these numbers are
 reproducible by re-capturing, not by cloning; the command is at the end of this
-section. Tick `0.10`, median mid `76,890`, `2.0 bps` maker fee, mid ended the
+section. Tick `0.10`, median mid `76,900`, `2.0 bps` maker fee, mid ended the
 session at `-0.24 %`:
 
 | distance bps | ticks | fills | fills/min | `h=0` | `h=1s` | `h=1s` t | `h=1s` n | win % | `h=10s` | `h=10s` t |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| `0.0125` | 1 | 351,042 | 1,950.3 | `+0.019` | `-1.332` | `-640.6` | 332,890 | 7.3 | `-1.302` | `-258.0` |
-| `0.1` | 8 | 295,553 | 1,642.0 | `+0.111` | `-1.301` | `-562.7` | 278,924 | 8.2 | `-1.239` | `-223.8` |
-| `0.5` | 38 | 171,702 | 953.9 | `+0.504` | `-1.153` | `-348.5` | 155,282 | 12.0 | `-0.979` | `-130.1` |
-| `1` | 77 | 74,507 | 413.9 | `+1.009` | `-1.084` | `-176.3` | 58,355 | 18.8 | `-0.668` | `-53.3` |
-| `1.5` | 115 | 38,559 | 214.2 | `+1.508` | `-1.077` | `-98.9` | 22,597 | 18.6 | `-0.287` | `-14.9` |
-| `2` | 154 | 25,637 | 142.4 | `+2.007` | `-0.971` | `-54.8` | 9,675 | 26.0 | **`+0.121`** | `+4.4` |
-| `3` | 231 | 18,436 | 102.4 | `+3.013` | `-0.522` | `-13.2` | 2,474 | 54.0 | **`+1.489`** | `+33.4` |
+| `0.0125` | 1 | 366,309 | 1,831.6 | `+0.019` | `-1.326` | `-657.8` | 348,157 | 7.2 | `-1.303` | `-267.3` |
+| `0.1` | 8 | 308,203 | 1,541.1 | `+0.111` | `-1.295` | `-577.8` | 291,574 | 8.0 | `-1.241` | `-232.0` |
+| `0.5` | 38 | 177,985 | 890.0 | `+0.504` | `-1.145` | `-356.1` | 161,565 | 11.8 | `-0.980` | `-134.3` |
+| `1` | 77 | 75,976 | 379.9 | `+1.009` | `-1.076` | `-178.0` | 59,824 | 18.6 | `-0.671` | `-54.6` |
+| `1.5` | 115 | 38,694 | 193.5 | `+1.508` | `-1.076` | `-99.3` | 22,732 | 18.5 | `-0.296` | `-15.4` |
+| `2` | 154 | 25,637 | 128.2 | `+2.007` | `-0.971` | `-54.8` | 9,675 | 26.0 | **`+0.121`** | `+4.4` |
+| `3` | 231 | 18,436 | 92.2 | `+3.013` | `-0.522` | `-13.2` | 2,474 | 54.0 | **`+1.489`** | `+33.4` |
 
 Two caveats travel with this table, and both are the study's own honesty rather
 the maker's:
 
-- **`n` is smaller than `fills` at every distance.** About 16,000 fills per
+- **`n` is smaller than `fills` at every distance.** 16,000–18,000 fills per
   distance had no mid inside the 2 s tolerance and are excluded, never
-  interpolated. They are not a random subset: the websocket reconnect at `18:52`
-  left a 113 s hole in the mid timeline, and 15,261 of the `3 bps` fills landed
-  inside it. That episode was the most violent of the session, so the surviving
-  means are if anything **flattering**. The module now reports the count
-  (`truncated`) instead of shrinking the sample quietly.
+  interpolated — at `3 bps` that is 15,962 of 18,436. They are not a random
+  subset: the websocket reconnect at `18:52` left a 113 s hole in the mid
+  timeline, and 15,261 of the `3 bps` fills landed inside it. That episode was
+  the most violent of the session, so the surviving means are if anything
+  **flattering**. The module now reports the count (`truncated`) instead of
+  shrinking the sample quietly.
 - **The per-roll spread is the regime.** At the touch, the `1 s` markout is
-  negative in **12 of 12** rolls (`-1.12` to `-1.49 bps`). At `2 bps` it is
-  negative in 10 of 12 and positive in two (`+1.31`, `+0.15`). A single roll
-  would have supported almost any story; twelve make the sign of the touch
+  negative in **14 of 14** rolls (`-1.12` to `-1.49 bps`). At `2 bps` it is
+  negative in 12 of 14 and positive in two (`+1.31`, `+0.15`). A single roll
+  would have supported almost any story; fourteen make the sign of the touch
   unambiguous and the sign of the far quotes obviously regime-dependent.
 
 #### 11.8.4 What the shape says
 
 1. **At the touch, being filled is the adverse event.** One tick out, the `1 s`
-   markout is `-1.33 bps` over 332,890 fills, `t = -641`, and only 7.3 % of fills
+   markout is `-1.33 bps` over 348,157 fills, `t = -658`, and only 7.2 % of fills
    are positive one second later. This is not a trend: the session ended where it
    started, and the damage is inside the second after each print. §11.6.3 reached
-   the same conclusion from the strategy's own fills (`-0.404 bps`, 0 % win) with
-   6,000x less data.
+   the same conclusion from the strategy's own fills (`-0.404 bps`, 0 % win) on 28
+   marked fills; this is the same measurement with four orders of magnitude more
+   of them.
 2. **Distance helps monotonically and never clears `1 s`.** `-1.33` at the touch,
-   `-1.30` at 8 ticks, `-1.15` at 38, `-1.08` at 77, `-0.97` at 154, `-0.52` at
-   231. Every one of those `t` statistics is far past `-1.96`. A maker cannot
-   quote its way out of the fee while it holds the fill for a second.
+   `-1.30` at 8 ticks, `-1.15` at 38, `-1.08` at 77, `-1.08` at 115, `-0.97` at
+   154, `-0.52` at 231. Every one of those `t` statistics is far past `-1.96`. A
+   maker cannot quote its way out of the fee while it holds the fill for a second.
 3. **The `10 s` horizon flips, and only far out.** `-1.30` at the touch, still
    negative at 77 and 115 ticks, then `+0.12` at 154 ticks and `+1.49` at 231
    (`t = +33`). Short-horizon momentum, longer-horizon reversion: after a sweep
@@ -1421,8 +1423,8 @@ fill.
 
 | configuration | fills/min | gross `h=10s` | fee that clears | sample |
 | --- | --- | --- | --- | --- |
-| `2 bps` (154 ticks) | 142.4 | `+0.121 bps` | `< 0.12 bps` | 10,098 |
-| `3 bps` (231 ticks) | 102.4 | `+1.489 bps` | `< 1.49 bps` | 2,897 |
+| `2 bps` (154 ticks) | 128.2 | `+0.121 bps` | `< 0.12 bps` | 10,098 |
+| `3 bps` (231 ticks) | 92.2 | `+1.489 bps` | `< 1.49 bps` | 2,897 |
 
 That is not a market maker: it is a strategy that rests far from the touch,
 accepts a fill only when the market runs, and then waits for the reversion. Its
@@ -1447,7 +1449,7 @@ python3 scripts/run_edge_curve.py \
 # a multi-roll capture, read as one chronological tape (the 3 h numbers)
 python3 scripts/run_edge_curve.py \
   --source data/raw_l2/binance_futures_btcusdt_depth_100ms_trade_20261030T*_0000[1-9].ndjson.gz \
-           data/raw_l2/binance_futures_btcusdt_depth_100ms_trade_20261030T*_0001[0-2].ndjson.gz \
+           data/raw_l2/binance_futures_btcusdt_depth_100ms_trade_20261030T*_0001[0-4].ndjson.gz \
   --tick-size 0.1 --distances-bps 0.0125,0.1,0.5,1,1.5,2,3
 # exit 0 a distance clears, 1 none does, 2 usage, 3 no priced print
 ```
