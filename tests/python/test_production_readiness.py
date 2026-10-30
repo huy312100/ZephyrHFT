@@ -143,6 +143,16 @@ def test_the_reanchor_ceiling_is_its_own_budget(gate, green) -> None:
     assert not checks[0].passed
 
 
+def test_the_reanchor_ceiling_cannot_be_disabled(gate) -> None:
+    """`inf` would make every finite p99 pass, so the budget is refused, not trusted."""
+    for unbounded in ("inf", "-inf", "nan"):
+        with pytest.raises(SystemExit) as raised:
+            gate.parse_args(["--max-reanchor-p99-us", unbounded])
+        # argparse's usage refusal is the same code the script uses for config.
+        assert raised.value.code == gate.EXIT_USAGE
+    assert gate.parse_args(["--max-reanchor-p99-us", "0.5"]).max_reanchor_p99_us == 0.5
+
+
 def test_chaos_profiles_are_attributed(green) -> None:
     chaos = green[1].evidence["chaos"]
     storm = chaos["disconnect_storm"]

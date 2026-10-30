@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 import tempfile
 import time
@@ -1061,6 +1062,14 @@ def measure_validation(payload: Dict[str, Any], origin: str, *,
 # --------------------------------------------------------------------------- #
 # CLI
 # --------------------------------------------------------------------------- #
+def _finite_float(text: str) -> float:
+    """``float`` that refuses ``inf``/``nan``, so a budget cannot be disabled."""
+    value = float(text)
+    if not math.isfinite(value):
+        raise argparse.ArgumentTypeError(f"must be a finite number, got {text!r}")
+    return value
+
+
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -1076,7 +1085,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--reanchor-frames", type=int, default=1000,
                         help="frames used for the re-anchor latency check; every "
                              "one of them moves the priced window")
-    parser.add_argument("--max-reanchor-p99-us", type=float, default=200.0,
+    parser.add_argument("--max-reanchor-p99-us", type=_finite_float, default=200.0,
                         help="p99 ceiling for frames that move the priced window; "
                              "separate from the engine budget, and looser, because "
                              "a re-anchor moves the whole ladder and its p99 is "

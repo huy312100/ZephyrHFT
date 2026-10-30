@@ -1002,7 +1002,7 @@ Sample verdict — the honest combination at retail fees:
 | 2 — execution | engine p99 ≤ 50 µs, p999 ≤ 500 µs, re-anchor p99 ≤ 200 µs over frames that actually move the window, replay ≥ 1,000 depth events/s, equity-vs-PnL ledger residual ≤ 1e-2, `0` rejected orders, fill activity > 0 % |
 | 3 — resilience | disconnect storm self-heals (`reconnects == outages`, every frame accounted for), latency injection spikes but never exceeds its ceiling, dead-man's switch trips on silence, blocks orders, releases only on an explicit reset and can trip again |
 | 4 — validation | parameter lock re-verified, look-ahead chronology verified on every boundary, aggregate ledger residual ≤ 2e-2, ≥ 2 OOS windows, optional `--min-oos-sharpe` |
-| alpha | `net_pnl >= 0` after modelled fees, and `maker_bps >= 0` (no rebate assumed) — reported on every run, gating only with `--require-positive-alpha` |
+| alpha | `net_pnl >= 0` after modelled fees, `maker_bps >= 0` (no rebate assumed), and — when the study traded notional — a break-even maker fee above the gross edge (`fee_wall`) — reported on every run, gating only with `--require-positive-alpha` |
 
 Engine, chaos and walk-forward evidence come from a seeded synthetic book
 (`--evidence-events`, `--seed`), so every deterministic check reproduces on any

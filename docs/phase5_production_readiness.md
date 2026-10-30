@@ -291,7 +291,7 @@ Every row below was produced by this code base on the same developer host
 | 2,000-frame evidence book, idle host | `0.5 µs` | `3.2 µs` | `723.9 µs` | NO-GO (p999 only) | NO-GO |
 | 2,000-frame evidence book, concurrent load | `0.5 µs` | `8.2–11.3 µs` | `93–724 µs` | GO, unless the tail trips | NO-GO |
 | Phase 2 warm ingest harness (`docs/phase2_technical_specification.md`) | `0.9 µs` | `1.10–1.30 µs` | — | GO | GO |
-| Re-anchor path, 1,000 frames that each move the window | `4.9–24.8 µs` | `5.8–63 µs` | `11–139 µs` | GO (own `200 µs` gate) | NO-GO (p99) |
+| Re-anchor path, 1,000 frames that each move the window | `4.9–24.8 µs` | `5.8–63 µs` | `11–139 µs` | GO (own `200 µs` gate) | n/a (not a seeded frame) |
 
 Reading the table:
 
