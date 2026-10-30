@@ -629,7 +629,10 @@ using L2Book = L2OrderBook<8192>;
 // unrepresentable grid cannot make the book thrash, clearing itself every frame.
 // Two conditions are required as evidence, not one: the touch must be outside
 // *and* most of the frame must be unrepresentable, so a corrupt print cannot
-// drag the book onto a price the market never traded at.
+// drag the book onto a price the market never traded at. A frame that is an even
+// split -- one level inside the window, one outside -- is not evidence either
+// way, and the tie goes to keeping the populated book: moving on it would drop
+// every level it holds on the strength of a single stray price.
 //
 // Returns the price to re-anchor on, or a default (zero) Price for "no move".
 template <std::size_t MaxTicks>
@@ -682,8 +685,10 @@ template <std::size_t MaxTicks>
     // The touch is outside the window. Move the anchor only when most of the frame
     // cannot be held either -- a lone bad price is a bad print, not proof that the
     // market has left -- unless the book is blind, in which case it has nothing to
-    // lose and nothing to keep it right.
-    if (!book.blind() && static_cast<std::uint64_t>(held) * 2 > levels) {
+    // lose and nothing to keep it right. ``held * 2 == levels`` is a tie, so the
+    // comparison is ``>=``: at half the frame held, the frame does not prove the
+    // window is wrong, and a move would drop the levels that did fit.
+    if (!book.blind() && static_cast<std::uint64_t>(held) * 2 >= levels) {
         return Price{};
     }
     // Mid of whatever sides this frame touches, floored onto the tick grid.

@@ -366,6 +366,7 @@ python3 -m pytest --cov=python_analytics --cov-fail-under=80
 | `source` | `data/sample_events.ndjson` | archive whose Phase 1 integrity is verified |
 | `evidence-events` | `2000` | synthetic frames behind the engine/chaos/OOS evidence |
 | `max-engine-p99-us` | `50` | engine p99 ceiling; relax it on a noisy runner, not in code |
+| `max-reanchor-p99-us` | `200` | p99 ceiling for frames that move the priced window; its own budget, because a re-anchor translates the whole ladder |
 | `min-oos-sharpe` | *(empty)* | set it to make profitability blocking; empty keeps it `info` |
 | `recompute-walk-forward` | `false` | ignore `reports/walk_forward.json` and rerun the study |
 
@@ -997,7 +998,7 @@ Sample verdict — the honest combination at retail fees:
 | Phase | Gates |
 | --- | --- |
 | 1 — ingestion | settings self-consistency (positive tick/center, kill switch armed), archive integrity (`0` malformed, `0` sequence gaps) on the real NDJSON, ingest rate (info) |
-| 2 — execution | engine p99 ≤ 50 µs, p999 ≤ 500 µs, re-anchor p99 ≤ 50 µs over frames that actually move the window, replay ≥ 1,000 depth events/s, equity-vs-PnL ledger residual ≤ 1e-2, `0` rejected orders, fill activity > 0 % |
+| 2 — execution | engine p99 ≤ 50 µs, p999 ≤ 500 µs, re-anchor p99 ≤ 200 µs over frames that actually move the window, replay ≥ 1,000 depth events/s, equity-vs-PnL ledger residual ≤ 1e-2, `0` rejected orders, fill activity > 0 % |
 | 3 — resilience | disconnect storm self-heals (`reconnects == outages`, every frame accounted for), latency injection spikes but never exceeds its ceiling, dead-man's switch trips on silence, blocks orders, releases only on an explicit reset and can trip again |
 | 4 — validation | parameter lock re-verified, look-ahead chronology verified on every boundary, aggregate ledger residual ≤ 2e-2, ≥ 2 OOS windows, optional `--min-oos-sharpe` |
 | alpha | `net_pnl >= 0` after modelled fees, and `maker_bps >= 0` (no rebate assumed) — reported on every run, gating only with `--require-positive-alpha` |
@@ -1016,7 +1017,10 @@ strategy into a green one. Artefacts: `reports/production_readiness_report.{json
 shared runners, not the performance target. The budget a co-located trading host
 must hold is **engine p99 <= 5.0 µs**, applied at promotion time with
 `--max-engine-p99-us 5.0` (measured: `1.4 µs` p99 at 20 k frames on an idle host,
-`8–11 µs` under load). See
+`8–11 µs` under load). Tightening that ceiling does not tighten the re-anchor
+row: frames that move the priced window keep their own `--max-reanchor-p99-us`
+(`200 µs` by default), because they translate the whole ladder and their p99
+tracks host memory bandwidth rather than the code. See
 [`docs/phase5_production_readiness.md` §3](docs/phase5_production_readiness.md#3-latency-and-throughput-policy)
 for the measured bands, the p999 noise caveat and the reasoning.
 

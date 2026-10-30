@@ -891,7 +891,7 @@ def build_report(args: argparse.Namespace) -> ReadinessReport:
     evidence["engine"] = measured
 
     found, measured = measure_reanchor(parameters, frames=args.reanchor_frames,
-                                       max_p99_us=args.max_engine_p99_us)
+                                       max_p99_us=args.max_reanchor_p99_us)
     checks += found
     evidence["reanchor"] = measured
 
@@ -943,6 +943,7 @@ def build_report(args: argparse.Namespace) -> ReadinessReport:
     thresholds = {
         "max_engine_p99_us": args.max_engine_p99_us,
         "max_engine_p999_us": args.max_engine_p999_us,
+        "max_reanchor_p99_us": args.max_reanchor_p99_us,
         "min_throughput_fps": args.min_throughput_fps,
         "ledger_tolerance": args.ledger_tolerance,
         "max_archive_malformed": 0,
@@ -1075,6 +1076,11 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--reanchor-frames", type=int, default=1000,
                         help="frames used for the re-anchor latency check; every "
                              "one of them moves the priced window")
+    parser.add_argument("--max-reanchor-p99-us", type=float, default=200.0,
+                        help="p99 ceiling for frames that move the priced window; "
+                             "separate from the engine budget, and looser, because "
+                             "a re-anchor moves the whole ladder and its p99 is "
+                             "dominated by host memory bandwidth")
     parser.add_argument("--window-events", type=int, default=0,
                         help="walk-forward window size for recomputed evidence; "
                              "0 = evidence-events/4")

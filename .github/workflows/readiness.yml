@@ -20,6 +20,10 @@ on:
         description: "Engine p99 ceiling in microseconds"
         required: false
         default: "50"
+      max-reanchor-p99-us:
+        description: "p99 ceiling for frames that move the priced window"
+        required: false
+        default: "200"
       min-oos-sharpe:
         description: "Block when OOS Sharpe is below this (empty = report only)"
         required: false
@@ -53,6 +57,7 @@ env:
   SOURCE: ${{ github.event.inputs.source || 'data/sample_events.ndjson' }}
   EVIDENCE_EVENTS: ${{ github.event.inputs.evidence-events || '2000' }}
   MAX_ENGINE_P99_US: ${{ github.event.inputs.max-engine-p99-us || '50' }}
+  MAX_REANCHOR_P99_US: ${{ github.event.inputs.max-reanchor-p99-us || '200' }}
   MIN_OOS_SHARPE: ${{ github.event.inputs.min-oos-sharpe }}
   RECOMPUTE_WALK_FORWARD: ${{ github.event.inputs.recompute-walk-forward || 'false' }}
 
@@ -132,6 +137,7 @@ jobs:
             --source "$SOURCE"
             --evidence-events "$EVIDENCE_EVENTS"
             --max-engine-p99-us "$MAX_ENGINE_P99_US"
+            --max-reanchor-p99-us "$MAX_REANCHOR_P99_US"
             --report-dir reports
             --stem production_readiness_report
           )

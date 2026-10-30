@@ -130,6 +130,19 @@ def test_reanchor_check_fails_when_the_window_never_moves(gate) -> None:
     assert not checks[0].passed
 
 
+def test_the_reanchor_ceiling_is_its_own_budget(gate, green) -> None:
+    """The 5 us production tier gates seeded frames, not window moves."""
+    args = gate.parse_args(["--max-engine-p99-us", "5.0"])
+    assert args.max_reanchor_p99_us == 200.0
+    assert green[1].thresholds["max_reanchor_p99_us"] == 200.0
+
+    # The ceiling handed in is the one enforced, not the engine budget.
+    parameters = gate.LockedParameters()
+    checks, _ = gate.measure_reanchor(parameters, frames=20, max_p99_us=0.0)
+    assert checks[0].threshold == "<= 0 us"
+    assert not checks[0].passed
+
+
 def test_chaos_profiles_are_attributed(green) -> None:
     chaos = green[1].evidence["chaos"]
     storm = chaos["disconnect_storm"]

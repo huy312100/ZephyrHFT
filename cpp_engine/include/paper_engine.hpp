@@ -482,6 +482,18 @@ private:
                 state.ref_qty = displayed;
                 return;
             }
+            if (displayed == 0 && !book_.contains(slot.price)) {
+                // The price left the window, so the level was dropped by a
+                // re-anchor rather than traded away. Re-reading that drop as
+                // traded volume would stage a fill at a price the book no longer
+                // holds; reseed the reference instead and let the next frame
+                // that puts the price back do the accounting. Checked here rather
+                // than inside ``recenter`` because it is one comparison per live
+                // order on a frame that already walks them, and the re-anchor is
+                // a priced-latency path (§3.3 of the Phase 5 document).
+                state.ref_qty = 0;
+                return;
+            }
             const std::int64_t traded =
                 state.ref_qty > displayed ? state.ref_qty - displayed : 0;
             state.ref_qty = displayed;

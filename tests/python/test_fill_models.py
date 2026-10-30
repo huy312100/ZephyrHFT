@@ -184,6 +184,26 @@ def test_queue_model_fills_once_depth_at_the_price_is_consumed():
     assert _drain(engine) == [("30000.00000000", "0.40000000", 1)]
 
 
+def test_a_re_anchor_does_not_replay_a_dropped_level_as_a_fill():
+    """A level dropped by the re-anchor is not evidence that anything traded."""
+    engine = _engine(n.FillModel.QUEUE)
+    engine.process_update(_depth(1000, [("30000", "10.0")], [("30000.5", "1.0")]))
+    assert _post(engine, n.Side.BUY, "30000", "0.5", 1000).accepted()
+
+    # A print consumes half of the queue ahead of the order without reaching it.
+    engine.process_trade(_trade(1050, "30000", "5.0"))
+    assert _drain(engine) == []
+
+    # The market gaps past the window. The re-anchor drops the level the order
+    # sits on, and the queue model reads a fall in displayed size as traded
+    # volume -- so the drop must not be replayed as a fill at a price the book
+    # no longer holds.
+    engine.process_update(_depth(1100, [("33000", "1.0")], [("33000.5", "1.0")]))
+    assert engine.metrics().book_recenters == 1
+    assert _drain(engine) == []
+    assert float(engine.account().realized_pnl()) == pytest.approx(0.0)
+
+
 def test_fill_model_survives_reset_and_is_reported():
     engine = _engine(n.FillModel.QUEUE)
     assert engine.fill_model() == n.FillModel.QUEUE
@@ -285,6 +305,23 @@ def test_one_implausible_level_does_not_drag_the_anchor():
     assert float(engine.center()) == pytest.approx(30000.0)
     assert metrics.rejected_levels == 1  # the bad level is reported, not chased
     assert float(engine.bbo().bid_price) == pytest.approx(30000.0)
+
+
+def test_an_even_split_frame_keeps_the_populated_book():
+    """One fitting level and one stray is not proof that the market has moved."""
+    engine = _engine(n.FillModel.TOUCH)
+    engine.process_update(_depth(1000, [("30000", "2.0")], [("30000.5", "1.0")]))
+
+    # Half of the frame fits and half does not: the tie must not move the anchor.
+    # Chasing it would re-anchor on the midpoint of the good bid and the stray
+    # ask, which drops the bid, the ask and every other level the book holds.
+    engine.process_update(_depth(1100, [("30000", "2.0")], [("40000", "1.0")]))
+    metrics = engine.metrics()
+    assert metrics.book_recenters == 0
+    assert float(engine.center()) == pytest.approx(30000.0)
+    assert metrics.rejected_levels == 1
+    assert float(engine.bbo().bid_price) == pytest.approx(30000.0)
+    assert float(engine.bbo().ask_price) == pytest.approx(30000.5)
 
 
 def test_a_wrong_tick_is_reported_instead_of_hidden():
