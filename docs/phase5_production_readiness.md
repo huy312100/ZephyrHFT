@@ -1340,14 +1340,17 @@ reproduces the distance almost exactly (`+1.002` at `1 bps`) because a fill is
 marked against the mid it was quoted away from.
 
 This first run read two things into that table: that `1 bps` was the only
-distance that paid, and that the tape never reached `1.5 bps` or beyond. **Both
-were artefacts of a two-and-a-half-minute window.** A single 15-minute roll was
-already enough to falsify them — `1.5` and `2 bps` fill, and `1 bps` is `-1.43`
-at `1 s` in that roll — and the 3 h 20 m capture in §11.8.3 confirms it: `1.5`
-and `2 bps` fill (38,694 and 25,637 times) and `+0.13 bps` at `1 bps` does not
-survive. The smoke test stays in this document because deleting it would hide
-the lesson — a 151 s capture cannot separate a plateau from a regime, which is
-exactly what §11.6.5 warned about.
+distance with a positive *gross* `1 s` markout, and that the tape never reached
+`1.5 bps` or beyond. The first is not a distance that paid: `+0.131 bps` is
+pre-fee, so it failed the `2.0 bps` maker fee like every other row — the run's
+verdict is `NO_CLEARING_DISTANCE` for that reason. **Both readings were
+nevertheless artefacts of a two-and-a-half-minute window.** A single 15-minute
+roll was already enough to falsify them — `1.5` and `2 bps` fill, and `1 bps` is
+`-1.43` at `1 s` in that roll — and the 3 h 20 m capture in §11.8.3 confirms it:
+`1.5` and `2 bps` fill (38,694 and 25,637 times) and `+0.13 bps` at `1 bps` does
+not survive. The smoke test stays in this document because deleting it would
+hide the lesson — a 151 s capture cannot separate a plateau from a regime, which
+is exactly what §11.6.5 warned about.
 
 #### 11.8.3 Three hours of the same instrument
 
