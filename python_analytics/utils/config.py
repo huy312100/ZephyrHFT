@@ -478,17 +478,37 @@ def require_aligned_center(center: Any, tick_size: Any) -> None:
 #: frames on the configured futures endpoint while ``@trade`` delivers ~40/s).
 #: Keyed by exchange because the naming is not shared: on spot ``aggTrade`` is a
 #: real, delivering stream, so warning about it there would be a lie, and no
-#: capture in this repository measures the testnet endpoint at all.
+#: capture in this repository measures the testnet endpoint at all. The lookup
+#: goes through :func:`exchange_for_endpoint`, so a ``ws_base_url`` override is
+#: judged by the endpoint it points at rather than by ``exchange``.
 SILENT_AUX_STREAMS: Mapping[str, Tuple[str, ...]] = {
     "binance_futures": ("aggTrade",),
 }
 
 
+def exchange_for_endpoint(ws_base_url: str) -> str:
+    """The exchange whose endpoint ``ws_base_url`` is, or ``""`` if unmapped.
+
+    ``exchange`` only selects a default URL; ``ws_base_url`` overrides it, so
+    anything keyed by venue has to read the endpoint actually dialled.
+    """
+    base = ws_base_url.rstrip("/")
+    for exchange, endpoint in EXCHANGE_ENDPOINTS.items():
+        if endpoint.rstrip("/") == base:
+            return exchange
+    return ""
+
+
 def silent_aux_streams(
-    aux_streams: Sequence[str], exchange: str
+    aux_streams: Sequence[str], ws_base_url: str
 ) -> Tuple[str, ...]:
-    """The configured aux streams ``exchange`` accepts but never delivers."""
-    silent = SILENT_AUX_STREAMS.get(exchange, ())
+    """The aux streams ``ws_base_url`` accepts but never delivers.
+
+    Keyed on the endpoint rather than on ``exchange``: a ``ws_base_url``
+    override moves the frames to another venue, and a warning borrowed from the
+    endpoint named in the config would then be attached to a different one.
+    """
+    silent = SILENT_AUX_STREAMS.get(exchange_for_endpoint(ws_base_url), ())
     return tuple(
         tag for tag in aux_streams if tag.split("@", 1)[0] in silent
     )

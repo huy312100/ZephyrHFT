@@ -480,12 +480,15 @@ private:
         // Trades are inferred per price level -- one depletion, one traded
         // quantity -- so two of our orders on one level must share it. Without
         // this the same depletion would fill both of them, and a level holding
-        // two quotes would trade twice its own depth.
+        // two quotes would trade twice its own depth. The shared quantity is
+        // what the level *absorbed*, which each order subtracts from its own
+        // queue: a quote posted into a deeper level sits further back, and
+        // handing it the front order's residual would fill it too early.
         struct level_frame {
             Price price{};
             Side side{Side::Buy};
             std::int64_t available{0};
-            std::int64_t queue_ahead{0};
+            std::int64_t absorbed{0};
         };
         std::array<level_frame, kMaxCrossed> levels{};
         std::size_t level_count = 0;
@@ -524,30 +527,38 @@ private:
                 }
             }
             std::int64_t available = 0;
+            std::int64_t absorbed = 0;
             if (level_index < level_count) {
                 // Another of our orders already read this level's depletion and
-                // spent the part of it that reached the queue. Take both the
-                // volume and the queue it left, so this order does not carry a
-                // queue that was already cleared into the next frame.
+                // spent the part of it that reached the queue. Take what it has
+                // not spent and how much of the level it has absorbed, so this
+                // order keeps its own place instead of inheriting a neighbour's.
                 available = levels[level_index].available;
-                state.queue_ahead = levels[level_index].queue_ahead;
+                absorbed = levels[level_index].absorbed;
                 state.ref_qty = displayed;
             } else {
                 const std::int64_t traded =
                     state.ref_qty > displayed ? state.ref_qty - displayed : 0;
                 state.ref_qty = displayed;
                 available = traded;
-                if (available > 0 && state.queue_ahead > 0) {
-                    const std::int64_t consumed =
-                        available < state.queue_ahead ? available : state.queue_ahead;
-                    state.queue_ahead -= consumed;
-                    available -= consumed;
-                }
                 if (level_count < levels.size()) {
-                    levels[level_count] = {slot.price, slot.side, available,
-                                           state.queue_ahead};
+                    levels[level_count] = {slot.price, slot.side, available, 0};
                     level_index = level_count++;
                 }
+            }
+            const std::int64_t own = state.queue_ahead;
+            std::int64_t queue_left = own > absorbed ? own - absorbed : 0;
+            if (available > 0 && queue_left > 0) {
+                const std::int64_t consumed =
+                    available < queue_left ? available : queue_left;
+                queue_left -= consumed;
+                absorbed += consumed;
+                available -= consumed;
+            }
+            state.queue_ahead = queue_left;
+            if (level_index < level_count) {
+                levels[level_index].available = available;
+                levels[level_index].absorbed = absorbed;
             }
             if (available <= 0 || fill_count >= fills.size()) {
                 return;
@@ -559,6 +570,7 @@ private:
             const std::int64_t filled = available < remaining ? available : remaining;
             if (level_index < level_count) {
                 levels[level_index].available = available - filled;
+                levels[level_index].absorbed = absorbed + filled;
             }
             fills[fill_count++] = {slot.id, slot.price, slot.side,
                                    Quantity::from_raw(filled)};
@@ -639,27 +651,36 @@ private:
         // them is filled, and whatever is left is shared in posting order.
         // Charging every order its own copy of the displayed size debits the
         // level once per order -- the second order can then miss a print that
-        // covered the level -- and leaves it holding a queue that was already
-        // cleared, so the print after that misses too.
+        // covered the level.
+        //
+        // What the level absorbs is tracked once and subtracted from each
+        // order's *own* queue, which is not the same as handing the first
+        // order's residual to the others: a quote posted into a level that
+        // deepened after its neighbour has more size ahead of it, and a copy of
+        // the shallower residual would put it at the front of a queue it is
+        // not at the front of.
         Price level_price{};
-        std::int64_t level_queue = 0;
+        std::int64_t level_absorbed = 0;
         bool level_open = false;
         for (std::size_t i = 0; i < candidate_count; ++i) {
             queue_slot& state = *candidates[i].state;
             if (!level_open || candidates[i].price != level_price) {
                 level_open = true;
                 level_price = candidates[i].price;
-                level_queue = state.queue_ahead;
+                level_absorbed = 0;
             }
-            if (available > 0 && level_queue > 0) {
+            const std::int64_t own = state.queue_ahead;
+            std::int64_t queue_left = own > level_absorbed ? own - level_absorbed : 0;
+            if (available > 0 && queue_left > 0) {
                 const std::int64_t consumed =
-                    available < level_queue ? available : level_queue;
-                level_queue -= consumed;
+                    available < queue_left ? available : queue_left;
+                queue_left -= consumed;
+                level_absorbed += consumed;
                 available -= consumed;
             }
-            // Every order on the level carries what is left of its queue, so
+            // Every order on the level carries what is left of its own queue, so
             // one this print never reaches is not left behind a stale queue.
-            state.queue_ahead = level_queue;
+            state.queue_ahead = queue_left;
             if (available <= 0) {
                 continue;
             }
@@ -669,6 +690,9 @@ private:
                 continue;
             }
             available -= filled;
+            // Volume that filled us moved the front of the level as well, so a
+            // later order on it is not charged the same size twice.
+            level_absorbed += filled;
             fills[fill_count++] = {candidates[i].id, candidates[i].price,
                                    resting_side, Quantity::from_raw(filled)};
         }

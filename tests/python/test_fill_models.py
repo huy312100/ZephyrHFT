@@ -227,6 +227,65 @@ def test_two_quotes_at_one_price_share_the_inferred_trades():
                               ("30000.00000000", "0.10000000", 1)]
 
 
+def test_a_quote_that_joins_a_deeper_level_keeps_its_own_place_in_the_queue():
+    """The tape model: each quote carries its own remainder, not its neighbour's.
+
+    The second quote is posted after the level deepened, so more size sits in
+    front of it than in front of the first. Handing it the first order's
+    residual puts it at the front of the queue: the next print fills it while
+    the market is still trading away depth that is ahead of it.
+    """
+    engine = _engine(n.FillModel.TRADE)
+    engine.process_update(_depth(1000, [("30000", "0.4")], [("30000.5", "1.0")]))
+    assert _post(engine, n.Side.BUY, "30000", "0.6", 1000).accepted()
+    # The level deepens to 1.4 before the second quote joins: 1.4 ahead of it.
+    engine.process_update(_depth(1100, [("30000", "1.4")], [("30000.5", "1.0")]))
+    assert _post(engine, n.Side.BUY, "30000", "0.6", 1100).accepted()
+
+    # 1.0 printed: 0.4 clears the queue ahead of the first quote, 0.6 fills it.
+    engine.process_trade(_trade(1200, "30000", "1.0"))
+    assert _drain(engine) == [("30000.00000000", "0.60000000", 1)]
+
+    # 0.4 still sits ahead of the second quote, so the next prints are not its.
+    engine.process_trade(_trade(1300, "30000", "0.3"))
+    assert _drain(engine) == []
+    engine.process_trade(_trade(1400, "30000", "0.1"))
+    assert _drain(engine) == []
+
+    # The queue in front of it is gone, so now the print is its own.
+    engine.process_trade(_trade(1500, "30000", "0.05"))
+    assert _drain(engine) == [("30000.00000000", "0.05000000", 1)]
+
+
+def test_a_quote_that_joins_a_deeper_level_is_not_filled_by_its_neighbour() -> None:
+    """The depth model: one depletion, two queues at two different positions."""
+    engine = _engine(n.FillModel.QUEUE)
+    engine.process_update(_depth(1000, [("30000", "0.4")], [("30000.5", "1.0")]))
+    assert _post(engine, n.Side.BUY, "30000", "0.4", 1000).accepted()
+    engine.process_update(_depth(1100, [("30000", "1.4")], [("30000.5", "1.0")]))
+    assert _post(engine, n.Side.BUY, "30000", "0.6", 1100).accepted()
+    assert _drain(engine) == []
+
+    # 1.0 traded. The 0.4 queue goes first, 0.4 fills the first quote, and 0.2
+    # of the depletion is left -- which still sits behind the 0.4 in front of
+    # the second quote, so it must not reach it.
+    engine.process_update(_depth(1200, [("30000", "0.4")], [("30000.5", "1.0")]))
+    assert _drain(engine) == [("30000.00000000", "0.40000000", 1)]
+
+    # Walking the level down to the second quote's position fills nothing.
+    engine.process_update(_depth(1300, [("30000", "0.2")], [("30000.5", "1.0")]))
+    assert _drain(engine) == []
+    engine.process_update(_depth(1350, [("30000", "0.05")], [("30000.5", "1.0")]))
+    assert _drain(engine) == []
+
+    # Depth is added behind it (no trade), then 0.6 leaves the level: 0.05 of
+    # that is its own queue rather than a neighbour's, and the rest fills it.
+    engine.process_update(_depth(1400, [("30000", "1.0")], [("30000.5", "1.0")]))
+    assert _drain(engine) == []
+    engine.process_update(_depth(1500, [("30000", "0.4")], [("30000.5", "1.0")]))
+    assert _drain(engine) == [("30000.00000000", "0.55000000", 1)]
+
+
 def test_a_re_anchor_does_not_replay_a_dropped_level_as_a_fill():
     """A level dropped by the re-anchor is not evidence that anything traded."""
     engine = _engine(n.FillModel.QUEUE)

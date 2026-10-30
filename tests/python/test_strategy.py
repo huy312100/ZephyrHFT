@@ -150,9 +150,13 @@ def test_a_quote_already_on_the_grid_keeps_its_price() -> None:
     assert strategy.snap_to_tick(80000.0, round_down=True) == 80000.0
 
     # A genuinely off-grid quote still rounds in the direction asked for, so
-    # snapping can only widen the market.
-    assert strategy.snap_to_tick(80000.25, round_down=True) == pytest.approx(80000.2)
-    assert strategy.snap_to_tick(80000.25, round_down=False) == pytest.approx(80000.3)
+    # snapping can only widen the market. ``abs`` is a thousandth of a tick:
+    # ``approx``'s default relative tolerance is 0.08 at this price, which is
+    # 800 ticks wide and would accept a quote left a whole tick off grid.
+    assert strategy.snap_to_tick(80000.25, round_down=True) == pytest.approx(
+        80000.2, rel=0, abs=1e-7)
+    assert strategy.snap_to_tick(80000.25, round_down=False) == pytest.approx(
+        80000.3, rel=0, abs=1e-7)
 
 
 def test_a_half_tick_quote_is_not_mistaken_for_a_grid_price() -> None:
@@ -168,16 +172,18 @@ def test_a_half_tick_quote_is_not_mistaken_for_a_grid_price() -> None:
     strategy = AvellanedaStoikovStrategy(config)
 
     # Half a tick off the grid: snapped outward, never submitted as it stands.
+    # The tolerance is a tenth of the offset being detected, with the relative
+    # term off, so a quote left where it started or moved by one tick fails.
     assert strategy.snap_to_tick(80000.00005, round_down=True) == pytest.approx(
-        80000.0)
+        80000.0, rel=0, abs=1e-9)
     assert strategy.snap_to_tick(80000.00005, round_down=False) == pytest.approx(
-        80000.0001)
+        80000.0001, rel=0, abs=1e-9)
 
     # And a real grid price survives the same extremes untouched.
     assert strategy.snap_to_tick(80000.0001, round_down=True) == pytest.approx(
-        80000.0001)
+        80000.0001, rel=0, abs=1e-9)
     assert strategy.snap_to_tick(80000.0001, round_down=False) == pytest.approx(
-        80000.0001)
+        80000.0001, rel=0, abs=1e-9)
 
 
 def test_crypto_quote_never_collapses_into_a_crossed_market() -> None:

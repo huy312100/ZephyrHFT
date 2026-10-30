@@ -185,11 +185,13 @@ def test_aux_streams_this_venue_accepts_but_never_delivers_are_named() -> None:
     at ~40/s. The capture therefore has to name the silent ones at startup
     instead of letting a tape study discover the empty archive later.
     """
-    assert silent_aux_streams(("trade",), "binance_futures") == ()
-    assert silent_aux_streams((), "binance_futures") == ()
-    assert silent_aux_streams(("aggTrade", "trade"), "binance_futures") == (
+    assert silent_aux_streams(("trade",), EXCHANGE_ENDPOINTS["binance_futures"]) == ()
+    assert silent_aux_streams((), EXCHANGE_ENDPOINTS["binance_futures"]) == ()
+    assert silent_aux_streams(("aggTrade", "trade"),
+                              EXCHANGE_ENDPOINTS["binance_futures"]) == (
         "aggTrade",)
-    assert silent_aux_streams(("aggTrade@100ms",), "binance_futures") == (
+    assert silent_aux_streams(("aggTrade@100ms",),
+                              EXCHANGE_ENDPOINTS["binance_futures"]) == (
         "aggTrade@100ms",)
 
 
@@ -201,8 +203,30 @@ def test_the_silent_stream_list_is_scoped_to_the_venue_that_was_measured() -> No
     measured at all. Warning there would be a statement the repository cannot
     support, and on spot it would be false in the operator's favour.
     """
-    assert silent_aux_streams(("aggTrade",), "binance_spot") == ()
-    assert silent_aux_streams(("aggTrade",), "binance_futures_testnet") == ()
+    assert silent_aux_streams(("aggTrade",), EXCHANGE_ENDPOINTS["binance_spot"]) == ()
+    assert silent_aux_streams(("aggTrade",),
+                              EXCHANGE_ENDPOINTS["binance_futures_testnet"]) == ()
+
+
+def test_the_silent_stream_warning_follows_the_endpoint_that_is_dialled() -> None:
+    """A ``ws_base_url`` override moves the frames, so the claim moves with them.
+
+    ``exchange`` only selects a default URL. Reading the warning's key from it
+    would attach the futures measurement to whatever the override points at --
+    silent where ``aggTrade`` does deliver, and quiet where it does not.
+    """
+    futures = EXCHANGE_ENDPOINTS["binance_futures"]
+    # Configured as testnet, dialled at the endpoint that was measured.
+    assert silent_aux_streams(("aggTrade",), futures) == ("aggTrade",)
+    assert _settings(exchange="binance_futures_testnet",
+                     ws_base_url=futures).endpoint == futures
+    # Configured as futures, dialled at spot, where ``aggTrade`` delivers.
+    assert silent_aux_streams(("aggTrade",),
+                              EXCHANGE_ENDPOINTS["binance_spot"]) == ()
+    # An endpoint nothing here has measured carries no claim in either direction.
+    assert silent_aux_streams(("aggTrade",), "wss://example.invalid/ws") == ()
+    # A trailing slash is not a different endpoint.
+    assert silent_aux_streams(("aggTrade",), futures + "/") == ("aggTrade",)
 
 
 def test_storage_dir_is_absolute_and_repo_relative() -> None:
