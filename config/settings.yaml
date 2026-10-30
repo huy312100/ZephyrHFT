@@ -49,8 +49,11 @@ data_ingestion:
   # separates "our quote was hit" from "the book crossed us" -- without prints
   # every backtested fill is adversarially selected by construction. ``trade`` is
   # the stream that actually delivers on this endpoint (@aggTrade is silently
-  # empty); ``--aux-stream aggTrade`` still works if a venue serves it.
-  aux_streams: [trade]            # e.g. [trade, markPrice@1s], [] = depth only
+  # empty); ``--aux-stream aggTrade`` still works if a venue serves it. Only
+  # depth and trade payloads are parsed and every other frame counts as
+  # malformed, so asking for e.g. ``markPrice@1s`` would archive frames that
+  # fail the archive-integrity check.
+  aux_streams: [trade]            # e.g. [trade], [] = depth only
   storage_path: data/raw_l2        # relative to the repository root
   compression: gzip                # gzip | none
   compression_level: 1             # 1 = fastest (ingest path), 9 = smallest

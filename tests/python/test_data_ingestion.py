@@ -801,6 +801,41 @@ def test_unwrap_frame_text_keeps_the_payload_bytes_verbatim() -> None:
     assert unwrap_frame_text(bare) == bare
 
 
+def test_unwrap_frame_text_extracts_the_whole_data_value() -> None:
+    """The slice is the value's own span, not everything before the last brace."""
+    payload = _agg_trade()
+    # Keys after "data" would otherwise be swallowed into the archived line.
+    data_first = '{"data":%s,"stream":"btcusdt@trade"}' % payload
+    assert unwrap_frame_text(data_first) == payload
+    # A brace inside a string is payload text, not the end of the envelope.
+    braced = '{"stream":"btcusdt@trade","data":{"e":"trade","s":"A}B","p":"1"}}'
+    assert unwrap_frame_text(braced) == '{"e":"trade","s":"A}B","p":"1"}'
+    # An envelope whose members are separated by whitespace still unwraps.
+    spaced = '{ "stream" : "btcusdt@trade" , "data" : %s }' % payload
+    assert unwrap_frame_text(spaced) == payload
+    # A truncated envelope is archived whole rather than half-sliced.
+    truncated = '{"stream":"btcusdt@trade","data":{"e":"tra'
+    assert unwrap_frame_text(truncated) == truncated
+
+
+def test_a_mark_price_stream_is_not_ingestible() -> None:
+    """Why settings.yaml's aux_streams example stops at ``trade``.
+
+    The capture client would archive a mark-price frame happily; native ingestion
+    cannot parse it, so ``ingest_json`` counts it malformed and
+    ``phase1.archive_integrity`` (which requires zero) turns BUILD NO-GO.
+    """
+    from python_analytics.bridge import build_paper_engine, ingest_batch
+
+    mark_price = json.dumps({"e": "markPriceUpdate", "E": 1_700_000_000_000,
+                             "s": "BTCUSDT", "p": "30000.00", "i": "30001.00"})
+    assert hft_native.classify_json(mark_price) == hft_native.FeedMessageType.UNKNOWN
+
+    engine = build_paper_engine(tick_size="0.50", center="30000.00")
+    stats = ingest_batch(engine, [_depth(), _agg_trade(), mark_price])
+    assert (stats["depth"], stats["trade"], stats["malformed"]) == (1, 1, 1)
+
+
 def test_event_kind_separates_depth_from_tape() -> None:
     assert event_kind(json.loads(_depth())) == "depth"
     assert event_kind(json.loads(_agg_trade())) == "trade"

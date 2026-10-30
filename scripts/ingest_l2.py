@@ -104,6 +104,72 @@ def unwrap_payload(payload: Any) -> Any:
     return payload
 
 
+_JSON_DECODER = json.JSONDecoder()
+
+
+def _skip_ws(raw: str, index: int) -> int:
+    """Advances past spaces, tabs and newlines."""
+    limit = len(raw)
+    while index < limit and raw[index] in " \t\r\n":
+        index += 1
+    return index
+
+
+def _envelope_data_span(raw: str) -> Optional[Tuple[int, int]]:
+    """Returns the text span of a combined envelope's ``data`` value, or ``None``.
+
+    The members are walked one at a time with ``JSONDecoder.raw_decode``, which
+    reports where each value ends, so the span is the value's own text: a brace
+    inside a string, a nested object, or a key that *follows* ``data`` can
+    neither shorten nor extend it. ``None`` unless the line is a single
+    ``{"stream": ..., "data": ...}`` object, so a bare payload that happens to
+    carry a ``data`` key is left alone.
+    """
+    index = _skip_ws(raw, 0)
+    if index >= len(raw) or raw[index] != "{":
+        return None
+    index += 1
+    has_stream = False
+    span: Optional[Tuple[int, int]] = None
+    while True:
+        index = _skip_ws(raw, index)
+        if index >= len(raw):
+            return None
+        if raw[index] == "}":
+            break
+        try:
+            key, index = _JSON_DECODER.raw_decode(raw, index)
+        except ValueError:
+            return None
+        if not isinstance(key, str):
+            return None
+        index = _skip_ws(raw, index)
+        if index >= len(raw) or raw[index] != ":":
+            return None
+        index = _skip_ws(raw, index + 1)
+        start = index
+        try:
+            _, index = _JSON_DECODER.raw_decode(raw, index)
+        except ValueError:
+            return None
+        if key == "stream":
+            has_stream = True
+        elif key == "data":
+            span = (start, index)
+        index = _skip_ws(raw, index)
+        if index >= len(raw):
+            return None
+        if raw[index] == ",":
+            index += 1
+            continue
+        if raw[index] != "}":
+            return None
+        break
+    if not has_stream or span is None:
+        return None
+    return span
+
+
 def unwrap_frame_text(raw: str) -> str:
     """Returns the line to archive for one socket frame.
 
@@ -114,20 +180,12 @@ def unwrap_frame_text(raw: str) -> str:
     would reformat numbers and the archive would stop being ground truth. The
     ``stream`` name is pure redundancy: the payload carries ``s`` itself.
     """
-    if not raw.startswith('{"stream"'):
+    if '"stream"' not in raw:
         return raw
-    marker = '"data":'
-    index = raw.find(marker)
-    if index < 0:
+    span = _envelope_data_span(raw)
+    if span is None:
         return raw
-    begin = index + len(marker)
-    limit = len(raw)
-    while begin < limit and raw[begin] in " \t\r\n":
-        begin += 1
-    end = raw.rfind("}")
-    if end <= begin:
-        return raw
-    return raw[begin:end]
+    return raw[span[0]:span[1]]
 
 
 def event_kind(payload: Any) -> str:
