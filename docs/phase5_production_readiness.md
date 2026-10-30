@@ -448,7 +448,7 @@ proof would be vacuous.
 | Evidence | `--source`, `--evidence-events`, `--seed`, `--chaos-frames`, `--window-events`, `--min-windows` | `data/sample_events.ndjson`, `2000`, `7`, `200`, `0`, `2` |
 | Frozen parameters | `--gamma`, `--sigma`, `--k`, `--time-horizon`, `--inventory-limit`, `--ofi-sensitivity`, `--ofi-decay`, `--ofi-cap` | `0.1`, `0.02`, `5.0`, `60.0`, `5.0`, `0.0`, `0.95`, `3.0` |
 | Venue / costs | `--market-type`, `--tick-size`, `--center`, `--maker-bps`, `--taker-bps`, `--initial-cash`, `--order-quantity` | `CRYPTO`, settings, settings, `2.0`, `5.0`, `100000.0`, `0.01` |
-| Gates | `--max-engine-p99-us`, `--max-engine-p999-us`, `--min-throughput-fps`, `--ledger-tolerance`, `--min-oos-sharpe`, `--require-positive-alpha` | `50.0`, `500.0`, `1000`, `1e-2`, `None`, off |
+| Gates | `--max-engine-p99-us`, `--max-engine-p999-us`, `--max-reanchor-p99-us`, `--reanchor-frames`, `--min-throughput-fps`, `--ledger-tolerance`, `--min-oos-sharpe`, `--require-positive-alpha` | `50.0`, `500.0`, `200.0`, `1000`, `1000`, `1e-2`, `None`, off |
 | Walk-forward evidence | `--walk-forward-json`, `--recompute-walk-forward` | `reports/walk_forward.json`, off |
 | Output | `--report-dir`, `--stem`, `--no-report`, `--log-level` | `reports`, `production_readiness_report`, off, `ERROR` |
 
