@@ -1207,6 +1207,44 @@ void test_risk_manager_in_engine() {
     CHECK(!plain.risk_manager_config().enabled);
 }
 
+void test_order_entry_refuses_a_book_it_cannot_see() {
+    // ``top()`` reports an invalid Bbo rather than a torn one, so order entry has
+    // to turn that into a refusal: the fat-finger gate is skipped (there is no
+    // mid to band against) and ``risk_.check()`` names the reason. Without this
+    // the engine would price a live order against half a book -- or, before the
+    // fail-closed read, against one side of one write and the other of the next.
+    hft::EngineConfig config;
+    config.tick_size = hft::Price::from_double(0.5);
+    config.center = hft::Price::from_int(30'000);
+    config.risk_manager = base_risk_config();
+    hft::TradingEngine engine(config);
+
+    hft::OrderRequest request;
+    request.side = hft::Side::Buy;
+    request.type = hft::OrderType::Limit;
+    request.quantity = Q("1");
+    request.price = P("29999.5");
+
+    const hft::OrderAck empty_book = engine.submit(request);
+    CHECK(!empty_book.accepted());
+    CHECK(empty_book.reason == hft::RejectReason::BookUnavailable);
+    CHECK(engine.metrics().orders_rejected == 1);
+
+    // A bid with no ask is still not a book, and the frame that produced it is
+    // counted as unpriced instead of becoming a mark of zero.
+    hft::DepthUpdate depth;
+    depth.exchange_ts = 1'000;
+    depth.bids[0] = {P("29999.5"), Q("50")};
+    depth.bid_count = 1;
+    engine.apply_depth(depth);
+    CHECK(engine.metrics().unpriced_frames == 1);
+
+    const hft::OrderAck one_sided = engine.submit(request);
+    CHECK(!one_sided.accepted());
+    CHECK(one_sided.reason == hft::RejectReason::BookUnavailable);
+    CHECK(engine.metrics().orders_rejected == 2);
+}
+
 void test_kill_switch_basic() {
     hft::KillSwitch kill;
     CHECK(!kill.is_tripped());
@@ -1698,6 +1736,7 @@ int main() {
     test_risk_manager_rate_limit();
     test_risk_manager_concurrent_burst();
     test_risk_manager_in_engine();
+    test_order_entry_refuses_a_book_it_cannot_see();
     test_kill_switch_basic();
     test_kill_switch_guards();
     test_kill_switch_hooks_and_threads();
