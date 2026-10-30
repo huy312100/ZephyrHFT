@@ -6,6 +6,8 @@ offset either side.
 """
 from __future__ import annotations
 
+import math
+
 import pytest
 
 from python_analytics.costs import (
@@ -92,6 +94,14 @@ def test_fee_wall_reports_no_multiple_when_the_edge_is_zero():
     assert wall.fee_multiple is None
     assert "break-even maker fee +0.000 bps" in wall.describe()
     assert "2 bps maker fee" in wall.describe()
+
+
+def test_fee_wall_reports_no_multiple_when_the_quotient_overflows():
+    """A finite but tiny edge must not publish an infinite multiple."""
+    wall = FeeWall.from_study(pre_fee_pnl=1e-309, traded_notional=10_000.0,
+                              maker_bps=2.0)
+    assert wall is not None and math.isfinite(wall.gross_bps)
+    assert wall.fee_multiple is None
 
 
 def test_fee_wall_clears_a_rebate():

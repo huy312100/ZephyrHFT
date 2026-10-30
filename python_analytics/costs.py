@@ -110,10 +110,16 @@ class FeeWall:
 
     @property
     def fee_multiple(self) -> "Optional[float]":
-        """How many times the fee exceeds the edge (``None`` if there is none)."""
+        """How many times the fee exceeds the edge (``None`` if there is none).
+
+        A tiny but finite edge can still overflow the quotient (``2.0 / 1e-309``
+        is infinite), and an infinite multiple reaches the report as the
+        nonstandard ``Infinity`` token, so it counts as "no multiple" here.
+        """
         if self.gross_bps <= 0.0:
             return None
-        return self.maker_bps / self.gross_bps
+        multiple = self.maker_bps / self.gross_bps
+        return multiple if math.isfinite(multiple) else None
 
     def describe(self) -> str:
         """One line naming both sides and the break-even fee between them."""

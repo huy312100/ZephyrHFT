@@ -890,7 +890,7 @@ depth only. **A maker-fill study is not possible on either.**
    not a bug in the model; it is the model telling you what L2 snapshots cannot
    see.
 
-So the choice is: capture `aggTrade` alongside `depth@100ms` and study fills
+So the choice is: capture `trade` alongside `depth@100ms` and study fills
 from the tape (§11.5.2), or keep quoting on a model that answers a different
 question.
 
@@ -922,7 +922,7 @@ The tape model is only as good as its input:
 
 | Requirement | Why |
 | --- | --- |
-| `aggTrade` captured next to `depth@100ms` | without prints, `--fill-model trade` fills nothing and says so |
+| `trade` captured next to `depth@100ms` | without prints, `--fill-model trade` fills nothing and says so. `@aggTrade` is documented but silent on this endpoint (§11.6.1), so the stream to archive is `trade` |
 | Hours-to-days of capture, not 9 seconds | the repro `data/raw_l2` file holds 93 frames; it cannot carry a study |
 | A spread that clears the fee | a `0.667 bps` book against `2 bps` maker is a structural loss: you need `> 4 bps` of round-trip edge or a fee tier near zero |
 | `--fill-model trade` recorded with the artefact | `aggregate.fill_model` now carries it, so a net PnL is never read without its model |
