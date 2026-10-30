@@ -1242,24 +1242,31 @@ would have filled if the print reached it, and the fill is marked from the
 quote's own price at each horizon. The output is edge against distance, plus the
 fill rate still available out there.
 
-On the committed 151 s tape (6,240 prints, tick `0.10`, `2.0 bps` maker fee):
+On 3 h of the same instrument (613,900 prints over 10,800 s, 12 rolls, tick
+`0.10`, median mid `76,890`, `2.0 bps` maker fee, session ended `-0.24 %`):
 
-| distance bps | ticks | fills | fills/min | 1 s mean | net of fee |
+| distance bps | ticks | fills/min | 1 s mean | 1 s t | 10 s mean |
 | --- | --- | --- | --- | --- | --- |
-| 0.0125 | 1 | 3,111 | 1,249.7 | −0.801 | −2.801 |
-| 0.1 | 8 | 2,501 | 1,004.7 | −0.752 | −2.752 |
-| 0.5 | 41 | 1,167 | 468.8 | −0.424 | −2.424 |
-| 1 | 81 | 231 | 92.8 | **+0.131** | −1.869 |
-| 1.5 | 122 | 0 | 0.0 | — | — |
-| 2 | 163 | 0 | 0.0 | — | — |
+| 0.0125 | 1 | 1,950.3 | **−1.332** | −640.6 | −1.302 |
+| 0.1 | 8 | 1,642.0 | −1.301 | −562.7 | −1.239 |
+| 0.5 | 38 | 953.9 | −1.153 | −348.5 | −0.979 |
+| 1 | 77 | 413.9 | −1.084 | −176.3 | −0.668 |
+| 1.5 | 115 | 214.2 | −1.077 | −98.9 | −0.287 |
+| 2 | 154 | 142.4 | −0.971 | −54.8 | **+0.121** |
+| 3 | 231 | 102.4 | −0.522 | −13.2 | **+1.489** |
 
-Verdict `NO_CLEARING_DISTANCE`: the only distance that earns anything at 1 s is
-`1 bps` out (`+0.13 bps`, t `+3.18`), and the tape never reaches `1.5 bps` at
-all, so nothing wider can be quoted. Any maker fee above `0.13 bps` loses money
-on this tape at every distance — the retail `2 bps` is fifteen times the whole
-edge. That is a fee-tier and instrument conclusion, not a parameter one, and
+Verdict `NO_CLEARING_DISTANCE`. At a one-second holding time the markout is
+negative at every distance the tape reaches — worst at the touch (`−1.33 bps`,
+`t = −641`, 7.3 % of fills positive), improving monotonically with distance and
+never clearing zero. A maker cannot quote its way out of the fee. At ten seconds
+the far distances flip positive (`+0.12 bps` at 154 ticks, `+1.49 bps` at 231),
+which is a sweep-reversion edge rather than a market-making one: quote far, get
+filled by a run, hold. A 151 s smoke test had reported `+0.13 bps` at `1 bps` and
+no fills beyond `1.5 bps`; 72× the tape reverses that sign and fills the far
+distances, which is why the study needed hours and not minutes.
 [`docs/phase5_production_readiness.md` §11.8](docs/phase5_production_readiness.md#118-the-edge-curve-what-a-quote-earns-at-each-distance)
-works it through in full.
+works it through, including the fills that a reconnect's 113 s hole in the mid
+timeline could not mark.
 
 ### Continuous integration
 
