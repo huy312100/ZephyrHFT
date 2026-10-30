@@ -242,7 +242,9 @@ def build_payload(args: argparse.Namespace, parameters: LockedParameters,
         "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "inputs": {
             "mode": "fills" if args.fills else "replay",
-            "fill_model": str(args.fill_model),
+            # No model produced the fills in ``--fills`` mode, so recording one
+            # would attribute an edge to a simulator that never ran.
+            "fill_model": None if args.fills else str(args.fill_model),
             "sources": [str(path) for path in resolve_sources(args.source)],
             "lock_file": str(args.lock_file),
             "lock_fingerprint": parameters.fingerprint,

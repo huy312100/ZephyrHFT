@@ -24,6 +24,7 @@ from python_analytics.utils.config import (
     DataIngestionSettings,
     as_dict,
     load_settings,
+    silent_aux_streams,
 )
 from scripts import ingest_l2 as ingest_module
 from scripts.ingest_l2 import (  # noqa: E402 - sys.path bootstrap lives in the script
@@ -174,6 +175,20 @@ def test_a_single_stream_keeps_the_plain_url() -> None:
     settings = _settings()
     assert settings.combined_stream_url is None
     assert settings.stream_url.endswith("/ws/btcusdt@depth@100ms")
+
+
+def test_aux_streams_this_venue_accepts_but_never_delivers_are_named() -> None:
+    """``@aggTrade`` subscribes cleanly and then carries nothing here.
+
+    Measured in docs/phase5 section 11.6.1: on the configured futures endpoint
+    ``@aggTrade`` delivered 0 frames while ``@trade`` delivered the same prints
+    at ~40/s. The capture therefore has to name the silent ones at startup
+    instead of letting a tape study discover the empty archive later.
+    """
+    assert silent_aux_streams(("trade",)) == ()
+    assert silent_aux_streams(()) == ()
+    assert silent_aux_streams(("aggTrade", "trade")) == ("aggTrade",)
+    assert silent_aux_streams(("aggTrade@100ms",)) == ("aggTrade@100ms",)
 
 
 def test_storage_dir_is_absolute_and_repo_relative() -> None:

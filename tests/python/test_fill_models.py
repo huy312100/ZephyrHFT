@@ -213,6 +213,34 @@ def test_fill_model_survives_reset_and_is_reported():
     assert engine.fill_model() == n.FillModel.TRADE
 
 
+def test_switching_to_the_queue_model_joins_the_queue_the_book_shows_now():
+    """A queue depth carried across models describes a rule no longer in force.
+
+    The order was posted while the level held 2.0; depth grew to 20.0 while the
+    engine was on the touch model, which never advances queue state. Switching
+    to the queue model must place the order behind the 20.0 displayed at the
+    switch. Keeping the 2.0 from submit time lets the 10.0 that left the level
+    beforehand be counted as traded volume *ahead* of an order that never sat in
+    that queue, and the sweep after it then fills a quote nobody hit.
+    """
+    engine = _engine(n.FillModel.TOUCH)
+    ask = [("30000.5", "1.0")]
+    engine.process_update(_depth(1000, [("30000", "2.0"), ("29999.5", "1.0")], ask))
+    assert _post(engine, n.Side.BUY, "30000", "0.5", 1000).accepted()
+
+    # Depth grows behind us while the touch model is in force: nothing trades.
+    engine.process_update(_depth(1100, [("30000", "20.0"), ("29999.5", "1.0")], ask))
+    assert _drain(engine) == []
+
+    engine.set_fill_model(n.FillModel.QUEUE)
+    # Half of the level leaves; 10.0 is still sitting ahead of the order.
+    engine.process_update(_depth(1200, [("30000", "10.0"), ("29999.5", "1.0")], ask))
+    assert _drain(engine) == []
+    # That remaining 10.0 is the trade here, and it only just reaches the order.
+    engine.process_update(_depth(1300, [("30000", "0.0"), ("29999.5", "1.0")], ask))
+    assert _drain(engine) == []
+
+
 @pytest.mark.parametrize("model", ["TOUCH", "QUEUE", "TRADE"])
 def test_ledger_stays_coherent_under_every_model(model):
     engine = _engine(getattr(n.FillModel, model))

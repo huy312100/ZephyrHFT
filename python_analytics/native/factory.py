@@ -3,7 +3,12 @@ from __future__ import annotations
 
 from typing import Union
 
-from ..utils.config import AppSettings, EngineSettings, KillSwitchSettings
+from ..utils.config import (
+    AppSettings,
+    EngineSettings,
+    KillSwitchSettings,
+    require_aligned_center,
+)
 from . import hft_native
 
 
@@ -72,6 +77,9 @@ def build_kill_switch(
 
 def engine_config(settings: Union[AppSettings, EngineSettings]) -> "hft_native.EngineConfig":
     engine_settings = settings.engine if isinstance(settings, AppSettings) else settings
+    # The engine and the paper replayer share one ladder, which indexes prices
+    # relative to this centre: an off-grid centre rejects the whole feed.
+    require_aligned_center(engine_settings.center, engine_settings.tick_size)
     config = hft_native.EngineConfig()
     config.tick_size = _price(engine_settings.tick_size)
     config.center = _price(engine_settings.center)

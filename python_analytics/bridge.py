@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Callable, Dict, Iterable, Iterator, List, Optional
 
 from .native import hft_native
+from .utils.config import require_aligned_center
 
 logger = logging.getLogger(__name__)
 
@@ -43,8 +44,11 @@ def build_paper_engine(
     """Creates the C++ paper engine.
 
     ``maker_bps`` / ``taker_bps`` are fractional basis points (e.g. ``0.5``);
-    the ledger stores them as micro-bps so no precision is lost here.
+    the ledger stores them as micro-bps so no precision is lost here. The
+    centre/tick pair is validated first: an off-grid centre rejects every price
+    the ladder is offered, which looks like a quiet market rather than a bug.
     """
+    require_aligned_center(center, tick_size)
     return hft_native.PaperEngine(
         hft_native.Price.from_string(tick_size),
         hft_native.Price.from_string(center),

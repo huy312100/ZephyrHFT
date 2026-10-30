@@ -737,11 +737,11 @@ venue before assuming the book is flat.
 
 ### 11.3 What is still missing before this is a business
 
-1. **An edge.** The committed study is `NO-GO`: `net_pnl = -16.47 USDT` over 229
+1. **An edge.** The committed study is `NO-GO`: `net_pnl = -15.78 USDT` over 229
    fills with `2.0 bps` maker / `5.0 bps` taker charged. Nothing in this layer
    changes that sign. Real capture + a re-run study is the work.
 2. **~~Markout.~~** Shipped in §11.4. It answers the question item 1 cannot: the
-   study's maker fills are marked at `-0.43 bps` one second after the trade, so
+   study's maker fills are marked at `-0.41 bps` one second after the trade, so
    the quote is being picked off and the fee is not the only problem.
 3. **Funding.** Perpetual funding is charged every 8h and is currently not in
    the ledger; a carry-heavy session will drift from the paper model.
@@ -1087,7 +1087,8 @@ second later every single fill is negative (`-0.404 bps`, 0 % win, `t = -11.92`)
 **the capture decays to nothing inside the marking window**, uniformly, rather
 than being destroyed by a minority of toxic prints. Neither column clears the
 `30`-sample bar, so both verdicts stay INCONCLUSIVE — the 1 s sign is
-consistent (45/45 → 0/28 positive) but it is still one 151 s capture.
+consistent (`28/28` → `0/28` positive on the tape model's 28 marked fills) but
+it is still one 151 s capture.
 
 The conclusion it sharpens: the strategy is not "wrong", it is
 **mis-priced against its own fee**:

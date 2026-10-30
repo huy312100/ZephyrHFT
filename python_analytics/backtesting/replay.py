@@ -13,7 +13,7 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Union
 from ..bridge import iter_gzip_ndjson, iter_ndjson
 from ..native import factory, hft_native
 from ..strategies.base import Strategy
-from ..utils.config import AppSettings
+from ..utils.config import AppSettings, require_aligned_center
 from ..costs import DEFAULT_MAKER_BPS, DEFAULT_TAKER_BPS
 from .metrics import distribution, fill_rows, quant_summary, summarize
 
@@ -296,6 +296,9 @@ class BulkReplayer:
                  fill_model: str = "touch") -> None:
         self._tick_size = str(tick_size)
         self._center = str(center)
+        # A centre off the tick grid cannot index a single price, so it is
+        # rejected here rather than after a silently empty study.
+        require_aligned_center(self._center, self._tick_size)
         # Fee rates are fractional basis points: 0.5 is a valid 0.5 bps charge,
         # so they are kept as floats and passed straight to the C++ ledger, which
         # freezes them into micro-bps. Never round/truncate them here.

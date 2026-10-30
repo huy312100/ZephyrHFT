@@ -67,6 +67,7 @@ from python_analytics.utils.config import (
     ConfigError,
     DataIngestionSettings,
     parse_stream_names,
+    silent_aux_streams,
 )
 
 logger = logging.getLogger("zephyr.ingest_l2")
@@ -1150,6 +1151,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "depth-only capture: no trade prints are archived, so "
             "'--fill-model trade' can never fill from this archive"
         )
+    else:
+        silent = silent_aux_streams(settings.aux_streams)
+        if silent:
+            logger.warning(
+                "aux stream(s) %s were accepted and stayed silent on this "
+                "endpoint; the tape needs 'trade' (docs/phase5 section 11.6.1)",
+                ", ".join(f"{settings.symbol}@{tag}" for tag in silent),
+            )
 
     async def _run() -> None:
         install_signal_handlers(client)

@@ -546,10 +546,12 @@ tick 0.50):
 | Window hit rate | `0%` (0 positive, 2 negative) |
 | Ledger residual | `-1.1e-7` (tolerance `2.0e-2`) |
 
-> **These numbers were re-measured after the depth-parser fix.** The ladder now
-> keeps the levels nearest the touch, so the marked book and the mark-to-market
-> leg differ from the figure this table carried before (`-16.4743` on the same
-> 229 fills and the same notional); the conclusion did not change.
+> **These numbers were re-measured after outward tick snapping was enabled for
+> crypto quotes.** Prices now land on the venue's tick grid (bid down, ask up),
+> so the marked book and the mark-to-market leg differ from the figure this table
+> carried before. Re-running with snapping disabled reproduces `-16.4743` on the
+> same 229 fills, with a notional of `68,664.89` against `68,664.88` here; the
+> conclusion did not change.
 
 > **This is a red result, and it is reported as one.** The same 800 events at the
 > rebate tier this repository used to default to (`maker_bps = -1.0`, a different

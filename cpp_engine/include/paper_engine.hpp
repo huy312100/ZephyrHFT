@@ -107,8 +107,15 @@ public:
     paper_engine& operator=(const paper_engine&) = delete;
 
     // Switching models mid-session is allowed; resting orders restart their
-    // queue accounting from the book they are looking at now.
-    void set_fill_model(fill_model model) noexcept { fill_model_ = model; }
+    // queue accounting from the book they are looking at now, because a queue
+    // depth carried over from the previous model describes a fill rule that is
+    // no longer in force.
+    void set_fill_model(fill_model model) noexcept {
+        fill_model_ = model;
+        orders_.for_each_live([&](DefaultOrderManager::Slot& slot) {
+            seed_queue_state(slot.id, slot.side, slot.price);
+        });
+    }
     [[nodiscard]] fill_model model() const noexcept { return fill_model_; }
 
     void reset() noexcept {

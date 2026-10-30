@@ -186,8 +186,12 @@ class DataIngestionSettings:
         if len(tags) < 2:
             return None
         base = self.endpoint
-        # ``/ws`` is the single-stream endpoint; the multiplexed one is sibling
-        # ``/stream`` on every Binance environment (spot, futures, testnet).
+        # ``/ws`` is the single-stream endpoint; the multiplexed one is its
+        # sibling ``/stream``. Measured on this venue (``docs/phase5`` §11.6.1):
+        # ``<sym>@depth@100ms`` and ``<sym>@trade`` share that socket and arrive
+        # interleaved, which is exactly what the tape capture needs. ``@aggTrade``
+        # is accepted there and then silent, so it is flagged at ingest startup
+        # (``silent_aux_streams``) instead of being routed to another path.
         base = base[: -len("/ws")] if base.endswith("/ws") else base
         streams = "/".join(f"{self.symbol}@{tag}" for tag in tags)
         return f"{base}/stream?streams={streams}"
@@ -434,6 +438,52 @@ def parse_stream_names(
         if text not in names:
             names.append(text)
     return tuple(names)
+
+
+def require_aligned_center(center: Any, tick_size: Any) -> None:
+    """Rejects a ladder centre that is not a whole number of ticks.
+
+    The native ladder indexes a price by ``(price - centre) / tick`` and refuses
+    any price whose delta does not divide exactly (``LadderSide::slot_for``), so
+    a centre off the grid rejects every frame, leaves resting orders unable to
+    match the depth in the book, and reads as a quiet market rather than as a
+    misconfiguration. Quotes are snapped *from zero* onto the tick grid
+    (``MarketMakerStrategy.adjusted_quotes``), so no quoting choice can fix an
+    unaligned centre: it has to be rejected before the run starts.
+    """
+    try:
+        tick = Decimal(str(tick_size))
+        price = Decimal(str(center))
+    except (InvalidOperation, ValueError) as exc:  # pragma: no cover - defensive
+        raise ValueError(
+            f"center {center!r} / tick size {tick_size!r} is not a decimal price"
+        ) from exc
+    # The tick is checked before the division: ``Decimal`` raises on a zero
+    # divisor, and a NaN comparison raises too, so neither can be left to the
+    # ``steps`` test below.
+    if not tick.is_finite() or tick <= 0:
+        raise ValueError(f"tick size must be positive, got {tick_size!r}")
+    if not price.is_finite():
+        raise ValueError(f"center {center!r} is not a finite price")
+    steps = price / tick
+    if steps != steps.to_integral_value():
+        raise ValueError(
+            f"center {center!r} is not a whole number of ticks ({tick_size!r}): "
+            f"{steps} steps, so every price would be off the ladder's grid"
+        )
+
+
+#: Aux streams the venue accepts and then never delivers (measured in
+#: ``docs/phase5_production_readiness.md`` §11.6.1: ``@aggTrade`` carries 0
+#: frames on the configured endpoint while ``@trade`` delivers ~40/s).
+SILENT_AUX_STREAMS: Tuple[str, ...] = ("aggTrade",)
+
+
+def silent_aux_streams(aux_streams: Sequence[str]) -> Tuple[str, ...]:
+    """The configured aux streams that this venue accepts but never delivers."""
+    return tuple(
+        tag for tag in aux_streams if tag.split("@", 1)[0] in SILENT_AUX_STREAMS
+    )
 
 
 def _build_data_ingestion(raw: Mapping[str, Any]) -> DataIngestionSettings:

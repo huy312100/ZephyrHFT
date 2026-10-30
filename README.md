@@ -1151,7 +1151,7 @@ python3 scripts/run_live_trader.py --cancel-all
 | No real money without evidence | Production needs `--live` **and** a fresh positive alpha in `reports/production_readiness_report.json`; `--cancel-all` is exempt, because the kill switch must not depend on an arming flag |
 
 The last row is the one that matters today: the committed study is `NO-GO`
-(`net_pnl = -16.47 USDT` after fees), so `--live` exits `3` until either the
+(`net_pnl = -15.78 USDT` after fees), so `--live` exits `3` until either the
 study turns green or someone writes `--override-alpha "<reason>"`, which is
 recorded in the order store's audit trail. The remaining gaps — markout,
 funding, a re-quoting loop, alerting — are listed in

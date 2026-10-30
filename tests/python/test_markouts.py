@@ -793,3 +793,17 @@ def test_the_markout_artefact_records_the_fill_model() -> None:
 
     # Two runs over the same archive with different models must be tellable apart.
     assert payload["inputs"]["fill_model"] == "queue"
+
+
+def test_fills_supplied_from_outside_record_no_fill_model(tmp_path) -> None:
+    """No simulator ran, so naming one would credit it with the edge."""
+    cli = _load_cli()
+    fills = tmp_path / "fills.json"
+    fills.write_text("[]", encoding="utf-8")
+    args = cli.parse_args(["--fills", str(fills), "--no-report"])
+
+    payload = cli.build_payload(args, _parameters(), MarkoutConfig(horizons_s=(0.0, 1.0)),
+                                {}, {}, [])
+
+    assert payload["inputs"]["mode"] == "fills"
+    assert payload["inputs"]["fill_model"] is None
