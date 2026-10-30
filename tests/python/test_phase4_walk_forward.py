@@ -251,27 +251,41 @@ def test_aggregate_reports_the_break_even_maker_fee(tmp_path: Path) -> None:
     """Gross edge per unit of notional is the fee a deployment has to clear.
 
     The number is derived, never stored twice: it must equal the aggregate's own
-    pre-fee PnL over its own traded notional, and it must be absent (``None``)
-    when nothing traded rather than a misleading zero.
+    pre-fee PnL over its own traded notional.
     """
     source = _write(tmp_path / "archive.ndjson", _lines(300))
     report = _runner(_parameters()).run([source])
     aggregate = report.aggregate
     notional = aggregate["traded_notional"]
-    wall = report.fee_wall()
-    fee_lines = [line for line in report.summary_lines() if line.startswith("fee wall:")]
+    assert notional > 0.0, "the fixture must trade, or this test proves nothing"
 
-    if notional > 0.0:
-        expected = ((aggregate["net_pnl"] + aggregate["fees_paid"])
-                    / notional * 10_000.0)
-        assert aggregate["gross_edge_bps"] == pytest.approx(expected, abs=1e-5)
-        assert wall is not None and wall.maker_bps == pytest.approx(2.0)
-        assert len(fee_lines) == 1
-        assert f"{expected:+.3f} bps" in fee_lines[0]
-    else:
-        assert aggregate["gross_edge_bps"] is None
-        assert wall is None
-        assert fee_lines == []
+    expected = ((aggregate["net_pnl"] + aggregate["fees_paid"])
+                / notional * 10_000.0)
+    assert aggregate["gross_edge_bps"] == pytest.approx(expected, abs=1e-5)
+    wall = report.fee_wall()
+    assert wall is not None and wall.maker_bps == pytest.approx(2.0)
+    fee_lines = [line for line in report.summary_lines()
+                 if line.startswith("fee wall:")]
+    assert len(fee_lines) == 1
+    assert f"{expected:+.3f} bps" in fee_lines[0]
+
+
+def test_a_study_that_never_traded_has_no_fee_wall(tmp_path: Path) -> None:
+    """An empty run has no unit of notional to charge a fee against.
+
+    Reporting ``0.0`` bps would read as a measured edge, so the derived gross
+    edge and the fee wall are both absent rather than zero.
+    """
+    source = _write(tmp_path / "archive.ndjson", _lines(1))
+    report = _runner(_parameters()).run([source])
+    aggregate = report.aggregate
+
+    assert aggregate["fills"] == 0
+    assert aggregate["traded_notional"] == pytest.approx(0.0)
+    assert aggregate["gross_edge_bps"] is None
+    assert report.fee_wall() is None
+    assert [line for line in report.summary_lines()
+            if line.startswith("fee wall:")] == []
 
 
 def test_report_numbers_are_finite_or_null(tmp_path: Path) -> None:

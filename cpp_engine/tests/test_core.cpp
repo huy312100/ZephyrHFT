@@ -455,8 +455,10 @@ void test_re_anchor_off_the_grid_drops_the_book_instead_of_moving_it() {
 void test_json_parser_keeps_the_levels_nearest_the_touch() {
     // A partial-book burst carries more levels than the update buffer holds, and
     // the venue promises no ordering. Here the bids are listed ascending from
-    // 30,000, so keeping the first come-first-served would make the engine's
-    // "best bid" the lowest one in the frame rather than the real touch.
+    // 30,000 and the asks descending from 40,039, so keeping the first
+    // come-first-served would make the engine's "best bid" the lowest bid in the
+    // frame and its "best ask" the highest ask -- neither of which the market
+    // ever quoted.
     std::string json = "{\"e\":\"depthUpdate\",\"E\":1700000000000,\"U\":1,\"u\":2,";
     json += "\"s\":\"BTCUSDT\",\"b\":[";
     for (int i = 0; i < 40; ++i) {
@@ -466,7 +468,7 @@ void test_json_parser_keeps_the_levels_nearest_the_touch() {
     json += "],\"a\":[";
     for (int i = 0; i < 40; ++i) {
         json += (i == 0 ? "" : ",");
-        json += "[\"" + std::to_string(40000 + i) + ".0\",\"1.0\"]";
+        json += "[\"" + std::to_string(40039 - i) + ".0\",\"1.0\"]";
     }
     json += "]}";
 

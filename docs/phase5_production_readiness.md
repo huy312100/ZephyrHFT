@@ -37,6 +37,7 @@ verdicts** against **explicit, named thresholds**:
   BUILD: GO (16/16 gated checks passed)
   ALPHA: NO-GO (1/3 profitability checks passed at 2.0 / 5.0 bps maker/taker)
     ALPHA FAIL alpha.net_pnl: -15.7830 USDT (-0.0158%); -2.0500 before +13.7330 of fees (required >= 0 after modelled fees)
+    ALPHA FAIL alpha.fee_wall: gross edge -0.299 bps vs 2 bps maker fee | break-even maker fee -0.299 bps (required gross edge > maker fee)
     Phase 1 - data ingestion               3/3 checks
     Phase 2 - paper execution              7/7 checks
     Phase 3 - resilience                   3/3 checks
@@ -83,7 +84,7 @@ never lets one impersonate the other:
 | Verdict | Answers | Gates the exit code by default | Contains |
 | --- | --- | --- | --- |
 | **BUILD** | Does the machinery keep the promises of phases 1–4? | yes (`0` / `1`) | the 16 gated build checks, plus informational rows |
-| **ALPHA** | Does *this* parameter set earn after the fees a retail account actually pays? | no — only with `--require-positive-alpha` (`3`) | `alpha.net_pnl`, `alpha.fee_assumption` |
+| **ALPHA** | Does *this* parameter set earn after the fees a retail account actually pays? | no — only with `--require-positive-alpha` (`3`) | `alpha.net_pnl`, `alpha.fee_assumption`, `alpha.fee_wall` |
 
 Both are always measured and both are printed; `summary.blocking` (build) and
 `summary.alpha_blocking` (alpha) are separate keys, and a failing alpha check can
@@ -98,6 +99,7 @@ The alpha block is deliberately blunt about costs:
 | --- | --- | --- |
 | `alpha.net_pnl` | Phase 4 aggregate `net_pnl` after fees, plus the same number with fees added back | `>= 0` after modelled fees |
 | `alpha.fee_assumption` | The fee assumption itself (maker/taker bps, round-trip cost) | `maker_bps >= 0` — a rebate is not a retail rate |
+| `alpha.fee_wall` | The same result in fee units: gross edge per unit of traded notional vs the maker fee, naming the break-even fee | `gross edge > maker fee`; emitted only when the study traded notional |
 
 Fees are already inside realized/unrealized PnL (both come from the cash ledger),
 so `pnl_before_fees = net_pnl + fees_paid` reports what the study would have earned
@@ -111,7 +113,7 @@ signal, not the fee tier.
 
 16 gated build checks by default across 18 table rows (16 gates + 2
 informational rows); enabling `--min-oos-sharpe` adds one gate for 17 gated
-checks across 19 rows. The two alpha checks (§1.3) are reported alongside these
+checks across 19 rows. The three alpha checks (§1.3) are reported alongside these
 but are gated separately, so they are not counted here.
 
 ### 2.1 Phase 1 — data ingestion

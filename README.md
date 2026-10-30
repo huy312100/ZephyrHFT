@@ -987,6 +987,7 @@ Sample verdict — the honest combination at retail fees:
   BUILD: GO (16/16 gated checks passed)
   ALPHA: NO-GO (1/3 profitability checks passed at 2.0 / 5.0 bps maker/taker)
     ALPHA FAIL alpha.net_pnl: -15.7830 USDT (-0.0158%); -2.0500 before +13.7330 of fees
+    ALPHA FAIL alpha.fee_wall: gross edge -0.299 bps vs 2 bps maker fee (break-even maker fee -0.299 bps)
     Phase 1 - data ingestion               3/3 checks
     Phase 2 - paper execution              7/7 checks
     Phase 3 - resilience                   3/3 checks

@@ -190,14 +190,14 @@ def test_a_re_anchor_does_not_replay_a_dropped_level_as_a_fill():
     engine.process_update(_depth(1000, [("30000", "10.0")], [("30000.5", "1.0")]))
     assert _post(engine, n.Side.BUY, "30000", "0.5", 1000).accepted()
 
-    # A print consumes half of the queue ahead of the order without reaching it.
-    engine.process_trade(_trade(1050, "30000", "5.0"))
+    # Depth is added behind the order: the reference grows to 20.0 while the
+    # 10.0 sitting ahead of us stays where it was.
+    engine.process_update(_depth(1050, [("30000", "20.0")], [("30000.5", "1.0")]))
     assert _drain(engine) == []
 
-    # The market gaps past the window. The re-anchor drops the level the order
-    # sits on, and the queue model reads a fall in displayed size as traded
-    # volume -- so the drop must not be replayed as a fill at a price the book
-    # no longer holds.
+    # The market gaps past the window, so the re-anchor drops the level the
+    # order sits on. Read as traded volume, that 20.0 drop would clear the queue
+    # ahead of us and fill the order at a price the book no longer holds.
     engine.process_update(_depth(1100, [("33000", "1.0")], [("33000.5", "1.0")]))
     assert engine.metrics().book_recenters == 1
     assert _drain(engine) == []

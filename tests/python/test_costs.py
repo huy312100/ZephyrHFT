@@ -53,6 +53,21 @@ def test_gross_edge_refuses_to_invent_an_edge_out_of_nothing():
                               maker_bps=2.0) is None
 
 
+def test_gross_edge_refuses_a_non_finite_study():
+    """NaN and infinity are not valid JSON numbers, so they are never derived."""
+    nan = float("nan")
+    inf = float("inf")
+    assert gross_edge_bps(nan, 10_000.0) is None
+    assert gross_edge_bps(inf, 10_000.0) is None
+    assert gross_edge_bps(-inf, 10_000.0) is None
+    assert gross_edge_bps(1.0, nan) is None
+    assert gross_edge_bps(1.0, inf) is None
+    # A finite input pair can still overflow the division.
+    assert gross_edge_bps(1e308, 1e-8) is None
+    assert FeeWall.from_study(pre_fee_pnl=nan, traded_notional=10_000.0,
+                              maker_bps=2.0) is None
+
+
 def test_fee_wall_compares_edge_and_fee_in_the_same_unit():
     wall = FeeWall.from_study(pre_fee_pnl=0.5, traded_notional=25_000.0,
                               maker_bps=2.0, fills=12)

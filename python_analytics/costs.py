@@ -15,6 +15,7 @@ This module imports nothing from this package so both ``strategies`` and
 """
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Optional
 
@@ -53,12 +54,20 @@ def gross_edge_bps(pre_fee_pnl: float,
     edge is ``g`` bps breaks even at a maker fee of exactly ``g`` bps and loses
     ``maker_bps - g`` bps on every unit of notional once the fee goes above it.
     Returns ``None`` when nothing was traded: an empty run has no unit to charge
-    a fee against, and reporting ``0.0`` would read as a measured edge.
+    a fee against, and reporting ``0.0`` would read as a measured edge. It also
+    returns ``None`` when the study's numbers are not finite, in either
+    direction: ``json.dumps`` writes ``NaN``/``Infinity`` as bare tokens, which
+    are not valid JSON, so a corrupted artefact must not reach the report as a
+    derived measurement.
     """
     notional = float(traded_notional)
-    if notional <= 0.0:
+    if not math.isfinite(notional) or notional <= 0.0:
         return None
-    return float(pre_fee_pnl) / notional * 10_000.0
+    pnl = float(pre_fee_pnl)
+    if not math.isfinite(pnl):
+        return None
+    edge = pnl / notional * 10_000.0
+    return edge if math.isfinite(edge) else None
 
 
 @dataclass(frozen=True)
