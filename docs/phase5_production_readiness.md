@@ -424,6 +424,11 @@ python3 scripts/generate_readiness_report.py \
 # 6. Write a named bundle for an audit packet
 python3 scripts/generate_readiness_report.py \
   --report-dir reports/release-2026-10-24 --stem pre_live
+
+# 7. Is there any distance from the mid where a quote pays its fee? (§11.8)
+#    exit 0 a distance clears, 1 none does, 2 usage, 3 no priced print
+python3 scripts/run_edge_curve.py \
+  --source data/raw_l2/*.ndjson.gz --tick-size 0.1
 ```
 
 ### 5.2 How the evidence is produced
@@ -1281,3 +1286,110 @@ meeting.
 With `alpha.fee_wall` in the report, the promotion checklist in §10 cannot pass
 a study whose edge is smaller than the fee it will be charged, and the number
 that has to change is now named on every run.
+
+### 11.8 The edge curve: what a quote earns at each distance
+
+§11.6 measured the strategy's fills and §11.7 measured the fee against the
+spread. Both leave one question open, and it is the one that decides whether a
+maker can be viable on this instrument at *any* setting: **is there a distance
+from the mid at which a resting quote is paid more than its fee, and does the
+tape ever go there?**
+
+#### 11.8.1 The measurement, and what it is not
+
+`scripts/run_edge_curve.py` answers it with no strategy in the loop. For every
+print in a capture, an order resting `d` basis points on the passive side would
+have been filled if the print traded at or through its price; that hypothetical
+fill is marked from **the quote's own price** — a print that trades through us
+fills us at our limit, not at its own price — at the configured horizons, and
+the maker fee is subtracted. Each distance is then summarised by edge and by how
+often the tape reached it.
+
+Two boundaries matter, because they are what keep this from being a fantasy:
+
+- **The quote is re-anchored to the mid before every print.** That models a maker
+  that reprices on each update — which is what this engine does — and it is not
+  the same experiment as the hold-until-filled walk-forward of §11.6. A quote
+  that stays put is filled when the market walks to it, and those fills are the
+  adverse ones; §11.6 already measured them. The curve measures the other half:
+  what is available to a maker who keeps his distance.
+- **Queue position, latency and our size are not modelled.** All three make
+  fills less likely, never more, so the fill count is an upper bound and the
+  edge is a best case. A distance that fails here cannot be rescued upstream.
+
+#### 11.8.2 The curve on the committed tape
+
+151 s capture, 6,240 prints, 1,466 depth frames, tick `0.10`, median mid
+`81,389.95`, `2.0 bps` maker fee. `ticks` is that distance on the venue grid:
+
+| distance bps | ticks | fills | fills/min | `h=0` | `h=1s` | `h=1s` t | win % | `h=10s` |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `0.0125` | 1 | 3,111 | 1,249.7 | `+0.018` | `-0.801` | `-76.03` | 4 | `-1.201` |
+| `0.025` | 2 | 2,883 | 1,158.1 | `+0.031` | `-0.804` | `-73.06` | 5 | `-1.202` |
+| `0.05` | 4 | 2,703 | 1,085.8 | `+0.055` | `-0.794` | `-69.76` | 5 | `-1.172` |
+| `0.1` | 8 | 2,501 | 1,004.7 | `+0.104` | `-0.752` | `-63.81` | 6 | `-1.112` |
+| `0.25` | 20 | 1,961 | 787.8 | `+0.252` | `-0.632` | `-46.69` | 7 | `-0.947` |
+| `0.5` | 41 | 1,167 | 468.8 | `+0.510` | `-0.424` | `-22.96` | 22 | `-0.693` |
+| `1` | 81 | 231 | 92.8 | `+1.002` | `+0.131` | `+3.18` | 50 | `-0.604` |
+| `1.5` | 122 | **0** | 0.0 | — | — | — | — | — |
+| `2` | 163 | **0** | 0.0 | — | — | — | — | — |
+
+The `h=0` column is not an edge and is printed to keep the table honest: it
+reproduces the distance almost exactly (`+1.002` at `1 bps`) because a fill is
+marked against the mid it was quoted away from. The edge is what survives at
+`1 s`, and it is negative at every distance a re-quoting maker can actually
+reach except one.
+
+#### 11.8.3 What the shape says
+
+1. **At the touch, being filled is bad news.** One tick out, the 1 s markout is
+   `-0.80 bps` with `t = -76` and a 4 % win rate: 96 of every 100 fills are
+   under water one second later. This is the same conclusion §11.6.3 reached
+   from the strategy's own fills (`-0.404 bps`, 0 % win), measured from the
+   other direction and with 100x the sample.
+2. **Distance is the only thing that improves it**, and it improves slowly:
+   `-0.80` at the touch, `-0.42` at 41 ticks, `+0.13` at 81 ticks. The market
+   reaches a distant quote only when it is genuinely going somewhere, so the
+   adverse selection is priced in — but 87 % of the `1 bps` offset is gone by
+   the time the fill is one second old.
+3. **The tape never went further.** At `1.5 bps` (122 ticks, `12.2 USDT`) and
+   beyond, there were **zero** fills in 149 s: the mid never traded that far from
+   where a quote would have rested. So the widest row of §11.7.2 — a `4.83 bps`
+   half-spread that produced 11 fills and 0 round trips — is not a distance a
+   re-quoting maker can reach; those fills exist only because the quote stayed
+   put and the market walked into it, which is the adverse case again.
+4. **The ceiling is therefore ~0.13 bps, not ~0.85 bps.** The best cell in the
+   table is `+0.131 bps` at `1 s` on 231 fills, and it is `-0.604 bps` by `10 s`.
+   Any maker fee above `0.13 bps` loses money on this tape at every distance and
+   every width. Retail VIP 0 charges `2.0 bps`, fifteen times the whole edge.
+
+#### 11.8.4 What this changes, and what it does not
+
+It does not change the verdict: `alpha.fee_wall` still fails, and it should. What
+it changes is *what the failure means*. Before this measurement the wall was
+argued from the spread and the fee schedule (§11.7.1) and a diagnostic `k` sweep
+whose wide rows were a boundary mark (§11.7.2). It is now a measured ceiling on
+the tape: **the best distance-and-fee pair this capture allows is `1 bps` of
+quote offset against a maker fee below `0.13 bps`**, and the tape never reached
+the distances where a retail fee could be earned back.
+
+That reframes the business case into something testable rather than tunable:
+
+- A fee tier at or below `0.1 bps` — a volume tier, a rebate programme, or a
+  venue with a wider grid — is the prerequisite. It cannot be produced by
+  parameter search, and no `k` sweep will find it.
+- If such a tier exists, the first thing to re-run is this curve on the venue's
+  own tape: the distance it names is the one to quote at, and `fills/min` is
+  the inventory the desk has to be able to work out inside `10 s`, where the
+  markout is already negative.
+- A different instrument is the other lever. The curve is per-capture and takes
+  any `--source`; the same command on a book whose spread is several bps wide
+  is the measurement that decides whether the same code can trade it.
+
+```bash
+# the curve on the committed tape, with the venue's real grid
+python3 scripts/run_edge_curve.py \
+  --source data/raw_l2/binance_futures_btcusdt_depth_100ms_trade_20261029T163929Z_00001.ndjson.gz \
+  --tick-size 0.1 --distances-bps 0.0125,0.025,0.05,0.1,0.25,0.5,1,1.5,2
+# exit 0 a distance clears, 1 none does, 2 usage, 3 no priced print
+```

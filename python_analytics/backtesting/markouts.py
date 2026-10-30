@@ -58,6 +58,7 @@ __all__ = [
     "horizon_label",
     "load_fills",
     "markout_verdict",
+    "message_ts_ns",
     "parse_fill_payload",
     "render_markdown",
     "resolve_markouts",
@@ -324,6 +325,21 @@ class MarkoutTimeline:
             return None
         return self._ts[index], self._mid[index], self._spread[index]
 
+    def strictly_before(self, ts_ns: int) -> Optional[Tuple[int, float, float]]:
+        """Last sample strictly before ``ts_ns`` as ``(ts, mid, spread_bps)``.
+
+        The strict form is what a *pre-trade* decision needs. A depth frame and
+        a print can carry the same venue millisecond, and the frame is archived
+        after the print only by arrival order: taking ``at_or_before`` there
+        can price a quote at a mid that already contains the print it is being
+        quoted against. That is look-ahead with a millisecond of disguise, so
+        anything that places an order before an event reads this instead.
+        """
+        index = bisect_left(self._ts, int(ts_ns)) - 1
+        if index < 0:
+            return None
+        return self._ts[index], self._mid[index], self._spread[index]
+
     def at_or_after(self, ts_ns: int) -> Optional[Tuple[int, float, float]]:
         """First sample at or after ``ts_ns`` as ``(ts, mid, spread_bps)``."""
         index = bisect_left(self._ts, int(ts_ns))
@@ -399,7 +415,7 @@ class TopOfBook:
         return (ask - bid) / mid * 10_000.0
 
 
-def _message_ts_ns(message: Mapping[str, Any]) -> Optional[int]:
+def message_ts_ns(message: Mapping[str, Any]) -> Optional[int]:
     """Extracts a venue timestamp from a raw feed message, in nanoseconds.
 
     ``E``/``T`` are Binance's millisecond fields; ``ts_ns``/``timestamp_ns`` are
@@ -489,7 +505,7 @@ class _TimelineBuilder:
                     continue
 
             kind = str(message.get("e") or message.get("type") or "")
-            ts_ns = _message_ts_ns(message)
+            ts_ns = message_ts_ns(message)
 
             if kind == "depthUpdate" or ("b" in message and "a" in message
                                          and isinstance(message.get("b"), list)):

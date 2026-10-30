@@ -64,6 +64,12 @@ used at the orchestration/analytics boundary.
   later, signed by side, subtracts the fee and returns GO / MARGINAL / COSTLY /
   ADVERSE_SELECTION — the difference between "the fees ate the edge" and "the
   quote was picked off".
+- **Edge curve** (`python_analytics/backtesting/edge_curve.py` +
+  `scripts/run_edge_curve.py`): with no strategy in the loop, measures what a
+  quote resting `d` bps from the mid would have earned on a capture and how
+  often the tape reached that far. It returns the distance at which a maker fee
+  is actually paid back, or says that no distance in the grid is — the
+  difference between "tune harder" and "this fee tier cannot be traded".
 
 ## Phase status
 
@@ -108,6 +114,7 @@ python3 scripts/generate_readiness_report.py
 │   ├── ingest_l2.py          # real-time L2 capture -> gzip NDJSON roll files
 │   ├── run_walk_forward.py   # Phase 4 OOS study + parameter lock
 │   ├── run_markout.py        # per-fill markout: spread capture vs adverse selection
+│   ├── run_edge_curve.py     # what a quote earns at each distance from the mid
 │   ├── generate_readiness_report.py  # Phase 5 GO/NO-GO gate
 │   └── run_benchmark.py      # tick-to-quote latency benchmark
 ├── docs/
@@ -1225,6 +1232,34 @@ was posted inside the touch, while live `post_only` (`timeInForce=GTX`) would
 have rejected it. Whether the quote can be made to rest passively *and* clear 2
 bps is the open question for the next study — markout is what makes it
 answerable.
+
+### Edge curve: is there any distance at which the fee is paid back?
+
+Every markout answer so far is a sentence about the fills a strategy happened to
+get. `scripts/run_edge_curve.py` asks the prior question with no strategy in the
+loop: for every print in a capture, an order resting `d` bps on the passive side
+would have filled if the print reached it, and the fill is marked from the
+quote's own price at each horizon. The output is edge against distance, plus the
+fill rate still available out there.
+
+On the committed 151 s tape (6,240 prints, tick `0.10`, `2.0 bps` maker fee):
+
+| distance bps | ticks | fills | fills/min | 1 s mean | net of fee |
+| --- | --- | --- | --- | --- | --- |
+| 0.0125 | 1 | 3,111 | 1,249.7 | −0.801 | −2.801 |
+| 0.1 | 8 | 2,501 | 1,004.7 | −0.752 | −2.752 |
+| 0.5 | 41 | 1,167 | 468.8 | −0.424 | −2.424 |
+| 1 | 81 | 231 | 92.8 | **+0.131** | −1.869 |
+| 1.5 | 122 | 0 | 0.0 | — | — |
+| 2 | 163 | 0 | 0.0 | — | — |
+
+Verdict `NO_CLEARING_DISTANCE`: the only distance that earns anything at 1 s is
+`1 bps` out (`+0.13 bps`, t `+3.18`), and the tape never reaches `1.5 bps` at
+all, so nothing wider can be quoted. Any maker fee above `0.13 bps` loses money
+on this tape at every distance — the retail `2 bps` is fifteen times the whole
+edge. That is a fee-tier and instrument conclusion, not a parameter one, and
+[`docs/phase5_production_readiness.md` §11.8](docs/phase5_production_readiness.md#118-the-edge-curve-what-a-quote-earns-at-each-distance)
+works it through in full.
 
 ### Continuous integration
 

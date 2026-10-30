@@ -1,0 +1,333 @@
+"""Unit tests for the edge curve.
+
+The curve exists to answer one question — at what distance from the mid does a
+resting quote clear its fee, and how often does the tape reach there — so each
+test pins one of the ways that answer could be wrong: a fill booked where the
+print never reached, an edge measured from the print instead of the quote, a mid
+read from a frame that arrived after the print, an aggressor side read backwards,
+or a verdict that clears a distance the sample count cannot support.
+"""
+from __future__ import annotations
+
+import importlib.util
+import json
+from pathlib import Path
+
+import pytest
+
+from python_analytics.backtesting.edge_curve import (
+    EdgeCurveConfig,
+    TapePrint,
+    edge_curve_verdict,
+    measure_edge_curve,
+    quote_price,
+    render_markdown,
+    scan_tape,
+)
+from python_analytics.backtesting.markouts import MarkoutTimeline, build_timeline
+
+BASE_MS = 1_700_000_000_000
+ROOT = Path(__file__).resolve().parents[2]
+SCRIPT = ROOT / "scripts" / "run_edge_curve.py"
+SAMPLE = ROOT / "data" / "sample_events.ndjson"
+
+
+def _load_script():
+    """Imports the runner so its exit codes can be asserted in-process."""
+    spec = importlib.util.spec_from_file_location("run_edge_curve", SCRIPT)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
+def _snapshot(ts_ms: int, bid: float, ask: float) -> str:
+    """An absolute book snapshot, the form the timeline builder reads directly."""
+    return json.dumps({
+        "lastUpdateId": ts_ms,
+        "bids": [[f"{bid:.2f}", "1.0"]],
+        "asks": [[f"{ask:.2f}", "1.0"]],
+        "E": BASE_MS + ts_ms,
+    })
+
+
+def _print(ts_ms: int, price: float, quantity: float = 0.1,
+           buyer_is_maker: bool = True) -> str:
+    """A trade frame. ``buyer_is_maker`` is the venue's ``m`` flag."""
+    return json.dumps({
+        "e": "trade",
+        "E": BASE_MS + ts_ms,
+        "T": BASE_MS + ts_ms,
+        "s": "BTCUSDT",
+        "p": f"{price:.3f}",
+        "q": f"{quantity:.3f}",
+        "m": buyer_is_maker,
+    })
+
+
+def _config(**overrides) -> EdgeCurveConfig:
+    defaults = dict(
+        distances_bps=(0.5, 1.0, 2.0),
+        horizons_s=(0.0, 1.0),
+        tolerance_s=2.0,
+        maker_bps=2.0,
+        tick_size=0.01,
+        min_samples=1,
+    )
+    defaults.update(overrides)
+    return EdgeCurveConfig(**defaults)
+
+
+def _curve(lines, config=None):
+    timeline = build_timeline(lines)
+    scan = scan_tape(lines)
+    config = config or _config()
+    return measure_edge_curve(scan, timeline, config), config
+
+
+def test_a_quote_is_only_filled_by_a_print_that_reaches_it() -> None:
+    """Mid 100, one print at 99.99: it reaches 1 bps (99.99), not 2 bps (99.98).
+
+    This is the property the whole curve rests on. If a print filled every
+    distance, the curve would report an infinite fill rate and a flat edge at
+    every offset, and the fee comparison would be meaningless.
+    """
+    lines = [
+        _snapshot(1_000, 99.99, 100.01),
+        _print(1_100, 99.99),
+        _snapshot(2_500, 99.99, 100.01),
+    ]
+    summary, _ = _curve(lines)
+    fills = {row["distance_bps"]: row["fills"] for row in summary["rows"]}
+    assert fills == {0.5: 1, 1.0: 1, 2.0: 0}
+
+
+def test_the_markout_is_measured_from_the_quote_and_not_from_the_print() -> None:
+    """A print that trades through us fills us at our limit, not at its price.
+
+    The print is at 99.985 and the resting bid at 99.99, so booking the edge from
+    the print would claim 0.5 bps the order never captured — the difference
+    between "the market traded below me" and "I bought there".
+    """
+    lines = [
+        _snapshot(1_000, 99.99, 100.01),
+        _print(1_100, 99.985),
+        _snapshot(2_200, 100.01, 100.03),
+    ]
+    summary, _ = _curve(lines, _config(distances_bps=(1.0,)))
+    row = summary["rows"][0]
+    expected = (100.02 - 99.99) / 99.99 * 10_000.0
+    assert row["horizons"]["1s"]["mean_bps"] == pytest.approx(expected, rel=0, abs=1e-9)
+    assert row["horizons"]["1s"]["mean_bps"] != pytest.approx(3.5, rel=0, abs=1e-3)
+
+
+def test_a_print_is_priced_against_a_mid_that_arrived_before_it() -> None:
+    """A depth frame stamped at the print's own millisecond is not the entry mid.
+
+    Both frames carry the same venue millisecond and only their arrival order
+    separates them. Pricing the quote from that frame would place it at 89.99
+    around a mid of 90, and the print at 99.9 could not reach it — so the fill
+    count, not just the markout, is what proves which mid was read.
+    """
+    lines = [
+        _snapshot(1_000, 99.99, 100.01),
+        _print(2_000, 99.90),
+        _snapshot(2_000, 89.99, 90.01),
+    ]
+    summary, _ = _curve(lines, _config(distances_bps=(1.0,)))
+    assert summary["rows"][0]["fills"] == 1
+
+
+def test_the_agreeing_side_is_the_one_that_rests() -> None:
+    """``m = true`` is a sell aggressor, so a bid is the order that fills.
+
+    Reading the flag backwards would rest the wrong side and invert every edge
+    on the curve, so the two prints below must fill disjoint distances.
+    """
+    down = scan_tape([_print(1_100, 99.99, buyer_is_maker=True)])
+    up = scan_tape([_print(1_100, 100.01, buyer_is_maker=False)])
+    assert down.prints[0].aggressor == "SELL"
+    assert up.prints[0].aggressor == "BUY"
+
+    assert quote_price(100.0, 1.0, buy=True, tick_size=0.01) == pytest.approx(
+        99.99, rel=0, abs=1e-9)
+    assert quote_price(100.0, 1.0, buy=False, tick_size=0.01) == pytest.approx(
+        100.01, rel=0, abs=1e-9)
+
+    lines = [
+        _snapshot(1_000, 99.99, 100.01),
+        _print(1_100, 99.99, buyer_is_maker=True),
+        _print(1_200, 100.01, buyer_is_maker=False),
+        _snapshot(2_500, 99.99, 100.01),
+    ]
+    summary, _ = _curve(lines, _config(distances_bps=(1.0,), horizons_s=(0.0,)))
+    # One print fills the bid at 99.99, the other fills the ask at 100.01.
+    assert summary["rows"][0]["fills"] == 2
+
+
+def test_a_buy_quote_snaps_down_and_a_sell_quote_snaps_up() -> None:
+    """Quantisation can only widen: a coarse grid never improves an edge."""
+    # ``9999 * 0.01`` is not exactly 99.99 in binary, so the snapped price is
+    # compared at an absolute tolerance far below a tick.
+    assert quote_price(100.0, 0.05, buy=True, tick_size=0.01) == pytest.approx(
+        99.99, rel=0, abs=1e-9)
+    assert quote_price(100.0, 0.05, buy=False, tick_size=0.01) == pytest.approx(
+        100.01, rel=0, abs=1e-9)
+    # Without a grid the exact distance is used.
+    assert quote_price(100.0, 1.0, buy=True) == pytest.approx(99.99, rel=0, abs=1e-12)
+
+
+def test_the_verdict_clears_the_first_distance_the_tape_pays_for() -> None:
+    """A mid that runs away from the quote clears the fee at every reached distance."""
+    lines = [
+        _snapshot(1_000, 99.99, 100.01),
+        _print(1_100, 99.99),
+        _snapshot(2_200, 101.00, 101.02),
+    ]
+    summary, config = _curve(lines, _config(min_samples=1))
+    verdict = edge_curve_verdict(summary, config)
+    assert verdict["verdict"] == "CLEARS"
+    assert verdict["distance_bps"] == 0.5
+    assert verdict["net_bps"] > 0.0
+
+    markdown = "\n".join(render_markdown(summary, verdict))
+    assert "**CLEARS**" in markdown
+    assert "What this does not prove" in markdown
+
+
+def test_the_verdict_refuses_a_distance_the_fee_eats() -> None:
+    """A mid that drifts against the quote leaves nothing to pay the fee with."""
+    lines = [
+        _snapshot(1_000, 99.99, 100.01),
+        _print(1_100, 99.99),
+        _snapshot(2_200, 99.50, 99.52),
+    ]
+    summary, config = _curve(lines, _config(min_samples=1))
+    verdict = edge_curve_verdict(summary, config)
+    assert verdict["verdict"] == "NO_CLEARING_DISTANCE"
+    assert verdict["distance_bps"] is None
+    assert any("no distance in the grid cleared" in reason
+               for reason in verdict["reasons"])
+
+
+def test_a_distance_needs_its_sample_count_before_it_can_clear() -> None:
+    """One lucky fill is not a distance that clears: the bar is a sample count."""
+    lines = [
+        _snapshot(1_000, 99.99, 100.01),
+        _print(1_100, 99.99),
+        _snapshot(2_200, 101.00, 101.02),
+    ]
+    summary, config = _curve(lines, _config(min_samples=30))
+    verdict = edge_curve_verdict(summary, config)
+    assert verdict["verdict"] == "NO_CLEARING_DISTANCE"
+    assert any("produced the 30 fills" in reason for reason in verdict["reasons"])
+
+
+def test_fill_rate_is_reported_per_minute_of_tape() -> None:
+    """Two fills 60 s apart on a two-minute tape is one fill per minute."""
+    lines = [
+        _snapshot(1_000, 99.99, 100.01),
+        _print(1_100, 99.99),
+        _print(61_100, 99.99),
+        _snapshot(121_100, 99.99, 100.01),
+    ]
+    summary, _ = _curve(lines, _config(distances_bps=(1.0,), horizons_s=(0.0,)))
+    row = summary["rows"][0]
+    assert row["fills"] == 2
+    assert row["fills_per_min"] == pytest.approx(2.0, rel=1e-6)
+
+
+def test_prints_without_a_side_flag_or_a_usable_price_are_refused() -> None:
+    """A frame without ``m`` cannot name an aggressor, so it is counted, not guessed."""
+    scan = scan_tape([
+        json.dumps({"e": "trade", "E": BASE_MS, "T": BASE_MS, "s": "BTCUSDT",
+                    "p": "100.0", "q": "1.0"}),
+        json.dumps({"e": "trade", "E": BASE_MS, "T": BASE_MS, "s": "BTCUSDT",
+                    "p": "0", "q": "1.0", "m": True}),
+        json.dumps({"e": "aggTrade", "E": BASE_MS, "T": BASE_MS, "s": "BTCUSDT",
+                    "p": "100.0", "q": "1.0", "m": False}),
+        "not json",
+    ])
+    assert [print_.aggressor for print_ in scan.prints] == ["BUY"]
+    assert scan.malformed == 3
+
+
+def test_prints_for_another_market_are_never_blended_in() -> None:
+    """An ETH print marked against a BTC mid is a fabricated number."""
+    scan = scan_tape([
+        _print(1_100, 99.99),
+        json.dumps({"e": "trade", "E": BASE_MS + 1_200, "T": BASE_MS + 1_200,
+                    "s": "ETHUSDT", "p": "3000.0", "q": "1.0", "m": True}),
+    ])
+    assert len(scan.prints) == 1
+    assert scan.ignored == 1
+
+
+def test_a_quote_that_cannot_be_priced_is_dropped_not_guessed() -> None:
+    """A distance wider than the mid would give a negative price; that is ``None``."""
+    assert quote_price(0.5, 20_000.0, buy=True) is None
+    with pytest.raises(ValueError):
+        EdgeCurveConfig(distances_bps=(0.0,))
+    with pytest.raises(ValueError):
+        EdgeCurveConfig(primary_horizon_s=42.0)
+
+
+def test_an_empty_tape_is_reported_as_no_data() -> None:
+    """No priced print is not a verdict about the fee, and must not read as one."""
+    timeline = MarkoutTimeline()
+    summary = measure_edge_curve(scan_tape([]), timeline, _config())
+    verdict = edge_curve_verdict(summary, _config())
+    assert verdict["verdict"] == "NO_DATA"
+    assert verdict["distance_bps"] is None
+
+
+def test_a_print_constructor_refuses_a_missing_side() -> None:
+    """A defaulted side would silently invert the sign of an edge."""
+    with pytest.raises(ValueError):
+        TapePrint(ts_ns=1, price=100.0, quantity=1.0, aggressor="sideways")
+
+
+def test_the_runner_exits_three_on_a_capture_with_no_prints() -> None:
+    """A depth-only capture prices nothing, and must not report "no" as a verdict."""
+    script = _load_script()
+    assert script.main(["--source", str(SAMPLE), "--no-report"]) == 3
+
+
+def test_the_runner_exits_zero_when_a_distance_clears_the_fee(tmp_path) -> None:
+    """A mid that runs away from the quote is a measured GO, and writes the bundle."""
+    capture = tmp_path / "runaway.ndjson"
+    capture.write_text("\n".join([
+        _snapshot(1_000, 99.99, 100.01),
+        _print(1_100, 99.99),
+        _snapshot(2_200, 101.00, 101.02),
+    ]) + "\n", encoding="utf-8")
+    script = _load_script()
+    code = script.main([
+        "--source", str(capture), "--tick-size", "0.01",
+        "--distances-bps", "0.5,1", "--min-samples", "1",
+        "--report-dir", str(tmp_path), "--stem", "edge",
+    ])
+    assert code == 0
+    for suffix in (".json", ".md", ".csv"):
+        assert (tmp_path / f"edge{suffix}").exists()
+
+
+def test_the_runner_exits_one_when_no_distance_clears(tmp_path) -> None:
+    """A mid that drifts against the quote is a measured NO, not an error."""
+    capture = tmp_path / "adverse.ndjson"
+    capture.write_text("\n".join([
+        _snapshot(1_000, 99.99, 100.01),
+        _print(1_100, 99.99),
+        _snapshot(2_200, 99.50, 99.52),
+    ]) + "\n", encoding="utf-8")
+    script = _load_script()
+    assert script.main([
+        "--source", str(capture), "--tick-size", "0.01",
+        "--distances-bps", "0.5,1", "--min-samples", "1", "--no-report",
+    ]) == 1
+
+
+def test_the_runner_refuses_a_missing_capture() -> None:
+    """A path that does not exist is a usage error, never an empty study."""
+    script = _load_script()
+    assert script.main(["--source", "does-not-exist.ndjson.gz", "--no-report"]) == 2
