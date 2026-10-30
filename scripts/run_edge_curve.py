@@ -126,7 +126,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             tick_size=float(args.tick_size),
             min_samples=int(args.min_samples),
         )
-    except (FileNotFoundError, ValueError) as exc:
+    except (FileNotFoundError, ValueError, argparse.ArgumentTypeError) as exc:
+        # ``ArgumentTypeError`` is not a ``ValueError``, and a bare traceback
+        # would exit 1 -- the code this runner reserves for "no distance clears".
         print(f"usage: {exc}", file=sys.stderr)
         return EXIT_USAGE
 

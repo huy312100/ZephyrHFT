@@ -1313,9 +1313,13 @@ Two boundaries matter, because they are what keep this from being a fantasy:
   that stays put is filled when the market walks to it, and those fills are the
   adverse ones; §11.6 already measured them. The curve measures the other half:
   what is available to a maker who keeps his distance.
-- **Queue position, latency and our size are not modelled.** All three make
-  fills less likely, never more, so the fill count is an upper bound and the
-  edge is a best case. A distance that fails here cannot be rescued upstream.
+- **Queue position, latency and our size are not modelled.** None of the three
+  is neutral. A quote re-priced from a stale mid — what a real maker posts while
+  it waits for its next update — can be reached by a print the idealised quote
+  would have moved away from, so latency can raise the fill count as well as
+  lower it, and the fills it changes are not the same fills: their markout moves
+  too. The curve is therefore conditional on its fill rule (the price on our
+  side is the mid before the print) and is not an execution estimate.
 
 #### 11.8.2 The first tape: 151 s, and what it could not see
 
@@ -1337,11 +1341,13 @@ marked against the mid it was quoted away from.
 
 This first run read two things into that table: that `1 bps` was the only
 distance that paid, and that the tape never reached `1.5 bps` or beyond. **Both
-were artefacts of a two-and-a-half-minute window**, and 15 more minutes were
-enough to show it: `1.5` and `2 bps` fill (38,694 and 25,637 times), and `+0.13
-bps` at `1 bps` does not survive three hours. The smoke test stays in this
-document because deleting it would hide the lesson — a 151 s capture cannot
-separate a plateau from a regime, which is exactly what §11.6.5 warned about.
+were artefacts of a two-and-a-half-minute window.** A single 15-minute roll was
+already enough to falsify them — `1.5` and `2 bps` fill, and `1 bps` is `-1.43`
+at `1 s` in that roll — and the 3 h 20 m capture in §11.8.3 confirms it: `1.5`
+and `2 bps` fill (38,694 and 25,637 times) and `+0.13 bps` at `1 bps` does not
+survive. The smoke test stays in this document because deleting it would hide
+the lesson — a 151 s capture cannot separate a plateau from a regime, which is
+exactly what §11.6.5 warned about.
 
 #### 11.8.3 Three hours of the same instrument
 

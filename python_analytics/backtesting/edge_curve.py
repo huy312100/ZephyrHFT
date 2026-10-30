@@ -31,10 +31,16 @@ measures whether the tape ever goes there.
 What this does not model
 ------------------------
 Queue position, our own size against the print's size, latency, and the effect
-our resting order has on the book are all outside this number. Every one of them
-makes fills *less* likely, never more, so the curve is an upper bound on fill
-rate and a best case on edge: a distance that does not clear the fee here cannot
-be rescued by anything this model leaves out.
+our resting order has on the book are all outside this number. None of them is
+neutral. A quote re-priced from a *stale* mid, which is what a real maker posts
+while it is waiting for its next update, can be reached by a print the idealised
+quote would have moved away from, so latency can raise the fill count as well as
+lower it, and the fills it changes are not the same fills: their markout moves
+too. The number here is therefore conditional on this fill rule — the price on
+our side being the mid before the print — and is not an execution estimate. A
+distance that loses on this curve has no measured edge under the idealised
+rule; whether a different execution model would find one is a separate
+measurement, not a deduction from this one.
 
 Scale
 -----
@@ -232,6 +238,14 @@ class EdgeCurveConfig:
         horizons = tuple(sorted({float(value) for value in self.horizons_s}))
         if not horizons or horizons[0] < 0.0:
             raise ValueError("horizons_s must be non-negative")
+        # Two horizons that print as the same label would pool their markouts
+        # under one report key, so fifteen fills could satisfy a 30-sample bar
+        # and "clear" a distance on half the evidence it claims.
+        labels = [horizon_label(value) for value in horizons]
+        if len(set(labels)) != len(labels):
+            raise ValueError(
+                f"horizons_s has horizons that share a label: {labels}; "
+                "their markouts would be pooled")
         if float(self.tolerance_s) <= 0.0:
             raise ValueError("tolerance_s must be > 0")
         if float(self.tick_size) < 0.0:
@@ -538,8 +552,10 @@ def edge_curve_verdict(summary: Mapping[str, Any],
                     f"{min(float(row['distance_bps']) for row in rows):g} bps "
                     f"while a quote was resting")
     reasons.append(
-        "queue position, latency and our own size are not modelled: fills are an "
-        "upper bound, so a distance that fails here cannot be rescued upstream")
+        "queue position, latency and our own size are not modelled: the fill "
+        "count is not an execution estimate, and those effects change both how "
+        "often a quote fills and what the fills that remain are worth, so read "
+        "the edge as conditional on the idealised fill rule")
     return {
         "verdict": verdict,
         "primary_horizon": label,
@@ -614,8 +630,11 @@ def render_markdown(summary: Mapping[str, Any], verdict: Mapping[str, Any]) -> L
         "",
         "## What this does not prove",
         "",
-        "- Queue position, latency and our own size are not modelled, so the fill",
-        "  count is an upper bound and the edge is a best case.",
+        "- Queue position, latency and our own size are not modelled. None is",
+        "  neutral: a quote re-priced from a stale mid can be reached by a print",
+        "  the idealised quote would have moved away from, so the fill count here",
+        "  is not an execution estimate and the surviving fills' markout moves",
+        "  with the execution model.",
         "- A distance whose quote would sit inside the touch would compete for the",
         "  front of the queue first; being filled there is not guaranteed.",
         "- One tape is one regime: the curve says what was reachable while this",

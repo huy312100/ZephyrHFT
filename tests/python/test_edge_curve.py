@@ -322,6 +322,29 @@ def test_a_fill_with_no_mid_after_it_is_dropped_and_counted() -> None:
     assert "dropped" in markdown
 
 
+def test_two_horizons_that_share_a_report_key_are_refused() -> None:
+    """``1`` and ``1.0000001`` both print as ``1s``, so their marks would pool.
+
+    Pooled samples would let fifteen fills satisfy a 30-fill bar and clear a
+    distance on half the evidence the report claims, so the pairing is refused
+    before anything is measured.
+    """
+    with pytest.raises(ValueError):
+        EdgeCurveConfig(horizons_s=(1.0, 1.0000001))
+    with pytest.raises(ValueError):
+        # ``%g`` keeps six significant digits, so these two also print as ``2s``.
+        EdgeCurveConfig(horizons_s=(0.0, 2.0, 2.0000001))
+
+
+def test_the_runner_refuses_an_unparseable_list() -> None:
+    """``--horizons foo`` is a usage error, not a traceback and not a "no"."""
+    script = _load_script()
+    assert script.main(["--source", str(SAMPLE), "--horizons", "foo",
+                        "--no-report"]) == 2
+    assert script.main(["--source", str(SAMPLE), "--distances-bps", "1,,x",
+                        "--no-report"]) == 2
+
+
 def test_a_print_constructor_refuses_a_missing_side() -> None:
     """A defaulted side would silently invert the sign of an edge."""
     with pytest.raises(ValueError):
