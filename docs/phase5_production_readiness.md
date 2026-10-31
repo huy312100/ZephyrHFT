@@ -1471,7 +1471,11 @@ fee ceiling(d, h)    = markout(d, h)          # per side, where the net is zero
 ```
 
 That reframes every number above, and it is the arithmetic a fee tier has to
-survive. On the same 3 h capture, with the fee at `2.0 bps`:
+survive — **under the same idealised fill rule as every other number here**. The
+markout is what the mid did after a fill; a filter, a better queue position or a
+seeded book changes *which* fills happen and how many of them can be measured,
+not what the mid does afterwards, so none of them turns this into an execution
+estimate. On the same 3 h capture, with the fee at `2.0 bps`:
 
 | primary horizon | best **covered** distance | per-fill mean | round-trip net | fee ceiling |
 | --- | --- | --- | --- | --- |
@@ -1479,13 +1483,15 @@ survive. On the same 3 h capture, with the fee at `2.0 bps`:
 | `10 s` | `2 bps` (154 ticks) | `+0.121` | `-3.76 bps` | `+0.121 bps` |
 
 The `10 s` holding time is the only one with a positive fee ceiling, and it is
-`+0.12 bps` per side — a maker schedule at or below that, or nothing. Retail is
-`2.0 bps`, which is sixteen times too expensive for this tape.
+`+0.12 bps` per side on the rows with enough coverage — a maker schedule at or
+below that, under this fill rule, or nothing. Retail is `2.0 bps`, which is
+sixteen times too expensive for this tape.
 
 **Why the 4 bps cell in §11.8.3 is not the answer.** At `4 bps` and a `10 s`
 hold the tape pays `+2.12 bps` per fill and `+0.25 bps` per round trip — the only
-cell in the whole study that clears a retail fee. It is also computed on **7.3 %**
-of that distance's fills, and the coverage falls monotonically with distance:
+cell in the whole study that clears a retail fee. It is also the *best measured*
+cell, not a proven one: it is computed on **7.3 %** of that distance's fills, and
+coverage falls monotonically with distance:
 
 | distance | 0.0125 bps | 0.5 bps | 2 bps | 3 bps | 4 bps |
 | --- | --- | --- | --- | --- | --- |

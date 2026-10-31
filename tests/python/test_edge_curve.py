@@ -208,7 +208,7 @@ def test_the_verdict_refuses_a_distance_the_fee_eats() -> None:
     verdict = edge_curve_verdict(summary, config)
     assert verdict["verdict"] == "NO_CLEARING_DISTANCE"
     assert verdict["distance_bps"] is None
-    assert any("no distance in the grid cleared" in reason
+    assert any("none cleared" in reason and "covered distance" in reason
                for reason in verdict["reasons"])
 
 

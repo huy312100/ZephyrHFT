@@ -579,16 +579,29 @@ def edge_curve_verdict(summary: Mapping[str, Any],
         verdict = "NO_CLEARING_DISTANCE"
         if eligible:
             best = max(eligible, key=lambda row: _net_at(row, label))
+            # Every claim below is about the rows that passed *both* gates. A row
+            # excluded for coverage is described separately, so "no distance
+            # cleared" is never read as "every measured cell was negative".
             reasons.append(
-                f"no distance in the grid cleared the {config.maker_bps:g} bps fee "
-                f"at {label}; the best was {float(best['distance_bps']):g} bps "
+                f"among the {len(eligible)} covered distance(s) with at least "
+                f"{config.min_samples} samples, none cleared the "
+                f"{config.maker_bps:g} bps fee at {label}; the best was "
+                f"{float(best['distance_bps']):g} bps "
                 f"({float(best['distance_ticks'] or 0.0):.0f} ticks) with net "
                 f"{_net_at(best, label):+.2f} bps on {_samples_at(best, label)} fill(s)")
         else:
-            reachable = [
-                row for row in rows if _samples_at(row, label) > 0
+            reachable = [row for row in rows if _samples_at(row, label) > 0]
+            enough_samples = [
+                row for row in reachable
+                if _samples_at(row, label) >= config.min_samples
             ]
-            if reachable:
+            if enough_samples:
+                reasons.append(
+                    f"no distance could decide: {len(enough_samples)} had the "
+                    f"{config.min_samples} samples a verdict needs but not the "
+                    f"{config.min_coverage:.0%} coverage, and the rest had too few "
+                    f"samples at {label}")
+            elif reachable:
                 furthest = max(reachable, key=lambda row: float(row["distance_bps"]))
                 reasons.append(
                     f"the tape reached {float(furthest['distance_bps']):g} bps "
@@ -663,19 +676,19 @@ def edge_curve_verdict(summary: Mapping[str, Any],
             reasons.append(
                 f"a round trip at {round_trip['distance_bps']:g} bps nets "
                 f"{net:+.2f} bps after two {config.maker_bps:g} bps maker fees "
-                f"at {label}")
+                f"at {label} (covered rows only)")
         else:
             reasons.append(
-                f"no round trip clears two {config.maker_bps:g} bps maker fees: the "
-                f"best is {net:+.2f} bps at "
-                f"{round_trip['distance_bps']:g} bps, so every configuration here "
-                f"loses before inventory risk")
+                f"no round trip among the {len(round_trip_rows)} covered distance(s) "
+                f"clears two {config.maker_bps:g} bps maker fees: the best is "
+                f"{net:+.2f} bps at {round_trip['distance_bps']:g} bps")
     if best_ceiling is not None:
         reasons.append(
-            f"the fee ceiling is {round_trip['breakeven_maker_bps']:+.3f} bps per "
-            f"side at {round_trip['breakeven_distance_bps']:g} bps of quote offset "
-            f"({label}); a maker schedule above that cannot pay for a round trip "
-            f"on this tape, whatever the distance")
+            f"the fee ceiling for a covered round trip is "
+            f"{round_trip['breakeven_maker_bps']:+.3f} bps per side at "
+            f"{round_trip['breakeven_distance_bps']:g} bps of quote offset "
+            f"({label}, idealised fill rule); a maker schedule above that cannot "
+            f"pay for a round trip on this tape")
 
     return {
         "verdict": verdict,
