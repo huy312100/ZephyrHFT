@@ -64,11 +64,15 @@ data_ingestion:
   compression: gzip                # gzip | none
   compression_level: 1             # 1 = fastest (ingest path), 9 = smallest
   flush_interval_ms: 250           # max time a record waits in the write buffer
-  # Absolute book snapshot, fetched over REST and archived as the first line of
-  # each connection. A depth subscription is a *diff* stream: without a seed the
-  # reader has no mid until enough deltas arrive (113 s in the 3 h capture), and
-  # every fill in that window is unmarkable -- which is exactly where the far
-  # quotes trade. `false` (or `--no-snapshot`) captures the venue's stream only.
+  # Absolute book snapshot, fetched over REST with the socket already open and
+  # archived as the first line of each connection. A depth subscription is a
+  # *diff* stream: without a seed the reader has no mid until enough deltas
+  # arrive (113 s in the 3 h capture), and every fill in that window is
+  # unmarkable -- which is exactly where the far quotes trade. The frames that
+  # land during the REST round trip are dropped rather than archived, because
+  # the seed already contains them; the first frame beyond it then has to
+  # continue the seed's update-id range or the session reports a `handoff_gap`.
+  # `false` (or `--no-snapshot`) captures the venue's stream only, undropped.
   snapshot_on_connect: true
   # Depth must be one the venue serves, judged against the endpoint actually
   # dialled (`ws_base_url` if set, otherwise `exchange`'s default): USDⓈ-M

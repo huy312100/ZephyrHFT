@@ -196,6 +196,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     print(f"tape: {len(scan.prints)} print(s), {summary['tape']['matched']} priced, "
           f"{summary['tape']['unmatched']} without a mid, "
           f"{summary['tape']['span_s']:.1f} s")
+    print(f"mids: {summary['tape']['timeline_samples']} sample(s), "
+          f"{summary['tape']['timeline_max_gap_s']:.2f} s worst gap, "
+          f"{summary['tape']['timeline_stale']} delta(s) already in a seed, "
+          f"{summary['tape']['timeline_handoff_gaps']} seed(s) the stream did "
+          "not continue")
     print(f"fee: {config.maker_bps:.2f} bps maker | grid: "
           f"{', '.join(f'{value:g}' for value in config.distances_bps)} bps"
           + (f" | tick {config.tick_size:g}" if config.tick_size > 0 else ""))

@@ -57,15 +57,36 @@ the event loop, while compression, disk I/O and `fsync` are delegated to a worke
 thread. A slow disk therefore degrades *buffering*, never *completeness*.
 
 Each connection is seeded with one absolute depth snapshot from the venue's REST
-API, archived **before** the socket opens (`snapshot_on_connect`, `--no-snapshot`
-to disable). The depth feed is a *diff* stream, so a reader that starts empty —
-and every reader starts empty, including after a reconnect — has no mid until
-enough deltas arrive; in a 3 h capture that took 113 s, and every fill in the
-window was unmarkable (`docs/phase5_production_readiness.md` §11.8.7). The seed is
-an extra NDJSON line of the same shape as a REST book snapshot (`lastUpdateId`,
-`bids`, `asks`), annotated textually with the three things this capture knows and
-the venue's response does not send: a marker in `e` (next paragraph), its receive
-time (`E`; the USDⓈ-M snapshot has one, the spot snapshot has none) and its market
+API (`snapshot_on_connect`, `--no-snapshot` to disable). The depth feed is a *diff*
+stream, so a reader that starts empty — and every reader starts empty, including
+after a reconnect — has no mid until enough deltas arrive; in a 3 h capture that
+took 113 s, and every fill in the window was unmarkable
+(`docs/phase5_production_readiness.md` §11.8.7).
+
+The snapshot is fetched with the socket **already open**, which is the venue's
+own procedure for maintaining a local book, and it is what makes the handoff a
+check rather than an assumption. The frames the socket delivered while the REST
+request was in flight are on the socket, so each can be placed against the seed
+by its update ids: a frame whose last id (`u`) is at or below the seed's
+`lastUpdateId` is already in the archived book and is **dropped** — kept, it
+would sit *behind* the seed line that precedes it, and the mid timeline refuses
+a non-chronological file (that refusal is what forced this order). The first
+frame beyond the seed then has to *continue* it: the venue publishes the range
+each frame covers, so its first id (`U`) must be `lastUpdateId + 1` or lower. A
+higher `U` means updates went by on no socket, and a level one of them deleted
+is still in the book — a phantom best bid is a mid that is wrong in a way
+nothing downstream can see. That case is counted (`IngestStats.handoff_gaps`
+here, `MarkoutTimeline.handoff_gaps` in the analysis), never repaired by
+dropping market data. Measured on the live venue over 30 s: 537 records
+handled, 4 dropped as already seeded, 0 non-contiguous handoffs, and 533
+archived lines that ingest with `0 malformed, 0 gaps` and give the timeline a
+mid on its first line.
+
+The seed is an extra NDJSON line of the same shape as a REST book snapshot
+(`lastUpdateId`, `bids`, `asks`), annotated textually with the three things this
+capture knows and the venue's response does not send: a marker in `e` (next
+paragraph), its receive time (`E`; the USDⓈ-M snapshot has one, the spot snapshot
+has none) and its market
 (`s` — **neither** product names its symbol in this response, and an unlabelled
 line is the one record a mixed capture could attribute to the wrong book). The
 venue's own bytes are never re-serialised.

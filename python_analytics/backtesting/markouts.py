@@ -256,7 +256,7 @@ class MarkoutTimeline:
     """
 
     __slots__ = ("symbol", "_ts", "_mid", "_spread", "malformed", "ignored",
-                 "stale")
+                 "stale", "handoff_gaps")
 
     def __init__(self, symbol: Optional[str] = None) -> None:
         self.symbol = symbol
@@ -267,6 +267,15 @@ class MarkoutTimeline:
         self.ignored = 0
         #: Diff frames already contained in a snapshot that followed them.
         self.stale = 0
+        #: Seeds whose handoff the stream could not be matched to.
+        #:
+        #: A snapshot ending at update ``L`` and a first frame starting above
+        #: ``L + 1`` means the ids between them were on no socket, so a level
+        #: one of those updates *deleted* is still in the book -- a phantom best
+        #: bid is a mid that is not one. Counted rather than repaired: the
+        #: capture is written so this cannot happen (see ``ingest_l2.py``), which
+        #: is why a non-zero value here is evidence about the file, not the tape.
+        self.handoff_gaps = 0
 
     # ------------------------------------------------------------- building
     def add(self, ts_ns: int, mid: float, spread_bps: float = 0.0) -> bool:
@@ -487,6 +496,25 @@ def _update_id(message: Mapping[str, Any]) -> Optional[int]:
     return None
 
 
+def _first_id(message: Mapping[str, Any]) -> Optional[int]:
+    """The first update id in a diff frame's range, or ``None`` when it has none.
+
+    The last id says a frame is *newer* than a snapshot; only the first id says
+    nothing was skipped on the way there. Both products spell it ``U``. Without
+    it a snapshot-to-stream handoff can be tested for overlap but never for
+    contiguity, and the difference is exactly the update that deleted a level.
+    """
+    for key in ("U", "first_update_id", "F"):
+        raw = message.get(key)
+        if raw is None or isinstance(raw, bool):
+            continue
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
 class _TimelineBuilder:
     """Stateful feed parser: one book, one ticker, one timeline.
 
@@ -497,14 +525,15 @@ class _TimelineBuilder:
     from half a book is not a measurement, it is a fabrication.
 
     A snapshot seeds the ladder, and the frames it already contains are
-    discarded: the REST request that produced the seed finished *before* the
-    stream was read, so a frame whose last update id is at or below the
-    snapshot's is already in the book. Applying it again moves a level twice,
-    which is exactly the "mid that is wrong but looks plausible" failure.
+    discarded: a frame whose last update id is at or below the snapshot's is
+    already in the book, and applying it again moves a level twice -- the "mid
+    that is wrong but looks plausible" failure. Discarding those is not the same
+    as proving the handoff, so the first frame the seed does *not* contain is
+    checked against its own range as well: see :attr:`MarkoutTimeline.handoff_gaps`.
     """
 
     __slots__ = ("timeline", "book", "ticker", "want", "explicit", "file_symbol",
-                 "snapshot_id")
+                 "snapshot_id", "handoff_checked")
 
     def __init__(self, symbol: Optional[str] = None) -> None:
         self.timeline = MarkoutTimeline(symbol=symbol)
@@ -516,6 +545,8 @@ class _TimelineBuilder:
         self.file_symbol: Optional[str] = None
         #: ``lastUpdateId`` of the newest snapshot applied, if any.
         self.snapshot_id: Optional[int] = None
+        #: Whether the frame that follows the current snapshot has been judged.
+        self.handoff_checked = False
 
     def feed(self, lines: Iterable[str]) -> MarkoutTimeline:
         """Applies one capture's lines to the running book and timeline."""
@@ -560,6 +591,18 @@ class _TimelineBuilder:
                     # move a level twice and report the result as a mid.
                     timeline.stale += 1
                     continue
+                if (self.snapshot_id is not None and not self.handoff_checked):
+                    # The first frame the seed does not already contain. Its
+                    # range must start at or before ``snapshot_id + 1``: if the
+                    # venue's ids jumped, the updates in the gap never reached
+                    # any socket, and a level one of them deleted is still in
+                    # the book. Contiguity is then unproven for every mid built
+                    # on this seed, which is why the gap is counted here rather
+                    # than assumed away by the discard above.
+                    self.handoff_checked = True
+                    first_id = _first_id(message)
+                    if first_id is None or first_id > self.snapshot_id + 1:
+                        timeline.handoff_gaps += 1
                 book.apply("BUY", message.get("b") or ())
                 book.apply("SELL", message.get("a") or ())
                 mid = book.mid
@@ -585,6 +628,9 @@ class _TimelineBuilder:
                     self.snapshot_id = int(message.get("lastUpdateId"))
                 except (TypeError, ValueError):
                     self.snapshot_id = None
+                # A new seed means a new handoff to judge, whatever the previous
+                # one looked like: reconnects archive one seed per connection.
+                self.handoff_checked = False
                 if ts_ns is None:
                     timeline.ignored += 1
                     continue

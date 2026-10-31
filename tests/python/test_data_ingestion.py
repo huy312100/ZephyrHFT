@@ -990,6 +990,9 @@ def test_client_reconnects_with_backoff_and_gives_up(tmp_path, monkeypatch) -> N
         def __aiter__(self) -> "_FailingSource":
             return self
 
+        async def open(self) -> None:
+            raise ConnectionError("socket closed")
+
         async def __anext__(self) -> Frame:
             raise ConnectionError("socket closed")
 
@@ -1009,12 +1012,13 @@ def test_client_reconnects_with_backoff_and_gives_up(tmp_path, monkeypatch) -> N
     assert stats.connections == 0
     assert stats.connect_failures == 3  # initial attempt + two retries
     assert stats.reconnects == 2
-    # A dead feed still archives the book it tried to capture: one seed per
-    # attempt, and no venue frames. The seed is what lets the analysis place the
-    # book in time, so it is recorded whether or not the socket ever opens.
-    assert stats.snapshots == 3
+    # A feed that never opened gets no seed. Archiving one per attempt used to be
+    # the behaviour, and it was worse than useless: a book snapshot with no
+    # stream after it is a mid with no market behind it, and the reconciliation
+    # below needs the socket to be delivering before the snapshot is fetched.
+    assert stats.snapshots == 0
     assert client.writer_stats is not None
-    assert client.writer_stats.records == 3
+    assert client.writer_stats.records == 0
     assert client.stats.depth_frames == 0
 
 
@@ -1186,64 +1190,179 @@ def test_the_seeded_file_builds_a_monotonic_timeline(tmp_path) -> None:
     assert timeline.max_gap_s < 1.0
 
 
-def test_a_live_session_seeds_before_it_reads_the_stream(tmp_path, monkeypatch) -> None:
-    """The call-site order is what keeps the archived file monotonic.
+def test_a_live_session_opens_the_socket_before_it_seeds(tmp_path, monkeypatch) -> None:
+    """The call-site order is what makes the handoff checkable at all.
 
-    A snapshot fetched *after* connecting carries a venue time later than the
-    frames the socket buffered while the HTTP round trip was in flight, so the
-    archive would hold a book stamped after the deltas that follow it and the mid
-    timeline would refuse the whole capture. Seeding first is the fix; this
-    drives ``run()`` so a future edit to that order cannot pass.
+    Binance's own procedure for a local book streams first and snapshots second,
+    so the frames that land during the HTTP round trip exist and can be reconciled
+    against the seed. Seeding before the socket opens also produced a monotonic
+    file, but the updates between its ``lastUpdateId`` and the first frame were on
+    no socket: nothing in the archive could tell a continuing book from one still
+    holding a level the market deleted. This drives ``run()`` through the whole
+    sequence -- redundant frame dropped, print kept, contiguous frame handoff --
+    so a future edit to that order cannot pass.
     """
     from python_analytics.backtesting.markouts import build_timeline
 
-    frame_ms = 1_700_000_000_400
+    frame_ms = 1_700_000_000_500
+    seed_ms = frame_ms - 300
+    order: List[str] = []
 
-    class _OneFrame:
-        """Yields one frame, then asks for the stop a reconnect would trigger.
+    class _ThreeFrames:
+        """Yields the frames a round trip buffers, then asks for the stop.
 
-        Ending the session cleanly matters: a second attempt would archive the
-        same old snapshot a second time, and the backward timestamp would be what
-        failed the test rather than what it is checking.
+        Ending the session cleanly matters: a second attempt would archive a
+        second seed, and the backward timestamp would be what failed the test
+        rather than what it is checking.
         """
 
         def __init__(self, client: L2IngestClient) -> None:
             self._client = client
-            self._done = False
+            self._left = (
+                # Arrived while the snapshot was in flight, and is inside it:
+                # archived, it would sit behind the seed that precedes it.
+                (seed_ms - 100, _depth(seed_ms - 100, U=4, u=5)),
+                # A print from the same window. Prints are the tape: the book
+                # being reconciled is no reason to lose one, and a print before
+                # the first mid is simply a print that cannot be marked yet.
+                (seed_ms - 50, _agg_trade(seed_ms - 50)),
+                # The first frame beyond the seed: its range starts at L + 1.
+                (frame_ms, _depth(frame_ms, U=6, u=7,
+                                  b=[["100.00", "2.0"]], a=[["100.50", "2.0"]])),
+            )
 
-        def __aiter__(self) -> "_OneFrame":
+        def __aiter__(self) -> "_ThreeFrames":
             return self
 
+        async def open(self) -> None:
+            order.append("open")
+            return None
+
         async def __anext__(self) -> Frame:
-            if self._done:
+            if not self._left:
                 self._client.request_stop()
                 raise StopAsyncIteration
-            self._done = True
-            return (frame_ms * NS_PER_MS,
-                    _depth(frame_ms, b=[["100.00", "2.0"]], a=[["100.50", "2.0"]]))
+            event_ms, raw = self._left[0]
+            self._left = self._left[1:]
+            return event_ms * NS_PER_MS, raw
 
         async def aclose(self) -> None:
             return None
 
-    monkeypatch.setattr(ingest_module, "_SocketFrames", _OneFrame)
+    monkeypatch.setattr(ingest_module, "_SocketFrames", _ThreeFrames)
+
+    def _fetch(url: str, timeout: float) -> str:
+        order.append("seed")
+        return _snapshot(event_ms=seed_ms, last_update_id=5)
+
     client = _client(
         tmp_path,
         settings=_settings(snapshot_limit=500),
-        snapshot_fetcher=lambda url, timeout: _snapshot(
-            event_ms=frame_ms - 300, last_update_id=1),
+        snapshot_fetcher=_fetch,
     )
     stats = asyncio.run(client.run())
 
+    # The procedure, not just its bookkeeping: connecting first is what puts the
+    # frames around the snapshot on the socket instead of in nobody's buffer.
+    assert order == ["open", "seed"]
     assert stats.snapshots == 1
+    assert stats.pre_handoff_drops == 1
+    assert stats.handoff_gaps == 0
+    # Received and archived are different counts: the dropped frame was real.
+    assert stats.frames == 4 and stats.stored == 3
+
     lines = [record for path in _roll_files(tmp_path) for record in _read_roll(path)]
-    assert len(lines) == 2
+    assert len(lines) == 3
     seed = json.loads(lines[0])
-    assert seed["lastUpdateId"] == 1 and seed["s"] == "BTCUSDT"
+    assert seed["lastUpdateId"] == 5 and seed["s"] == "BTCUSDT"
+    assert json.loads(lines[1])["e"] == "aggTrade"
+
     timeline = build_timeline(lines)
-    assert timeline.first_ts_ns == (frame_ms - 300) * NS_PER_MS
-    # The seed's own book, then the stream's: two samples, no stale discard.
+    assert timeline.first_ts_ns == seed_ms * NS_PER_MS
+    # The seed's own book, then the stream's: two samples, nothing discarded.
     assert len(timeline) == 2
     assert timeline.stale == 0
+    assert timeline.handoff_gaps == 0
+
+
+def test_a_non_contiguous_handoff_is_counted_not_silently_kept(tmp_path) -> None:
+    """The frame that continues the seed must start where the seed ended.
+
+    ``U`` ahead of ``lastUpdateId + 1`` means updates went by on no socket. The
+    frame is still archived -- dropping market data to hide a gap is the opposite
+    of what the capture is for -- but the session records that the book on the
+    other side of it is unproven.
+    """
+    client = _client(
+        tmp_path,
+        snapshot_fetcher=lambda url, timeout: _snapshot(last_update_id=5),
+    )
+
+    async def _session() -> None:
+        try:
+            await client._seed_snapshot()
+            await client.consume(_FrameSource([
+                (1_700_000_000_600 * NS_PER_MS,
+                 _depth(1_700_000_000_600, U=9, u=10,
+                        b=[["100.00", "2.0"]], a=[["100.50", "2.0"]])),
+            ]))
+        finally:
+            await client.aclose()
+
+    asyncio.run(_session())
+    assert client.stats.pre_handoff_drops == 0
+    assert client.stats.handoff_gaps == 1
+    lines = [record for path in _roll_files(tmp_path) for record in _read_roll(path)]
+    assert len(lines) == 2
+
+
+def test_a_depth_frame_with_no_update_id_is_archived_not_dropped(tmp_path) -> None:
+    """An id a capture cannot read is not a licence to delete a real update.
+
+    The window closes on the first depth frame either way, so a stream that names
+    no ids is archived exactly as it arrives: the honest failure is an
+    unreconciled book, not a missing one.
+    """
+    client = _client(
+        tmp_path,
+        snapshot_fetcher=lambda url, timeout: _snapshot(last_update_id=5),
+    )
+
+    async def _session() -> None:
+        try:
+            await client._seed_snapshot()
+            await client.consume(_FrameSource([
+                (1_700_000_000_600 * NS_PER_MS,
+                 _depth(1_700_000_000_600, U=None, u=None)),
+            ]))
+        finally:
+            await client.aclose()
+
+    asyncio.run(_session())
+    assert client.stats.pre_handoff_drops == 0
+    assert client.stats.handoff_gaps == 0
+    lines = [record for path in _roll_files(tmp_path) for record in _read_roll(path)]
+    assert len(lines) == 2
+
+
+def test_an_unseeded_session_drops_nothing(tmp_path) -> None:
+    """No seed means no book to be redundant with, so every frame is archived."""
+    client = _client(tmp_path, settings=_settings(snapshot_on_connect=False))
+
+    async def _session() -> None:
+        try:
+            await client._seed_snapshot()
+            await client.consume(_FrameSource([
+                (1_700_000_000_100 * NS_PER_MS, _depth(1_700_000_000_100, U=1, u=2)),
+            ]))
+        finally:
+            await client.aclose()
+
+    asyncio.run(_session())
+    assert client.stats.snapshots == 0
+    assert client.stats.pre_handoff_drops == 0
+    lines = [record for path in _roll_files(tmp_path) for record in _read_roll(path)]
+    assert len(lines) == 1
 
 
 def test_a_frame_already_contained_in_the_seed_is_not_applied_twice(tmp_path) -> None:

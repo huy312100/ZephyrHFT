@@ -175,6 +175,39 @@ def test_build_timeline_handles_snapshots_and_counts_junk() -> None:
     assert timeline.at_or_before(BASE_NS + 2_000_000)[1] == pytest.approx(201.0)
 
 
+def test_a_seed_the_stream_cannot_continue_is_reported_not_repaired() -> None:
+    """``u`` beyond the seed proves novelty; only ``U`` proves contiguity.
+
+    A snapshot ending at update 5 followed by a frame that starts at 9 means
+    updates 6..8 never reached the archive. If one of them deleted the best bid,
+    the seeded book still holds it and every mid built on it is wrong -- so the
+    timeline counts the exposure. It does not discard the samples: the fallback
+    is the blind book this seed exists to prevent, and a count the study can read
+    is worth more than a silent rollback.
+    """
+    seed = json.dumps({"lastUpdateId": 5, "E": BASE_MS,
+                       "bids": [["100.0", "1"]], "asks": [["102.0", "1"]]})
+    gap = json.dumps({"e": "depthUpdate", "E": BASE_MS + 100, "s": "BTCUSDT",
+                      "U": 9, "u": 10,
+                      "b": [["100.0", "1"]], "a": [["101.0", "1"]]})
+    contiguous = json.dumps({"e": "depthUpdate", "E": BASE_MS + 200,
+                             "s": "BTCUSDT", "U": 6, "u": 7,
+                             "b": [["100.0", "1"]], "a": [["101.0", "1"]]})
+    later = json.dumps({"e": "depthUpdate", "E": BASE_MS + 300, "s": "BTCUSDT",
+                        "U": 41, "u": 12,
+                        "b": [["100.0", "1"]], "a": [["101.0", "1"]]})
+
+    broken = build_timeline([seed, gap])
+    assert broken.handoff_gaps == 1
+    assert build_timeline([seed, contiguous]).handoff_gaps == 0
+    # Only the frame that first passes the seed is judged: by the time the stream
+    # has moved on, an id jump is the venue's own batching, not the handoff.
+    assert build_timeline([seed, contiguous, later]).handoff_gaps == 0
+    assert build_timeline([seed, gap, contiguous]).handoff_gaps == 1
+    # No seed at all: there is no handoff to establish, so nothing is counted.
+    assert build_timeline([gap]).handoff_gaps == 0
+
+
 def test_build_timeline_uses_a_book_ticker_when_there_is_no_ladder() -> None:
     lines = [json.dumps({"e": "bookTicker", "E": BASE_MS, "s": "BTCUSDT",
                          "b": "199.0", "a": "201.0"})]

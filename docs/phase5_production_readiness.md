@@ -1036,9 +1036,10 @@ cannot hold. Four properties matter:
   deployment must reseed from a REST snapshot (`seed_from_snapshot`) instead of
   trusting the near touch; the `depth20@100ms` partial-book stream is a
   snapshot-style exception and does not make the diff path safe. The *capture*
-  now does the same thing for the same reason (§11.8.7): `ingest_l2.py` archives
-  one REST depth snapshot per connection, before the socket opens, so a resumed
-  diff stream is never analysed against a book that does not exist yet.
+  now does the same thing for the same reason (§11.8.7): `ingest_l2.py` opens the
+  stream, archives one REST depth snapshot, and drops the deltas that snapshot
+  already contains, so a resumed diff stream is never analysed against a book
+  that does not exist yet — and never against one whose continuity is a guess.
 - **A frame is truncated toward the touch, not from the front.** `DepthUpdate`
   holds `kMaxDepthLevels` (32) levels per side, but a partial-book burst on this
   feed carries hundreds — one frame here listed 407 bids and 440 asks — and the
@@ -1519,23 +1520,38 @@ different kinds of problem:
    instrument whose quoted spread is several bps wide), not a parameter. No
    `k`, no filter and no queue position changes a number that is `2 * markout
    - 2 * fee`.
-2. **A capture that does not go blind where it matters.** The coverage gradient
+2. **Hours of tape from a capture that does not go blind.** The coverage gradient
    above is the reason the far cells cannot be trusted, and the direction of the
    resulting bias is **unmeasured** — the markouts that are missing are the ones
    nobody can compute, so it is a hole in the sample rather than a known skew.
-   The capture now archives one absolute REST depth snapshot per connection,
-   **before** the socket opens: fetched after connecting, its venue time lands
-   *after* the frames the socket buffered meanwhile, the mid timeline turns
-   non-monotonic, and the analysis refuses the file — which is how this was
-   found. It is recognised by an explicit marker (`"e":
+   The mechanism that closes it is now in place: the capture archives one
+   absolute REST depth snapshot per connection, fetched with the socket **already
+   open**, and drops the depth frames that landed during the REST round trip —
+   their update ids are at or below the seed's `lastUpdateId`, so they are already
+   in the archived book, and keeping them would write timestamps *behind* the seed
+   line that precedes them, which the mid timeline refuses (that refusal is how
+   this order was found).
+   The first frame *beyond* the seed is then checked rather than trusted: the
+   venue publishes the update-id range each frame covers, so a frame starting at
+   `lastUpdateId + 1` continues the seeded book and one starting above it means
+   updates went by on no socket — a level one of them deleted is still in the
+   book, and a phantom best bid is a mid that is wrong in a way nothing
+   downstream can see. Both sides count it (`IngestStats.handoff_gaps` at capture,
+   `MarkoutTimeline.handoff_gaps` at analysis). Measured on the live venue, 30 s:
+   537 records handled (one seed + 536 frames), 4 of them dropped as already
+   seeded, **0** non-contiguous handoffs, and an archive of 533 lines that
+   `phase1.archive_integrity` accepts with `0 malformed, 0 gaps` and the timeline
+   reads with `stale=0`, `handoff_gaps=0`, a mid in the first line and a 0.10 s
+   worst gap. The seed is recognised by an explicit marker (`"e":
    "zephyr.bookSnapshot"`), never by its shape: the spot partial-book *stream*
    sends frames shaped `{lastUpdateId, bids, asks}` with no event type, and
    shape-matching would have reclassified an un-ingestible stream as a sequence
-   of seeds — a clean archive of a book the engine never saw. Deltas the seed
-   already contains are counted in `MarkoutTimeline.stale` rather than applied a
-   second time, and the gap between the seed's `lastUpdateId` and the first frame
-   is documented as one, not papered over. What none of this does is prove the far
-   cells: that needs a fresh capture, which is now worth taking.
+   of seeds — a clean archive of a book the engine never saw. What is still
+   missing is the tape: the holes that made the far cells unmeasurable were
+   reconnect-scale (113 s), and this bounds each one by the REST round trip
+   instead — in the capture above the worst silence in the mid timeline was
+   0.10 s, one depth interval. Re-measuring the `3 bps` and `4 bps` rows on their
+   own fills needs the fresh capture, which is now worth taking.
 3. **A loop.** `run_live_trader.py` places at most one quote; re-quoting,
    inventory limits and a per-session loss cap belong in a supervisor (§11.3.4).
 4. **Funding and alerting.** Neither exists (§11.3.3, §11.3.5): a carry-heavy

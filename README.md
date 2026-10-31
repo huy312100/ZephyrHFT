@@ -48,11 +48,12 @@ used at the orchestration/analytics boundary.
 - **Real-time L2 capture** (`scripts/ingest_l2.py`): asyncio WebSocket client
   that stamps every frame with `time.time_ns()`, reports venue-to-host latency
   percentiles and archives the raw payloads as gzip NDJSON roll files with
-  backoff reconnection and graceful shutdown. Each connection starts with one
-  absolute REST depth snapshot, archived **before** the socket opens, so a
-  resumed *diff* stream is never analysed against a book that does not exist yet
-  (a seed fetched after connecting is timestamped after the frames buffered
-  meanwhile, and the mid timeline refuses a non-monotonic file).
+  backoff reconnection and graceful shutdown. Each connection opens the stream,
+  archives one absolute REST depth snapshot, then drops the frames the socket
+  delivered during that round trip because the snapshot already contains them —
+  the venue's own procedure for a local book — so the seeded book and the first
+  archived delta form one update-id sequence instead of a guess
+  (`snapshot_on_connect: false` or `--no-snapshot` disables the seed).
 - **Binance Futures testnet pilot** (`scripts/run_testnet_pilot.py`): signed REST
   (HMAC-SHA256, stdlib only), `exchangeInfo` filter validation, balance check,
   L2 depth sample and a dry-run or place → query → cancel order lifecycle against
@@ -401,8 +402,10 @@ in-engine histogram behind `phase2.engine_latency_p99`. Run
 `scripts/ingest_l2.py` is the capture front end: it subscribes to an exchange
 depth stream over WebSocket and writes the raw frames to gzip-compressed NDJSON
 roll files that later stages (feature building, replay, backtests) consume. Each
-connection is seeded with one REST depth snapshot first — the depth feed is a
-*diff* stream, so without it the archive has no mid until enough deltas arrive.
+connection is seeded with one REST depth snapshot — the depth feed is a *diff*
+stream, so without it the archive has no mid until enough deltas arrive — fetched
+with the socket already open, so the frames it overlaps are recognised and
+dropped rather than archived behind it.
 
 > Full architecture, data schema, capacity numbers and the Phase 2 handoff:
 > [`docs/phase1_roadmap.md`](docs/phase1_roadmap.md).
