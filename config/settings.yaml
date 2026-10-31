@@ -45,6 +45,12 @@ data_ingestion:
   exchange: binance_futures        # binance_futures | binance_futures_testnet | binance_spot
   symbol: btcusdt                  # lowercase, as required by the stream name
   stream_type: depth@100ms         # e.g. depth@100ms, depth@500ms, depth20@100ms
+  # On USDⓈ-M a partial-book stream is still a diff stream (verified on the wire:
+  # ``e=depthUpdate`` with ``U``/``u`` and ``b``/``a``), so it ingests. On **spot**
+  # it is not: those frames arrive as an absolute book with no event type, every
+  # one counts as malformed, and the archive fails ``phase1.archive_integrity``.
+  # That shape is what the book seed below uses, which is why the seed carries an
+  # explicit marker instead of being recognised by shape.
   # Extra streams on the same socket (combined-stream form). The tape is what
   # separates "our quote was hit" from "the book crossed us" -- without prints
   # every backtested fill is adversarially selected by construction. ``trade`` is

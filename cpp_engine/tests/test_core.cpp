@@ -1701,7 +1701,7 @@ void test_paper_engine_gap_detection() {
 void test_archived_book_snapshot_is_an_input_not_a_malformed_line() {
     hft::paper_engine engine{P("0.5"), P("30000")};
     std::vector<std::string> lines;
-    lines.push_back(R"({"lastUpdateId":42,"E":1000,"T":1000,"bids":[["30000.00","1"]],"asks":[["30001.00","1"]]})");
+    lines.push_back(R"({"e":"zephyr.bookSnapshot","lastUpdateId":42,"E":1000,"T":1000,"bids":[["30000.00","1"]],"asks":[["30001.00","1"]]})");
     const hft::ingest_stats seeded = hft::ingest_lines(engine, lines);
     CHECK(seeded.lines == 1);
     CHECK(seeded.snapshots == 1);
@@ -1717,6 +1717,24 @@ void test_archived_book_snapshot_is_an_input_not_a_malformed_line() {
     CHECK(all.depth_events == 1);
     CHECK(all.malformed == 1);  // the unrecognised stream, never the seed
     CHECK(engine.bbo().bid_price == P("30000.50"));
+}
+
+// The spot partial-book *stream* (depth20@100ms) sends frames shaped
+// {lastUpdateId, bids, asks} with no event type -- the same shape as an archived
+// book seed. Recognising seeds by shape would classify them as seeds, skip the
+// delta path, and report a capture whose book the engine never saw as clean.
+// They must stay Unknown, so the malformed count says so out loud.
+void test_partial_book_stream_frames_are_not_mistaken_for_seeds() {
+    hft::paper_engine engine{P("0.5"), P("30000")};
+    std::vector<std::string> lines;
+    lines.push_back(R"({"lastUpdateId":100,"bids":[["30000.00","1"]],"asks":[["30001.00","1"]]})");
+    lines.push_back(R"({"final":false,"bids":[["30000.00","1"]],"asks":[["30001.00","1"]],"u":101})");
+    const hft::ingest_stats stats = hft::ingest_lines(engine, lines);
+    CHECK(stats.lines == 2);
+    CHECK(stats.snapshots == 0);
+    CHECK(stats.depth_events == 0);
+    CHECK(stats.malformed == 2);
+    CHECK(engine.bbo().is_valid() == false);
 }
 
 void test_ingest_lines() {
@@ -1775,6 +1793,7 @@ int main() {
     test_paper_engine_taker();
     test_paper_engine_gap_detection();
     test_archived_book_snapshot_is_an_input_not_a_malformed_line();
+    test_partial_book_stream_frames_are_not_mistaken_for_seeds();
     test_ingest_lines();
     if (g_failures != 0) {
         std::fprintf(stderr, "%d test assertion(s) failed\n", g_failures);

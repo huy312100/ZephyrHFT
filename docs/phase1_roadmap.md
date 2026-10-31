@@ -63,22 +63,31 @@ and every reader starts empty, including after a reconnect — has no mid until
 enough deltas arrive; in a 3 h capture that took 113 s, and every fill in the
 window was unmarkable (`docs/phase5_production_readiness.md` §11.8.7). The seed is
 an extra NDJSON line of the same shape as a REST book snapshot (`lastUpdateId`,
-`bids`, `asks`), annotated textually with the two things the venue's response
-does not carry and this process knows: its receive time (`E`; the USDⓈ-M snapshot
-has one, the spot snapshot has none) and its market (`s` — **neither** product
-names its symbol in this response, and an unlabelled line is the one record a
-mixed capture could attribute to the wrong book). The venue's own bytes are never
-re-serialised.
+`bids`, `asks`), annotated textually with the three things this capture knows and
+the venue's response does not send: a marker in `e` (next paragraph), its receive
+time (`E`; the USDⓈ-M snapshot has one, the spot snapshot has none) and its market
+(`s` — **neither** product names its symbol in this response, and an unlabelled
+line is the one record a mixed capture could attribute to the wrong book). The
+venue's own bytes are never re-serialised.
 
 Native ingestion knows this line as its own input kind (`FeedMessageType::
 BookSnapshot`), counted in `ingest_stats.snapshots` and never routed through
-`process_update`. That distinction is load-bearing rather than cosmetic:
-`phase1.archive_integrity` requires **zero** malformed lines, so a classifier that
-saw the seed as junk would turn every seeded capture into a BUILD NO-GO at the
-release gate -- and feeding an absolute book through the delta path would move
-each level twice. A stream frame the parser cannot classify is still malformed,
-which is what makes an un-ingestible stream like `markPrice@1s` a failed capture
-instead of a silently partial one.
+`process_update`. Recognition is by an explicit marker the capture writes —
+`"e": "zephyr.bookSnapshot"` — and never by shape. Shape matching looks
+equivalent and is not: the spot partial-book *stream* answers with frames shaped
+`{lastUpdateId, bids, asks}` and no event type, so a shape-based seed would
+reclassify a stream the engine cannot use as a series of seeds, skip the delta
+path entirely, and report a clean archive of an empty book. That is a silent
+failure where the malformed count used to be a loud one, which is the exact
+failure class this repository keeps re-learning.
+
+The distinction is load-bearing rather than cosmetic: `phase1.archive_integrity`
+requires **zero** malformed lines, so a classifier that saw the seed as junk would
+turn every seeded capture into a BUILD NO-GO at the release gate — and feeding an
+absolute book through the delta path would move each level twice. A stream frame
+the parser cannot classify is still malformed, which is what makes an
+un-ingestible stream like `markPrice@1s` a failed capture instead of a silently
+partial one.
 
 What the seed cannot do is hand off contiguously: whatever changed between its
 `lastUpdateId` and the first frame was not on any socket yet, so it is not in the

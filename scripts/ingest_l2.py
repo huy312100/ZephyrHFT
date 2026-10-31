@@ -193,12 +193,22 @@ def unwrap_frame_text(raw: str) -> str:
     return raw[span[0]:span[1]]
 
 
+#: The marker written into an archived book seed, and the only thing that makes
+#: it recognisable. Shape is not enough: the spot `depth20@100ms` *stream* sends
+#: frames shaped `{"lastUpdateId", "bids", "asks"}` with no event type, and
+#: reading those as seeds would let a capture of an un-ingestible stream report
+#: a clean archive. Namespaced because the venue owns the values of `e`.
+SNAPSHOT_MARKER = "zephyr.bookSnapshot"
+
+
 def event_kind(payload: Any) -> str:
-    """Classifies a payload as ``depth``, ``trade`` or ``other``."""
+    """Classifies a payload as ``depth``, ``trade``, ``snapshot`` or ``other``."""
     data = unwrap_payload(payload)
     if not isinstance(data, Mapping):
         return "other"
     event = data.get("e")
+    if event == SNAPSHOT_MARKER:
+        return "snapshot"
     if event in ("depthUpdate", "depth"):
         return "depth"
     if event in ("trade", "aggTrade"):
@@ -255,21 +265,24 @@ def fetch_snapshot_text(url: str, timeout_s: float) -> str:
 
 
 def annotate_snapshot(text: str, now_ms: int, symbol: str) -> str:
-    """Adds the capture metadata a REST book snapshot needs but does not carry.
+    """Marks a REST book snapshot as capture metadata, textually.
 
-    Two fields, both facts about this capture rather than claims about the
-    market, and both inserted **textually** right after the opening brace so the
-    venue's own bytes stay byte-for-byte:
+    Three fields, each a fact about this capture rather than a claim about the
+    market, inserted right after the opening ``{`` so the venue's own bytes stay
+    byte-for-byte:
 
-    * ``E`` -- Binance's USDⓈ-M snapshot carries ``E``/``T``; the spot one
-      carries neither, and a book with no time cannot be placed on the mid
-      timeline, so it would be archived and then ignored.
-    * ``s`` -- neither snapshot names its market, and the consumers select
-      frames by symbol. An unlabelled seed is the one line in the archive that a
-      mixed capture would accept from any market and use as its first mid.
+    * ``e`` -- the marker ``classify`` looks for. Without it the seed would have
+      to be recognised by shape, which is how a partial-book *stream* would be
+      mistaken for a seed and quietly never applied.
+    * ``E`` -- the USDⓈ-M snapshot carries one, the spot snapshot carries neither
+      ``E`` nor ``T``, and a book with no time cannot be placed on the mid
+      timeline at all.
+    * ``s`` -- neither response names its market, and every consumer selects
+      frames by symbol, so an unlabelled seed is the one line a mixed capture
+      could attribute to the wrong book.
 
-    Bodies that already carry a field keep it, and anything that is not a JSON
-    object is returned unchanged.
+    A field the venue already sent is never overwritten, and a body that is not
+    a JSON object is returned unchanged.
     """
     start = text.find("{")
     if start < 0:
@@ -280,13 +293,11 @@ def annotate_snapshot(text: str, now_ms: int, symbol: str) -> str:
         return text
     if not isinstance(payload, Mapping):
         return text
-    parts: List[str] = []
+    parts: List[str] = [f'"e":"{SNAPSHOT_MARKER}"']
     if payload.get("E") is None and payload.get("T") is None:
         parts.append(f'"E":{int(now_ms)}')
     if payload.get("s") is None and payload.get("symbol") is None:
         parts.append(f'"s":"{str(symbol).upper()}"')
-    if not parts:
-        return text
     return f'{text[:start + 1]}{",".join(parts)},{text[start + 1:]}'
 
 

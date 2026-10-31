@@ -1523,19 +1523,19 @@ different kinds of problem:
    above is the reason the far cells cannot be trusted, and the direction of the
    resulting bias is **unmeasured** — the markouts that are missing are the ones
    nobody can compute, so it is a hole in the sample rather than a known skew.
-   The capture now archives an absolute REST depth snapshot per connection,
+   The capture now archives one absolute REST depth snapshot per connection,
    **before** the socket opens: fetched after connecting, its venue time lands
-   *after* the frames the socket buffered meanwhile, the mid timeline is then
-   non-monotonic, and the analysis refuses the file — which is exactly how this
-   was found. The seed gives the timeline a mid at its first sample instead of
-   after a delta backlog (113 s in the 3 h capture), and it is a line in the roll
-   file, so the archive stays self-describing, and it carries the market as
-   capture metadata because neither product's snapshot response names its symbol.
-   Deltas the seed already contains are counted in `MarkoutTimeline.stale` rather
-   than applied a second time; the gap between the seed's `lastUpdateId` and the
-   first frame is real and is documented as one, not papered over. What none of
-   this does is prove the far cells: that needs a fresh capture, which is now
-   worth taking.
+   *after* the frames the socket buffered meanwhile, the mid timeline turns
+   non-monotonic, and the analysis refuses the file — which is how this was
+   found. It is recognised by an explicit marker (`"e":
+   "zephyr.bookSnapshot"`), never by its shape: the spot partial-book *stream*
+   sends frames shaped `{lastUpdateId, bids, asks}` with no event type, and
+   shape-matching would have reclassified an un-ingestible stream as a sequence
+   of seeds — a clean archive of a book the engine never saw. Deltas the seed
+   already contains are counted in `MarkoutTimeline.stale` rather than applied a
+   second time, and the gap between the seed's `lastUpdateId` and the first frame
+   is documented as one, not papered over. What none of this does is prove the far
+   cells: that needs a fresh capture, which is now worth taking.
 3. **A loop.** `run_live_trader.py` places at most one quote; re-quoting,
    inventory limits and a per-session loss cap belong in a supervisor (§11.3.4).
 4. **Funding and alerting.** Neither exists (§11.3.3, §11.3.5): a carry-heavy

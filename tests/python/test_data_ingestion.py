@@ -877,7 +877,9 @@ def test_a_seeded_capture_is_an_input_and_not_a_malformed_line() -> None:
     """
     from python_analytics.bridge import build_paper_engine, ingest_batch
 
-    seed = _snapshot(event_ms=1_700_000_000_000)
+    # What the capture archives is the venue's body plus its own marker.
+    seed = annotate_snapshot(_snapshot(event_ms=1_700_000_000_000),
+                             1_700_000_000_000, "btcusdt")
     assert (hft_native.classify_json(seed)
             == hft_native.FeedMessageType.BOOK_SNAPSHOT)
 
@@ -887,8 +889,29 @@ def test_a_seeded_capture_is_an_input_and_not_a_malformed_line() -> None:
     assert stats["snapshot"] == 1
 
 
+def test_a_snapshot_shaped_stream_frame_is_never_a_seed() -> None:
+    """Shape is not a marker, and confusing the two silences a broken capture.
+
+    The spot ``depth20@100ms`` *stream* sends ``{lastUpdateId, bids, asks}`` with
+    no event type -- the same shape an archived book seed has. Classify by shape
+    and those frames are counted as seeds, never reach the book, and a capture of
+    a stream the engine cannot use reports a clean archive with an empty ladder.
+    The malformed count is what makes that loud, so it must stay malformed.
+    """
+    from python_analytics.bridge import build_paper_engine, ingest_batch
+
+    bare = _snapshot(event_ms=1_700_000_000_000)          # venue shape, no marker
+    assert hft_native.classify_json(bare) == hft_native.FeedMessageType.UNKNOWN
+
+    engine = build_paper_engine(tick_size="0.50", center="30000.00")
+    stats = ingest_batch(engine, [bare, _depth(event_ms=1_700_000_000_100)])
+    assert (stats["snapshot"], stats["depth"], stats["malformed"]) == (0, 1, 1)
+
+
 def test_event_kind_separates_depth_from_tape() -> None:
     assert event_kind(json.loads(_depth())) == "depth"
+    assert event_kind(json.loads(
+        annotate_snapshot(_snapshot(), 1, "btcusdt"))) == "snapshot"
     assert event_kind(json.loads(_agg_trade())) == "trade"
     assert event_kind({"result": None, "id": 1}) == "other"
 
@@ -1110,9 +1133,10 @@ def test_a_snapshot_is_archived_as_the_first_line_of_the_roll(tmp_path) -> None:
     lines = [record for path in _roll_files(tmp_path) for record in _read_roll(path)]
     seed = json.loads(lines[0])
     assert seed["lastUpdateId"] == 42
-    # The venue sent no market; the archive must carry one, or the seed is the
-    # one line a mixed capture cannot attribute.
+    # The venue sent no market and no event type; the archive must carry both, or
+    # the seed is a line no consumer can attribute or recognise.
     assert seed["s"] == "BTCUSDT"
+    assert seed["e"] == ingest_module.SNAPSHOT_MARKER
     assert client.stats.snapshots == 1
     assert client.stats.snapshot_failures == 0
 
@@ -1303,7 +1327,8 @@ def test_a_snapshot_is_stamped_with_only_what_the_venue_omitted() -> None:
     """
     spot = '{"lastUpdateId": 7, "bids": [["100.0", "1.0"]], "asks": [["100.5", "1.0"]]}'
     seeded = annotate_snapshot(spot, 1_700_000_000_123, "btcusdt")
-    assert seeded.startswith('{"E":1700000000123,"s":"BTCUSDT",')
+    assert seeded.startswith('{"e":"zephyr.bookSnapshot","E":1700000000123,'
+                             '"s":"BTCUSDT",')
     # The venue's own bytes survive the textual insert unchanged.
     assert seeded.split('"BTCUSDT",', 1)[1] == spot[1:]
     parsed = json.loads(seeded)

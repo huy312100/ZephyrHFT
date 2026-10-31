@@ -69,7 +69,9 @@ def test_a_seeded_archive_still_passes_the_integrity_check(gate, tmp_path) -> No
     because the archive that triggers them is the normal case now, not the edge.
     """
     archive = _archive(tmp_path / "seeded.ndjson", count=64)
-    seed = json.dumps({"lastUpdateId": 5, "E": 1_700_000_000_000 - 1000,
+    # Exactly what the capture archives: the venue's body plus its own marker.
+    seed = json.dumps({"e": "zephyr.bookSnapshot", "lastUpdateId": 5,
+                       "E": 1_700_000_000_000 - 1000,
                        "bids": [["100.00", "1.0"]], "asks": [["100.50", "1.0"]]})
     archive.write_text(seed + "\n" + archive.read_text(encoding="utf-8"),
                        encoding="utf-8")
