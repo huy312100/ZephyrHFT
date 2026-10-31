@@ -256,7 +256,7 @@ class MarkoutTimeline:
     """
 
     __slots__ = ("symbol", "_ts", "_mid", "_spread", "malformed", "ignored",
-                 "stale", "handoff_gaps")
+                 "stale", "handoff_gaps", "seed_backdated", "seed_unstamped")
 
     def __init__(self, symbol: Optional[str] = None) -> None:
         self.symbol = symbol
@@ -276,6 +276,25 @@ class MarkoutTimeline:
         #: capture is written so this cannot happen (see ``ingest_l2.py``), which
         #: is why a non-zero value here is evidence about the file, not the tape.
         self.handoff_gaps = 0
+        #: Seeds whose own timestamp lands after the frame that continues them.
+        #:
+        #: A snapshot is stamped with the venue's issuance time, and a frame whose
+        #: ids run past the seed can predate it -- the REST read may reflect a
+        #: state behind the stream, which is why the venue's own procedure keeps
+        #: that frame instead of discarding it. The seed's mid is then unpublishable
+        #: in order, so it is counted and dropped rather than written backwards:
+        #: the book itself survives in the ladder, and the tape survives in the
+        #: timeline.
+        self.seed_backdated = 0
+        #: Seeds that carry no venue-domain timestamp at all.
+        #:
+        #: Spot's depth response has no ``E``/``T``, and the capture does not put
+        #: its own receive time in the archive (decision ``P1-D1``,
+        #: docs/phase1 §9.1) -- still less under the venue's field name, which
+        #: would order a host clock against a venue one. Such a seed publishes its
+        #: **book** and lets the first continuing frame publish the mid, one depth
+        #: interval later, in a domain that means something.
+        self.seed_unstamped = 0
 
     # ------------------------------------------------------------- building
     def add(self, ts_ns: int, mid: float, spread_bps: float = 0.0) -> bool:
@@ -533,7 +552,7 @@ class _TimelineBuilder:
     """
 
     __slots__ = ("timeline", "book", "ticker", "want", "explicit", "file_symbol",
-                 "snapshot_id", "handoff_checked")
+                 "snapshot_id", "handoff_checked", "pending_seed")
 
     def __init__(self, symbol: Optional[str] = None) -> None:
         self.timeline = MarkoutTimeline(symbol=symbol)
@@ -547,6 +566,33 @@ class _TimelineBuilder:
         self.snapshot_id: Optional[int] = None
         #: Whether the frame that follows the current snapshot has been judged.
         self.handoff_checked = False
+        #: The current seed's mid, held until a frame proves it can be placed.
+        self.pending_seed: Optional[Tuple[int, float, float]] = None
+
+    def _flush_pending_seed(self, limit_ns: Optional[int] = None) -> None:
+        """Publishes the held seed sample when the frame after it is known.
+
+        Only one case is forgiven: the seed being *later* than the frame that
+        continues it, which is the venue's own staleness (the REST read can lag the
+        stream, and Binance's procedure keeps the straddling frame rather than
+        discarding it). Then the seed's mid cannot be placed in order, so it is
+        counted and dropped -- the book stays in the ladder and the tape stays in
+        the timeline.
+
+        A seed older than a sample already published is a different thing: the
+        input arrived out of order, and pretending otherwise would let yesterday's
+        roll file quietly supply today's mid. ``MarkoutTimeline.add`` refuses that,
+        and this method does not catch it.
+        """
+        pending = self.pending_seed
+        if pending is None:
+            return
+        self.pending_seed = None
+        if limit_ns is not None and pending[0] > limit_ns:
+            self.timeline.seed_backdated += 1
+            return
+        if not self.timeline.add(pending[0], pending[1], pending[2]):
+            self.timeline.ignored += 1
 
     def feed(self, lines: Iterable[str]) -> MarkoutTimeline:
         """Applies one capture's lines to the running book and timeline."""
@@ -611,6 +657,9 @@ class _TimelineBuilder:
                 if ts_ns is None:
                     timeline.ignored += 1
                     continue
+                # The seed's own sample goes first, if it can still be placed
+                # before this frame: see :meth:`_flush_pending_seed`.
+                self._flush_pending_seed(ts_ns)
                 if not timeline.add(ts_ns, mid if mid is not None else 0.0,
                                     book.spread_bps):
                     timeline.ignored += 1
@@ -632,10 +681,18 @@ class _TimelineBuilder:
                 # one looked like: reconnects archive one seed per connection.
                 self.handoff_checked = False
                 if ts_ns is None:
-                    timeline.ignored += 1
+                    # No venue-domain timestamp on the seed line: the ladder is
+                    # seeded, the mid is not published. See
+                    # :attr:`MarkoutTimeline.seed_unstamped`.
+                    timeline.seed_unstamped += 1
                     continue
-                if not timeline.add(ts_ns, book.mid or 0.0, book.spread_bps):
-                    timeline.ignored += 1
+                # A reconnect's seed supersedes any sample still held from the
+                # previous one, so publish that first while it is still ordered.
+                self._flush_pending_seed(ts_ns)
+                # Held, not added: the frame that continues this seed may predate
+                # it, and the mid timeline refuses a backwards sample. The book is
+                # applied to the ladder now either way.
+                self.pending_seed = (ts_ns, book.mid or 0.0, book.spread_bps)
                 continue
 
             if kind == "bookTicker" or (
@@ -658,12 +715,19 @@ class _TimelineBuilder:
                 self.ticker = (bid, ask)
                 mid = book.mid or (bid + ask) / 2.0
                 spread = book.spread_bps or (ask - bid) / mid * 10_000.0
-                if ts_ns is None or not timeline.add(ts_ns, mid, spread):
+                if ts_ns is None:
+                    timeline.ignored += 1
+                    continue
+                self._flush_pending_seed(ts_ns)
+                if not timeline.add(ts_ns, mid, spread):
                     timeline.ignored += 1
                 continue
 
             timeline.ignored += 1
 
+        # A capture that ends on a seed (or on frames that never carried a mid)
+        # still gets the book's mid: nothing later can contradict its order.
+        self._flush_pending_seed()
         return timeline
 
 

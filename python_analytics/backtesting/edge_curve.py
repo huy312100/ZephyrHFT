@@ -506,6 +506,8 @@ def measure_edge_curve(scan: TapeScan, timeline: MarkoutTimeline,
             # be present and still wrong.
             "timeline_stale": timeline.stale,
             "timeline_handoff_gaps": timeline.handoff_gaps,
+            "timeline_seed_backdated": timeline.seed_backdated,
+            "timeline_seed_unstamped": timeline.seed_unstamped,
         },
         "rows": rows,
     }

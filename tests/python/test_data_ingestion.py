@@ -879,8 +879,7 @@ def test_a_seeded_capture_is_an_input_and_not_a_malformed_line() -> None:
     from python_analytics.bridge import build_paper_engine, ingest_batch
 
     # What the capture archives is the venue's body plus its own marker.
-    seed = annotate_snapshot(_snapshot(event_ms=1_700_000_000_000),
-                             1_700_000_000_000, "btcusdt")
+    seed = annotate_snapshot(_snapshot(event_ms=1_700_000_000_000), "btcusdt")
     assert (hft_native.classify_json(seed)
             == hft_native.FeedMessageType.BOOK_SNAPSHOT)
 
@@ -912,7 +911,7 @@ def test_a_snapshot_shaped_stream_frame_is_never_a_seed() -> None:
 def test_event_kind_separates_depth_from_tape() -> None:
     assert event_kind(json.loads(_depth())) == "depth"
     assert event_kind(json.loads(
-        annotate_snapshot(_snapshot(), 1, "btcusdt"))) == "snapshot"
+        annotate_snapshot(_snapshot(), "btcusdt"))) == "snapshot"
     assert event_kind(json.loads(_agg_trade())) == "trade"
     assert event_kind({"result": None, "id": 1}) == "other"
 
@@ -1365,6 +1364,86 @@ def test_an_unseeded_session_drops_nothing(tmp_path) -> None:
     assert len(lines) == 1
 
 
+def test_a_spot_seed_does_not_file_the_host_clock_under_the_venue_name(
+    tmp_path, monkeypatch
+) -> None:
+    """Venue time and host time are different domains, and ordering proves it.
+
+    Spot's depth response carries no ``E``/``T``. Giving the seed this machine's
+    clock under the venue's field name would put the book ahead of the frames that
+    continue it whenever the host runs fast -- and ``build_timeline`` refuses a
+    backwards sample, so one fabricated field loses a whole capture. The seed
+    instead holds its book, and the first continuing frame carries the mid in the
+    venue's own domain.
+    """
+    from python_analytics.backtesting.markouts import build_timeline
+
+    venue_ms = 1_700_000_000_000
+    host_ms = venue_ms + 10_000            # the host clock runs 10 s ahead
+
+    class _OneDepthFrame:
+        """Delivers one frame that continues the seed, then stops the session."""
+
+        def __init__(self, client: L2IngestClient) -> None:
+            self._client = client
+            self._done = False
+
+        def __aiter__(self) -> "_OneDepthFrame":
+            return self
+
+        async def open(self) -> None:
+            return None
+
+        async def __anext__(self) -> Frame:
+            if self._done:
+                self._client.request_stop()
+                raise StopAsyncIteration
+            self._done = True
+            return ((venue_ms + 500) * NS_PER_MS,
+                    _depth(venue_ms + 500, U=6, u=7,
+                           b=[["100.0", "1"]], a=[["100.5", "1"]]))
+
+        async def aclose(self) -> None:
+            return None
+
+    def _spot_body(url: str, timeout: float) -> str:
+        return ('{"lastUpdateId": 5, "bids": [["100.0", "9"], ["99.5", "9"]],'
+                ' "asks": [["100.5", "9"], ["101.0", "9"]]}')
+
+    monkeypatch.setattr(ingest_module, "_SocketFrames", _OneDepthFrame)
+    client = _client(
+        tmp_path,
+        snapshot_fetcher=_spot_body,
+        clock=lambda: host_ms * NS_PER_MS,
+    )
+    stats = asyncio.run(client.run())
+
+    assert stats.snapshots == 1
+    assert stats.handoff_gaps == 0
+    assert stats.no_timestamp == 0        # a deliberate absence, not a stray frame
+    lines = [record for path in _roll_files(tmp_path) for record in _read_roll(path)]
+
+    # Read the archive first: what this pins is the *placement*. A seed stamped
+    # from the host clock either lands in the wrong domain (a mid before the
+    # market it describes) or is caught by the backdated guard and silently
+    # forfeits its sample. Neither is a venue-domain mid, which is the only thing
+    # worth putting in the timeline.
+    timeline = build_timeline(lines)
+    assert timeline.seed_unstamped == 1
+    assert timeline.seed_backdated == 0
+    assert len(timeline) == 1
+    assert timeline.first_ts_ns == (venue_ms + 500) * NS_PER_MS
+    # The seeded book is what the frame was applied to: the 100.0 bid survives from
+    # the seed, and the mid is the venue's, not the host's guess.
+    assert timeline.at_or_before(timeline.first_ts_ns)[1] == pytest.approx(100.25)
+
+    # Nothing host-dated is in the line at all: the archive keeps venue timestamps
+    # only (decision ``P1-D1``), so nothing downstream can order by two clocks.
+    seed_line = json.loads(lines[0])
+    assert "E" not in seed_line and "T" not in seed_line
+    assert not any("host" in key for key in seed_line)
+
+
 def test_a_frame_already_contained_in_the_seed_is_not_applied_twice(tmp_path) -> None:
     """The REST request finished before the stream was read, so ids can overlap.
 
@@ -1439,32 +1518,37 @@ def test_the_snapshot_url_follows_the_endpoint_that_is_dialled() -> None:
 
 
 def test_a_snapshot_is_stamped_with_only_what_the_venue_omitted() -> None:
-    """Missing receive time and market are added; everything else is untouched.
+    """The missing market is added; a timestamp never is.
 
-    Neither product's REST depth response names its symbol, and spot sends no
-    timestamp either. An archive line that identifies neither its market nor its
-    instant cannot be used by a consumer that filters on one of them.
+    Neither product's REST depth response names its symbol, so an unlabelled line
+    is the one record a mixed capture could attribute to the wrong book. Spot also
+    sends no timestamp, and the capture's own receive time is not written either:
+    it belongs to a different clock than the frames around it, and decision
+    ``P1-D1`` keeps host times out of the archive. The seed therefore places its
+    book and lets the venue-stamped frames place the mid.
     """
     spot = '{"lastUpdateId": 7, "bids": [["100.0", "1.0"]], "asks": [["100.5", "1.0"]]}'
-    seeded = annotate_snapshot(spot, 1_700_000_000_123, "btcusdt")
-    assert seeded.startswith('{"e":"zephyr.bookSnapshot","E":1700000000123,'
-                             '"s":"BTCUSDT",')
+    seeded = annotate_snapshot(spot, "btcusdt")
+    assert seeded.startswith('{"e":"zephyr.bookSnapshot","s":"BTCUSDT",')
     # The venue's own bytes survive the textual insert unchanged.
     assert seeded.split('"BTCUSDT",', 1)[1] == spot[1:]
     parsed = json.loads(seeded)
     assert parsed["lastUpdateId"] == 7 and parsed["bids"] == [["100.0", "1.0"]]
+    # No borrowed time, under the venue's name or anyone else's.
+    assert "E" not in parsed and "T" not in parsed
 
     # A USDⓈ-M body already carries E/T, so only the market is added.
     futures = _snapshot(event_ms=1_700_000_000_000)
-    assert json.loads(annotate_snapshot(futures, 1, "btcusdt"))["E"] == 1_700_000_000_000
-    assert json.loads(annotate_snapshot(futures, 1, "btcusdt"))["s"] == "BTCUSDT"
+    assert json.loads(annotate_snapshot(futures, "btcusdt"))["E"] == 1_700_000_000_000
+    assert json.loads(annotate_snapshot(futures, "btcusdt"))["s"] == "BTCUSDT"
 
-    # A body that already names its market keeps the venue's spelling; the
-    # missing timestamp is still added, because nothing can place it in time.
+    # A body that already names its market keeps the venue's spelling, and a body
+    # with no time still gets none.
     named = ('{"lastUpdateId": 7, "s": "ETHUSDT",'
              ' "bids": [["100.0", "1.0"]], "asks": [["100.5", "1.0"]]}')
-    annotated = json.loads(annotate_snapshot(named, 5, "btcusdt"))
-    assert annotated["s"] == "ETHUSDT" and annotated["E"] == 5
+    annotated = json.loads(annotate_snapshot(named, "btcusdt"))
+    assert annotated["s"] == "ETHUSDT"
+    assert "E" not in annotated and "T" not in annotated
 
 
 def test_only_a_body_with_a_book_in_it_counts_as_a_snapshot() -> None:
@@ -1476,20 +1560,18 @@ def test_only_a_body_with_a_book_in_it_counts_as_a_snapshot() -> None:
     received -- while archiving a line the parser has to reject into a file meant
     to be ground truth.
     """
-    assert annotate_snapshot("not json", 1, "btcusdt") is None
-    assert annotate_snapshot("[1, 2, 3]", 1, "btcusdt") is None
-    assert annotate_snapshot("{}", 1, "btcusdt") is None
+    assert annotate_snapshot("not json", "btcusdt") is None
+    assert annotate_snapshot("[1, 2, 3]", "btcusdt") is None
+    assert annotate_snapshot("{}", "btcusdt") is None
     # An object shaped like a book response but with no book in it.
-    assert annotate_snapshot('{"bids": [], "asks": []}', 1, "btcusdt") is None
+    assert annotate_snapshot('{"bids": [], "asks": []}', "btcusdt") is None
     # Right keys, empty levels: archiving this as a seed would replace a working
     # ladder with nothing at all.
-    assert annotate_snapshot('{"lastUpdateId": 1}', 1, "btcusdt") is None
-    assert annotate_snapshot('{"lastUpdateId": 1, "bids": [], "asks": []}',
-                             1, "btcusdt") is None
-    assert annotate_snapshot('{"lastUpdateId": 1, "bids": "x", "asks": "y"}',
-                             1, "btcusdt") is None
+    assert annotate_snapshot('{"lastUpdateId": 1}', "btcusdt") is None
+    assert annotate_snapshot('{"lastUpdateId": 1, "bids": [], "asks": []}', "btcusdt") is None
+    assert annotate_snapshot('{"lastUpdateId": 1, "bids": "x", "asks": "y"}', "btcusdt") is None
     # The real shape still annotates.
-    marked = annotate_snapshot(_snapshot(), 1, "btcusdt")
+    marked = annotate_snapshot(_snapshot(), "btcusdt")
     assert marked is not None and '"lastUpdateId"' in marked
 
 

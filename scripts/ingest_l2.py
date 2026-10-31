@@ -308,7 +308,7 @@ def fetch_snapshot_text(url: str, timeout_s: float) -> str:
         return response.read().decode("utf-8")
 
 
-def annotate_snapshot(text: str, now_ms: int, symbol: str) -> Optional[str]:
+def annotate_snapshot(text: str, symbol: str) -> Optional[str]:
     """Marks a REST book snapshot as capture metadata, textually.
 
     Returns ``None`` unless the body is a JSON **object** carrying
@@ -321,19 +321,27 @@ def annotate_snapshot(text: str, now_ms: int, symbol: str) -> Optional[str]:
     book in it would be counted and logged as a successful seed -- and, downstream,
     would clear a ladder that was working.
 
-    Three fields are added to a real snapshot, each a fact about this capture
+    Two fields can be added to a real snapshot, each a fact about this capture
     rather than a claim about the market, inserted right after the opening ``{``
     so the venue's own bytes stay byte-for-byte:
 
     * ``e`` -- the marker ``classify`` looks for. Without it the seed would have
       to be recognised by shape, which is how a partial-book *stream* would be
       mistaken for a seed and quietly never applied.
-    * ``E`` -- the USDⓈ-M snapshot carries one, the spot snapshot carries neither
-      ``E`` nor ``T``, and a book with no time cannot be placed on the mid
-      timeline at all.
     * ``s`` -- neither response names its market, and every consumer selects
       frames by symbol, so an unlabelled seed is the one line a mixed capture
       could attribute to the wrong book.
+
+    No timestamp is ever added. The USDⓈ-M snapshot carries its own ``E`` (venue
+    clock, comparable with the frames around it); the spot snapshot carries
+    neither ``E`` nor ``T``, and this capture's receive time does not belong in
+    the archive at all (decision ``P1-D1``, docs/phase1 §9.1) still less under the
+    venue's field name: ordering a host-domain value against venue-domain frames
+    compares two clocks, so a fast host puts the seed *after* the lines it
+    precedes and a slow one publishes a mid *before* the market it describes. A
+    seed with no venue timestamp therefore seeds the **book** only, and the first
+    frame that continues ``lastUpdateId`` carries the mid -- at most one depth
+    interval later, in a domain that means something.
 
     A field the venue already sent is never overwritten.
     """
@@ -355,8 +363,6 @@ def annotate_snapshot(text: str, now_ms: int, symbol: str) -> Optional[str]:
     if not bids or not asks:
         return None
     parts: List[str] = [f'"e":"{SNAPSHOT_MARKER}"']
-    if payload.get("E") is None and payload.get("T") is None:
-        parts.append(f'"E":{int(now_ms)}')
     if payload.get("s") is None and payload.get("symbol") is None:
         parts.append(f'"s":"{str(symbol).upper()}"')
     return f'{text[:start + 1]}{",".join(parts)},{text[start + 1:]}'
@@ -802,6 +808,8 @@ class IngestStats:
     disconnects: int = 0
     reconnects: int = 0
     connect_failures: int = 0
+    #: Book seeds archived this session (counted as they are classified, so a
+    #: replayed archive reports the same number as the capture that wrote it).
     snapshots: int = 0
     snapshot_failures: int = 0
     #: Depth frames dropped because the seed already contains them.
@@ -1082,6 +1090,14 @@ class L2IngestClient:
             stats.depth_frames += 1
         elif kind == "trade":
             stats.trade_frames += 1
+        elif kind == "snapshot":
+            # Counted on the way through, not by the caller that fetched it: a
+            # replayed archive then reports the same number of seeds as the
+            # capture that wrote it. It also keeps a spot seed -- which carries
+            # no venue timestamp by design -- out of `no_timestamp`, where it
+            # would look like a frame that cannot be placed.
+            stats.snapshots += 1
+            return
 
         event_ns = event_timestamp_ns(payload)
         if event_ns is None:
@@ -1205,9 +1221,8 @@ class L2IngestClient:
             return
         received_ns = self._clock()
         # The venue's own fields win; the capture adds only what it knows and a
-        # snapshot lacks -- its marker, its receive time and its market.
-        seeded = annotate_snapshot(
-            text, received_ns // NS_PER_MS, self._settings.symbol)
+        # snapshot lacks -- its marker and its market, and never a timestamp.
+        seeded = annotate_snapshot(text, self._settings.symbol)
         if seeded is None:
             # A 200 that is not a book: a proxy page, an error body, `{}`, an
             # array. Counting it as a seed would report a book this capture never
@@ -1218,12 +1233,12 @@ class L2IngestClient:
                 "depth response is not a book snapshot (%d bytes, no "
                 "lastUpdateId); continuing unseeded", len(text))
             return
-        self._stats.snapshots += 1
         logger.info("seeded the book from %s (%d bytes)", self._snapshot_url, len(seeded))
         # Reconcile the stream against this seed. Pending is set before the line
         # is archived, and that is safe for exactly one reason: a seed classifies
         # as ``snapshot``, never as ``depth``, so the frame that opens the window
-        # is never the frame the window drops.
+        # is never the frame the window drops. The seed itself is counted by
+        # ``_handle_frame``, which is what makes the number an archival fact.
         self._handoff_id = snapshot_update_id(parse_payload(seeded))
         self._handoff_pending = self._handoff_id is not None
         self._handle_frame(received_ns, seeded, measure_latency=False)

@@ -77,19 +77,33 @@ higher `U` means updates went by on no socket, and a level one of them deleted
 is still in the book — a phantom best bid is a mid that is wrong in a way
 nothing downstream can see. That case is counted (`IngestStats.handoff_gaps`
 here, `MarkoutTimeline.handoff_gaps` in the analysis), never repaired by
-dropping market data. Measured on the live venue over 30 s: 537 records
-handled, 4 dropped as already seeded, 0 non-contiguous handoffs, and 533
-archived lines that ingest with `0 malformed, 0 gaps` and give the timeline a
-mid on its first line.
+dropping market data. One consequence of fetching after connecting is worth
+naming: a snapshot carries the venue's issuance time, and the read can lag the
+stream, so the frame that continues a seed can predate it. The seed's own mid
+is therefore held until that frame is known — published when it fits in order
+and counted in `MarkoutTimeline.seed_backdated` when it does not, because
+refusing a whole capture over one early line would lose the tape. A seed older
+than a sample already in the timeline is a different case and still raises:
+that is roll files handed over out of order. Measured on the live venue over 30
+s: 537 records handled, 4 dropped as already seeded, 0 non-contiguous handoffs,
+and 533 archived lines that ingest with `0 malformed, 0 gaps` and give the
+timeline a mid on its first line.
 
 The seed is an extra NDJSON line of the same shape as a REST book snapshot
-(`lastUpdateId`, `bids`, `asks`), annotated textually with the three things this
-capture knows and the venue's response does not send: a marker in `e` (next
-paragraph), its receive time (`E`; the USDⓈ-M snapshot has one, the spot snapshot
-has none) and its market
-(`s` — **neither** product names its symbol in this response, and an unlabelled
-line is the one record a mixed capture could attribute to the wrong book). The
-venue's own bytes are never re-serialised.
+(`lastUpdateId`, `bids`, `asks`), annotated textually with what this capture
+knows and the venue's response does not send: a marker in `e` (next paragraph)
+and its market (`s` — **neither** product names its symbol in this response,
+and an unlabelled line is the one record a mixed capture could attribute to the
+wrong book). No timestamp is ever added. USDⓈ-M stamps its snapshot with `E`, a
+venue-domain time comparable with the frames around it; spot sends neither `E`
+nor `T`, and the capture's own receive time stays out of the archive (decision
+`P1-D1`, §9.1) and out of the venue's field name above all — ordering a host
+clock against venue-stamped frames compares two machines, so a fast host would
+place the seed after lines it precedes and a slow one would publish a mid
+before the market it describes. A spot seed therefore seeds the book only, and
+the first frame that continues `lastUpdateId` carries the mid: at most one
+depth interval later, in a domain that means something. The venue's own bytes
+are never re-serialised.
 
 Native ingestion knows this line as its own input kind (`FeedMessageType::
 BookSnapshot`), counted in `ingest_stats.snapshots` and never routed through

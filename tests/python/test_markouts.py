@@ -208,6 +208,48 @@ def test_a_seed_the_stream_cannot_continue_is_reported_not_repaired() -> None:
     assert build_timeline([gap]).handoff_gaps == 0
 
 
+def test_a_seed_that_lands_after_the_frame_continuing_it_is_counted_not_refused() -> None:
+    """The straddling frame may predate the snapshot that covers its ids.
+
+    Binance's procedure keeps a frame whose range spans ``lastUpdateId`` precisely
+    because the REST read can lag the stream, and a lagging read is stamped with a
+    later issuance time. Adding the seed's sample first would make the next sample
+    go backwards, which the mid timeline refuses -- an entire capture lost because
+    one line is early. So the seed's mid is held until the frame after it is known:
+    published when it fits, counted and dropped when it does not.
+    """
+    seed = json.dumps({"lastUpdateId": 5, "E": BASE_MS + 100,
+                       "bids": [["100.0", "1"]], "asks": [["102.0", "1"]]})
+    early = json.dumps({"e": "depthUpdate", "E": BASE_MS, "s": "BTCUSDT",
+                        "U": 5, "u": 6,
+                        "b": [["100.0", "1"]], "a": [["101.0", "1"]]})
+    later = json.dumps({"e": "depthUpdate", "E": BASE_MS + 200, "s": "BTCUSDT",
+                        "U": 7, "u": 7,
+                        "b": [["100.0", "0"], ["99.0", "1"]],
+                        "a": [["101.0", "1"]]})
+
+    timeline = build_timeline([seed, early, later])
+    assert timeline.seed_backdated == 1
+    # Refusing nothing: both frames still carry mids, in order.
+    assert len(timeline) == 2
+    assert timeline.at_or_before(BASE_NS)[1] == pytest.approx(100.5)
+    assert timeline.at_or_before(BASE_NS + 200 * 1_000_000)[1] == pytest.approx(100.0)
+    # The seed's own book is not lost either -- it is in the ladder the frames were
+    # applied to, which is why the ask above is 101.0 and not something invented.
+    assert timeline.handoff_gaps == 0
+
+    # The ordinary case still publishes the seed's mid, before the frame's.
+    in_order = build_timeline([
+        json.dumps({"lastUpdateId": 5, "E": BASE_MS,
+                    "bids": [["100.0", "1"]], "asks": [["102.0", "1"]]}),
+        json.dumps({"e": "depthUpdate", "E": BASE_MS + 100, "s": "BTCUSDT",
+                    "U": 5, "u": 6,
+                    "b": [["100.0", "1"]], "a": [["101.0", "1"]]}),
+    ])
+    assert in_order.seed_backdated == 0
+    assert len(in_order) == 2
+
+
 def test_build_timeline_uses_a_book_ticker_when_there_is_no_ladder() -> None:
     lines = [json.dumps({"e": "bookTicker", "E": BASE_MS, "s": "BTCUSDT",
                          "b": "199.0", "a": "201.0"})]
