@@ -1065,11 +1065,19 @@ class L2IngestClient:
         stats.frames += 1
         stats.bytes_received += len(raw)
 
-        # The handoff window is the one place the capture curates the stream:
-        # the depth frames it drops here are frames the archived seed already
+        # The handoff window is the one place the capture curates the stream: the
+        # depth frames it drops here are frames the archived seed already
         # describes. Outside that window nothing is filtered, so the tape stays
         # byte-complete.
-        if self._handoff_pending and self._drop_pre_handoff(raw):
+        #
+        # The window is read before the call, because closing it is one of that
+        # call's jobs: a frame dequeued while it was open has waited in the socket
+        # queue for the REST round trip, and `__anext__` stamps on dequeue. That
+        # wait is our scheduling, not venue-to-host transit, so it must not enter
+        # the latency histogram -- one reconnect could put a multi-second sample in
+        # the p99 and trip the threshold warning for a feed that is healthy.
+        window_open = self._handoff_pending
+        if window_open and self._drop_pre_handoff(raw):
             return
 
         # Archive first: the capture stays byte-complete even if a payload is
@@ -1103,7 +1111,7 @@ class L2IngestClient:
         if event_ns is None:
             stats.no_timestamp += 1
             return
-        if not measure_latency or not self._track_latency:
+        if not measure_latency or not self._track_latency or window_open:
             return
 
         latency_ns = recv_ns - event_ns

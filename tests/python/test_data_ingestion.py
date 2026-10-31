@@ -1315,6 +1315,52 @@ def test_a_non_contiguous_handoff_is_counted_not_silently_kept(tmp_path) -> None
     assert len(lines) == 2
 
 
+def test_a_frame_queued_during_the_seed_is_not_sampled_as_feed_latency(tmp_path) -> None:
+    """The latency histogram is evidence about the feed, not about our own queue.
+
+    The socket opens before the snapshot is fetched, and ``_SocketFrames`` stamps
+    on dequeue -- so every frame that arrived during the REST round trip carries
+    that round trip as "latency". Left in, one reconnect can put a multi-second
+    sample in the p99, raise ``max`` and trip the threshold warning for a feed that
+    was never slow. The seeding window is therefore not sampled at all.
+    """
+    client = _client(
+        tmp_path,
+        snapshot_fetcher=lambda url, timeout: _snapshot(last_update_id=5),
+    )
+    event_ms = 1_700_000_000_000
+    queued = 400 * NS_PER_MS          # the REST round trip, above the 250 ms warn
+    items: List[Frame] = [
+        # Inside the seed: dropped, and never a latency sample.
+        ((event_ms + 100) * NS_PER_MS + queued,
+         _depth(event_ms + 100, U=4, u=5)),
+        # A print held in the same queue: archived, not sampled.
+        ((event_ms + 200) * NS_PER_MS + queued, _agg_trade(event_ms + 200)),
+        # The frame that closes the window: still queued behind the snapshot.
+        ((event_ms + 300) * NS_PER_MS + queued,
+         _depth(event_ms + 300, U=6, u=7, b=[["100.0", "1"]], a=[["100.5", "1"]])),
+        # The first frame that arrived after the window: the honest sample.
+        ((event_ms + 400) * NS_PER_MS + 20 * NS_PER_MS,
+         _depth(event_ms + 400, U=8, u=9, b=[["100.0", "1"]], a=[["100.5", "1"]])),
+    ]
+
+    async def _session() -> None:
+        try:
+            await client._seed_snapshot()
+            await client.consume(_FrameSource(items))
+        finally:
+            await client.aclose()
+
+    asyncio.run(_session())
+    summary = client.latency.summary()
+    assert summary.samples == 1
+    assert summary.max_ms == pytest.approx(20.0)
+    assert client.latency.breaches == 0
+    # All four frames were still received and counted; only the sampling changed.
+    assert client.stats.frames == 5
+    assert client.stats.pre_handoff_drops == 1
+
+
 def test_a_depth_frame_with_no_update_id_is_archived_not_dropped(tmp_path) -> None:
     """An id a capture cannot read is not a licence to delete a real update.
 
