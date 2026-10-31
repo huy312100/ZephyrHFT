@@ -53,11 +53,14 @@ import random
 import signal
 import sys
 import time
+import urllib.error
+import urllib.request
 from collections import deque
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, AsyncIterator, Deque, Mapping, Optional, Sequence, Tuple
+from typing import (Any, AsyncIterator, Callable, Deque, List, Mapping, Optional,
+                    Sequence, Tuple)
 
 # Make the repository root importable when this script is run directly.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -67,6 +70,8 @@ from python_analytics.utils.config import (
     COMPRESSION_CHOICES,
     ConfigError,
     DataIngestionSettings,
+    check_snapshot_limit,
+    depth_snapshot_url,
     parse_stream_names,
     silent_aux_streams,
 )
@@ -188,12 +193,22 @@ def unwrap_frame_text(raw: str) -> str:
     return raw[span[0]:span[1]]
 
 
+#: The marker written into an archived book seed, and the only thing that makes
+#: it recognisable. Shape is not enough: the spot `depth20@100ms` *stream* sends
+#: frames shaped `{"lastUpdateId", "bids", "asks"}` with no event type, and
+#: reading those as seeds would let a capture of an un-ingestible stream report
+#: a clean archive. Namespaced because the venue owns the values of `e`.
+SNAPSHOT_MARKER = "zephyr.bookSnapshot"
+
+
 def event_kind(payload: Any) -> str:
-    """Classifies a payload as ``depth``, ``trade`` or ``other``."""
+    """Classifies a payload as ``depth``, ``trade``, ``snapshot`` or ``other``."""
     data = unwrap_payload(payload)
     if not isinstance(data, Mapping):
         return "other"
     event = data.get("e")
+    if event == SNAPSHOT_MARKER:
+        return "snapshot"
     if event in ("depthUpdate", "depth"):
         return "depth"
     if event in ("trade", "aggTrade"):
@@ -230,6 +245,127 @@ def parse_payload(raw: str) -> Optional[Any]:
         return json.loads(raw)
     except (TypeError, ValueError):
         return None
+
+
+def frame_update_ids(payload: Any) -> Tuple[Optional[int], Optional[int]]:
+    """Returns ``(first_id, last_id)`` of a diff frame, ``None`` when unreadable.
+
+    Binance's diff streams publish the update-id range a frame covers: ``U`` is
+    the first id in it, ``u`` the last. Against a snapshot ending at ``L`` those
+    two numbers distinguish the three cases the handoff has to resolve -- a frame
+    entirely inside the seed (``u <= L``, redundant), one that continues it
+    (``U <= L + 1``, the first frame to trust), and one with ids missing before
+    it (``U > L + 1``, a book that may still hold a level the market deleted).
+    """
+    data = unwrap_payload(payload)
+    if not isinstance(data, Mapping):
+        return None, None
+
+    def _read(key: str) -> Optional[int]:
+        raw = data.get(key)
+        if raw is None or isinstance(raw, bool):
+            return None
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            return None
+
+    return _read("U"), _read("u")
+
+
+def snapshot_update_id(payload: Any) -> Optional[int]:
+    """Returns a book snapshot's ``lastUpdateId``, or ``None`` when it has none.
+
+    The id is what the stream is reconciled against, so this reads it from the
+    annotated line the capture archives -- the same bytes a later study parses.
+    """
+    data = unwrap_payload(payload)
+    if not isinstance(data, Mapping):
+        return None
+    raw = data.get("lastUpdateId")
+    if raw is None or isinstance(raw, bool):
+        return None
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+def fetch_snapshot_text(url: str, timeout_s: float) -> str:
+    """Fetches an absolute depth snapshot and returns the venue's raw body.
+
+    Runs on a worker thread (``asyncio.to_thread``), so the receive loop never
+    blocks on HTTP. The body is returned **verbatim**: it is archived as a line
+    of the roll file and re-serialising it would make the capture disagree with
+    the venue about number formatting, which is the one thing the archive exists
+    not to do. Raises on any failure; the caller decides what a failed seed means
+    (the capture continues, it just records the hole).
+    """
+    request = urllib.request.Request(
+        url, headers={"User-Agent": "ZephyrHFT-ingest/1.0", "Accept": "application/json"}
+    )
+    with urllib.request.urlopen(request, timeout=timeout_s) as response:
+        return response.read().decode("utf-8")
+
+
+def annotate_snapshot(text: str, symbol: str) -> Optional[str]:
+    """Marks a REST book snapshot as capture metadata, textually.
+
+    Returns ``None`` unless the body is a JSON **object** carrying
+    ``lastUpdateId`` and non-empty array-valued ``bids``/``asks`` -- the fields
+    every consumer here keys a seed on, and the one thing that distinguishes a
+    book snapshot from whatever else a 200 response can hold: a proxy page, an
+    error body, ``{}``, a JSON array, or a well-keyed object with no levels in
+    it. Marking those would be worse than not marking them: the inserted fields
+    trail a comma, so an empty object becomes invalid JSON, and a body with no
+    book in it would be counted and logged as a successful seed -- and, downstream,
+    would clear a ladder that was working.
+
+    Two fields can be added to a real snapshot, each a fact about this capture
+    rather than a claim about the market, inserted right after the opening ``{``
+    so the venue's own bytes stay byte-for-byte:
+
+    * ``e`` -- the marker ``classify`` looks for. Without it the seed would have
+      to be recognised by shape, which is how a partial-book *stream* would be
+      mistaken for a seed and quietly never applied.
+    * ``s`` -- neither response names its market, and every consumer selects
+      frames by symbol, so an unlabelled seed is the one line a mixed capture
+      could attribute to the wrong book.
+
+    No timestamp is ever added. The USDⓈ-M snapshot carries its own ``E`` (venue
+    clock, comparable with the frames around it); the spot snapshot carries
+    neither ``E`` nor ``T``, and this capture's receive time does not belong in
+    the archive at all (decision ``P1-D1``, docs/phase1 §9.1) still less under the
+    venue's field name: ordering a host-domain value against venue-domain frames
+    compares two clocks, so a fast host puts the seed *after* the lines it
+    precedes and a slow one publishes a mid *before* the market it describes. A
+    seed with no venue timestamp therefore seeds the **book** only, and the first
+    frame that continues ``lastUpdateId`` carries the mid -- at most one depth
+    interval later, in a domain that means something.
+
+    A field the venue already sent is never overwritten.
+    """
+    start = text.find("{")
+    if start < 0:
+        return None
+    try:
+        payload = json.loads(text)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(payload, Mapping) or "lastUpdateId" not in payload:
+        return None
+    # A response can carry the right keys and still hold no book. Archived as a
+    # seed it would replace a ladder that was working with nothing, so the check
+    # is on the contents, not just the field names.
+    bids, asks = payload.get("bids"), payload.get("asks")
+    if not isinstance(bids, list) or not isinstance(asks, list):
+        return None
+    if not bids or not asks:
+        return None
+    parts: List[str] = [f'"e":"{SNAPSHOT_MARKER}"']
+    if payload.get("s") is None and payload.get("symbol") is None:
+        parts.append(f'"s":"{str(symbol).upper()}"')
+    return f'{text[:start + 1]}{",".join(parts)},{text[start + 1:]}'
 
 
 def percentile(samples: Sequence[int], fraction: float) -> float:
@@ -672,6 +808,14 @@ class IngestStats:
     disconnects: int = 0
     reconnects: int = 0
     connect_failures: int = 0
+    #: Book seeds archived this session (counted as they are classified, so a
+    #: replayed archive reports the same number as the capture that wrote it).
+    snapshots: int = 0
+    snapshot_failures: int = 0
+    #: Depth frames dropped because the seed already contains them.
+    pre_handoff_drops: int = 0
+    #: Connections whose seeded book could not be matched to the stream.
+    handoff_gaps: int = 0
 
     def elapsed_s(self, now_ns: int) -> float:
         if not self.started_ns:
@@ -708,6 +852,17 @@ class _SocketFrames:
 
     def __aiter__(self) -> "_SocketFrames":
         return self
+
+    async def open(self) -> None:
+        """Connects without reading a frame.
+
+        The snapshot is fetched with the socket already open, which is what makes
+        the frames that arrive during the HTTP round trip *available* to be
+        reconciled against it instead of lost. Iteration still connects lazily, so
+        this only moves the handshake earlier; calling it twice is harmless.
+        """
+        if self._iterator is None and not self._closed:
+            await self._connect()
 
     async def __anext__(self) -> Frame:
         client = self._client
@@ -781,11 +936,19 @@ class L2IngestClient:
         clock=time.time_ns,
         rng: Optional[random.Random] = None,
         max_file_bytes: Optional[int] = None,
+        snapshot_fetcher: Optional[Callable[[str, float], str]] = None,
     ) -> None:
         self._settings = settings
         self._clock = clock
         self._rng = rng
         self._track_latency = track_latency
+        self._snapshot_fetcher = snapshot_fetcher or fetch_snapshot_text
+        self._snapshot_url: Optional[str] = None
+        self._snapshot_url_logged = False
+        #: `lastUpdateId` of the seed archived on the current connection.
+        self._handoff_id: Optional[int] = None
+        #: True between archiving a seed and placing the first frame after it.
+        self._handoff_pending = False
         self._writer = (
             None
             if dry_run
@@ -895,11 +1058,19 @@ class L2IngestClient:
         return str(message)
 
     # -- hot path ---------------------------------------------------------- #
-    def _handle_frame(self, recv_ns: int, raw: str) -> None:
+    def _handle_frame(self, recv_ns: int, raw: str,
+                      measure_latency: bool = True) -> None:
         """Archives + measures one frame. No awaits, no copies beyond JSON."""
         stats = self._stats
         stats.frames += 1
         stats.bytes_received += len(raw)
+
+        # The handoff window is the one place the capture curates the stream:
+        # the depth frames it drops here are frames the archived seed already
+        # describes. Outside that window nothing is filtered, so the tape stays
+        # byte-complete.
+        if self._handoff_pending and self._drop_pre_handoff(raw):
+            return
 
         # Archive first: the capture stays byte-complete even if a payload is
         # unparseable, which is what makes the roll files usable as ground truth.
@@ -919,12 +1090,20 @@ class L2IngestClient:
             stats.depth_frames += 1
         elif kind == "trade":
             stats.trade_frames += 1
+        elif kind == "snapshot":
+            # Counted on the way through, not by the caller that fetched it: a
+            # replayed archive then reports the same number of seeds as the
+            # capture that wrote it. It also keeps a spot seed -- which carries
+            # no venue timestamp by design -- out of `no_timestamp`, where it
+            # would look like a frame that cannot be placed.
+            stats.snapshots += 1
+            return
 
         event_ns = event_timestamp_ns(payload)
         if event_ns is None:
             stats.no_timestamp += 1
             return
-        if not self._track_latency:
+        if not measure_latency or not self._track_latency:
             return
 
         latency_ns = recv_ns - event_ns
@@ -952,6 +1131,118 @@ class L2IngestClient:
         return consumed
 
     # -- session drivers --------------------------------------------------- #
+    def _drop_pre_handoff(self, raw: str) -> bool:
+        """Returns ``True`` for a depth frame the archived seed already contains.
+
+        The socket opens before the snapshot is fetched, so the frames delivered
+        during the HTTP round trip describe a book the seed also describes.
+        Archiving them would write timestamps *behind* the seed line that
+        precedes them -- the mid timeline refuses a non-chronological file -- and
+        re-applying their levels to the seeded book would move each one twice.
+
+        The venue's own ids make the boundary a check instead of an assumption:
+        the first frame whose last id passes ``lastUpdateId`` continues the seed
+        only when its range starts at ``lastUpdateId + 1``. Anything further is a
+        hole no socket carried, and the book on the other side of it is unproven
+        (a level one of the missed updates deleted is still in it). That is
+        counted, not silently kept: see :attr:`IngestStats.handoff_gaps`.
+        """
+        payload = parse_payload(raw)
+        if event_kind(payload) != "depth":
+            # Prints are the tape. Nothing about the book justifies losing one,
+            # and the analysis reads prints and mids on separate paths anyway.
+            return False
+        first_id, last_id = frame_update_ids(payload)
+        snapshot_id = self._handoff_id
+        if snapshot_id is None:
+            self._handoff_pending = False
+            return False
+        if last_id is None:
+            # A diff frame with no id cannot be placed against the seed at all;
+            # archiving it is the honest failure, dropping a real update is not.
+            self._handoff_pending = False
+            return False
+        if last_id <= snapshot_id:
+            self._stats.pre_handoff_drops += 1
+            return True
+        self._handoff_pending = False
+        if first_id is None or first_id > snapshot_id + 1:
+            self._stats.handoff_gaps += 1
+            logger.warning(
+                "snapshot-to-stream handoff is not contiguous: seed lastUpdateId=%d, "
+                "first frame %s (updates %d..%d were on no socket)",
+                snapshot_id, "carries no U" if first_id is None else f"U={first_id}",
+                snapshot_id + 1, (first_id - 1) if first_id is not None else snapshot_id,
+            )
+        else:
+            logger.debug("book handoff established at update %d", last_id)
+        return False
+
+    async def _seed_snapshot(self) -> None:
+        """Archives an absolute depth snapshot so the book has a mid at once.
+
+        A depth subscription is a *diff* stream. A reader that starts empty --
+        and every reader starts empty, and every reader is empty again after a
+        reconnect until enough deltas arrive -- has no book, and a study that
+        marks fills against a missing mid drops them. Fetching one snapshot per
+        connection turns a 113 s blind window into a single line in the roll
+        file that the analysis can rebuild the book from.
+
+        Failing to seed is a recorded hole, not a capture failure: the venue's
+        own stream is still archived byte-for-byte, so nothing here can corrupt
+        the tape.
+        """
+        if not self._settings.snapshot_on_connect:
+            return
+        if self._snapshot_url is None:
+            self._snapshot_url = depth_snapshot_url(
+                self._settings.endpoint,
+                self._settings.symbol,
+                self._settings.snapshot_limit,
+            )
+            if self._snapshot_url is None and not self._snapshot_url_logged:
+                self._snapshot_url_logged = True
+                logger.warning(
+                    "no depth snapshot endpoint is known for %s; the archive "
+                    "will have no seeded book (see --no-snapshot to silence this)",
+                    self._settings.endpoint,
+                )
+        if self._snapshot_url is None:
+            return
+        try:
+            text = await asyncio.to_thread(
+                self._snapshot_fetcher, self._snapshot_url,
+                self._settings.snapshot_timeout_s,
+            )
+        except Exception as exc:  # noqa: BLE001 - a seed failure is never fatal
+            self._stats.snapshot_failures += 1
+            logger.warning("depth snapshot failed (%s: %s); continuing unseeded",
+                           type(exc).__name__, exc)
+            return
+        received_ns = self._clock()
+        # The venue's own fields win; the capture adds only what it knows and a
+        # snapshot lacks -- its marker and its market, and never a timestamp.
+        seeded = annotate_snapshot(text, self._settings.symbol)
+        if seeded is None:
+            # A 200 that is not a book: a proxy page, an error body, `{}`, an
+            # array. Counting it as a seed would report a book this capture never
+            # received, and archiving it would put a line the parser must reject
+            # into an archive meant to be ground truth.
+            self._stats.snapshot_failures += 1
+            logger.warning(
+                "depth response is not a book snapshot (%d bytes, no "
+                "lastUpdateId); continuing unseeded", len(text))
+            return
+        logger.info("seeded the book from %s (%d bytes)", self._snapshot_url, len(seeded))
+        # Reconcile the stream against this seed. Pending is set before the line
+        # is archived, and that is safe for exactly one reason: a seed classifies
+        # as ``snapshot``, never as ``depth``, so the frame that opens the window
+        # is never the frame the window drops. The seed itself is counted by
+        # ``_handle_frame``, which is what makes the number an archival fact.
+        self._handoff_id = snapshot_update_id(parse_payload(seeded))
+        self._handoff_pending = self._handoff_id is not None
+        self._handle_frame(received_ns, seeded, measure_latency=False)
+
     async def run(self) -> IngestStats:
         """Connects, ingests and reconnects until stopped."""
         if not self._settings.enabled:
@@ -1002,6 +1293,23 @@ class L2IngestClient:
             error: Optional[BaseException] = None
             source = _SocketFrames(self)
             try:
+                # The venue's own order for building a local book: open the
+                # stream, fetch the snapshot, then drop the frames the snapshot
+                # already contains (`_drop_pre_handoff`). Seeding *before* the
+                # socket opens also produced a monotonic file -- it was the first
+                # thing measured here to do so -- but it could not be checked.
+                # The ids between the seed's ``lastUpdateId`` and the first frame
+                # were on no socket at all, so the book could still carry a level
+                # the market had already deleted, and a phantom best bid is a mid
+                # that is wrong in a way nothing downstream can see. With the
+                # socket open first, those frames are buffered instead of lost:
+                # the ones inside the seed are dropped rather than archived, and
+                # the first one beyond it either continues the sequence or
+                # reports the gap.
+                self._handoff_pending = False
+                self._handoff_id = None
+                await source.open()
+                await self._seed_snapshot()
                 frames = await self.consume(source)
             except FeedUnavailable:
                 raise
@@ -1074,6 +1382,14 @@ class L2IngestClient:
             parts.append(f"malformed={stats.malformed}")
         if stats.reconnects or stats.connect_failures:
             parts.append(f"reconnects={stats.reconnects} fail={stats.connect_failures}")
+        if stats.snapshots or stats.snapshot_failures:
+            # The handoff counters ride with the seed count and are printed even
+            # when zero: a seed nobody reconciled is the failure worth seeing, so
+            # the line carries the evidence rather than only the exceptions.
+            parts.append(
+                f"snapshots={stats.snapshots} snap_fail={stats.snapshot_failures} "
+                f"pre_handoff={stats.pre_handoff_drops} "
+                f"handoff_gaps={stats.handoff_gaps}")
         if self._writer is not None:
             writer = self._writer.stats()
             ratio = (
@@ -1128,6 +1444,15 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
                         help="latency/throughput summary cadence in seconds")
     parser.add_argument("--latency-warn-ms", type=float, default=None,
                         help="WARNING threshold for feed latency")
+    parser.add_argument("--no-snapshot", dest="snapshot_on_connect",
+                        action="store_false", default=None,
+                        help="do not seed the book from a REST depth snapshot on "
+                             "connect/reconnect (the archive then has no mid until "
+                             "the venue's deltas rebuild one)")
+    parser.add_argument("--snapshot-limit", type=int, default=None,
+                        help="levels requested from the snapshot endpoint; the "
+                             "venue's own set applies (USD-M: 5, 10, 20, 50, 100, "
+                             "500, 1000; spot: any depth to 5000). Default 1000.")
     parser.add_argument("--dry-run", action="store_true",
                         help="connect and measure only; write no files")
     parser.add_argument("--replay", type=Path, default=None,
@@ -1149,6 +1474,8 @@ def build_settings(args: argparse.Namespace) -> DataIngestionSettings:
         "flush_interval_ms": args.flush_interval_ms,
         "telemetry_interval_s": args.telemetry_interval,
         "latency_warn_ms": args.latency_warn_ms,
+        "snapshot_on_connect": args.snapshot_on_connect,
+        "snapshot_limit": args.snapshot_limit,
     }
     # ``--depth-only`` wins over ``--aux-stream``: an explicit request to drop
     # the tape must not be undone by a flag earlier on the command line.
@@ -1157,7 +1484,14 @@ def build_settings(args: argparse.Namespace) -> DataIngestionSettings:
     elif args.aux_streams:
         overrides["aux_streams"] = parse_stream_names(args.aux_streams)
     overrides = {name: value for name, value in overrides.items() if value is not None}
-    return replace(settings, **overrides) if overrides else settings
+    settings = replace(settings, **overrides) if overrides else settings
+    # ``dataclasses.replace`` does not re-run the settings validation, so a CLI
+    # value could otherwise reach the venue with a depth it answers with HTTP
+    # 400 -- an unseeded capture that still exits clean. Checked against the
+    # endpoint the merged settings will actually dial.
+    check_snapshot_limit(
+        settings.endpoint, settings.snapshot_limit, "--snapshot-limit")
+    return settings
 
 
 def install_signal_handlers(client: L2IngestClient) -> None:
@@ -1215,6 +1549,15 @@ def _print_summary(
     if stats.reconnects:
         print(f"  Reconnects    : {stats.reconnects}"
               f"  (failures: {stats.connect_failures})")
+    if stats.snapshots or stats.snapshot_failures:
+        print(f"  Book seeds    : {stats.snapshots}"
+              f"  (failed: {stats.snapshot_failures})")
+    if stats.snapshots:
+        # Shown even when clean: "dropped 3, gaps 0" is the statement that the
+        # seeded book and the stream are one update sequence, which is the whole
+        # reason the seed is archived after the socket opens.
+        print(f"  Book handoff  : {stats.pre_handoff_drops} frame(s) already in "
+              f"the seed dropped, {stats.handoff_gaps} non-contiguous handoff(s)")
     if stats.malformed or stats.no_timestamp:
         print(f"  Diagnostics   : malformed={stats.malformed}"
               f"  no_timestamp={stats.no_timestamp}")

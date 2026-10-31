@@ -227,6 +227,14 @@ def markouts_from_files(args: argparse.Namespace,
         "timeline_first_ts_ns": timeline.first_ts_ns,
         "timeline_last_ts_ns": timeline.last_ts_ns,
         "timeline_ignored_frames": timeline.ignored,
+        # The book's health, not just its size: a mid can be present in every row
+        # and still sit on a seed the stream did not continue, or on a ladder the
+        # study rebuilt from deltas alone. Same names as the edge curve uses.
+        "timeline_malformed": timeline.malformed,
+        "timeline_stale": timeline.stale,
+        "timeline_handoff_gaps": timeline.handoff_gaps,
+        "timeline_seed_backdated": timeline.seed_backdated,
+        "timeline_seed_unstamped": timeline.seed_unstamped,
         "fills_loaded": len(loaded),
         "fills_dropped_other_symbol": dropped,
         "fills": len(fills),

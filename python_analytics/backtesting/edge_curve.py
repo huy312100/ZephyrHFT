@@ -500,6 +500,14 @@ def measure_edge_curve(scan: TapeScan, timeline: MarkoutTimeline,
             "median_mid": median_mid,
             "timeline_samples": len(timeline),
             "timeline_max_gap_s": timeline.max_gap_s,
+            # The health of the book the mids came from, not just how many there
+            # are: coverage is what makes a far row decidable, and a seeded book
+            # whose handoff the stream could not continue is the one way a mid can
+            # be present and still wrong.
+            "timeline_stale": timeline.stale,
+            "timeline_handoff_gaps": timeline.handoff_gaps,
+            "timeline_seed_backdated": timeline.seed_backdated,
+            "timeline_seed_unstamped": timeline.seed_unstamped,
         },
         "rows": rows,
     }

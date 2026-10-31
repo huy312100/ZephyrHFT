@@ -29,6 +29,48 @@ EXCHANGE_ENDPOINTS: Dict[str, str] = {
     "binance_spot": "wss://stream.binance.com:9443/ws",
 }
 
+# REST side of the same venues, for the absolute depth snapshot the capture seeds
+# its book from. The path differs by product (futures ``/fapi/v1/depth``, spot
+# ``/api/v3/depth``), which is why this is a pair and not a base URL.
+#
+# The seed matters because a depth subscription is a *diff* stream: after a
+# reconnect it resumes into whatever book the reader still holds, and a reader
+# that starts empty has no mid at all until enough deltas arrive. In the 3 h
+# capture that took 113 s, and the fills in that window could not be marked --
+# which is exactly where the far-quote question lives (docs/phase5 §11.8.7).
+DEPTH_SNAPSHOT_ENDPOINTS: Dict[str, Tuple[str, str]] = {
+    # ``fstream`` is the market-data *websocket* host and answers the REST path
+    # with a 403; the USDⓈ-M REST API lives on ``fapi``.
+    "binance_futures": ("https://fapi.binance.com", "/fapi/v1/depth"),
+    "binance_futures_testnet": ("https://testnet.binancefuture.com", "/fapi/v1/depth"),
+    "binance_spot": ("https://api.binance.com", "/api/v3/depth"),
+}
+
+#: Depth limits each venue actually accepts, measured against the live API
+#: rather than read off a page: USDⓈ-M ``/fapi/v1/depth`` rejects ``limit=7``
+#: (HTTP 400, -4021 "7 is not valid depth limit") as well as ``limit=1001`` and
+#: ``limit=2000`` (HTTP 400, -1130), so a free 1-1000 integer range would
+#: configure a request that always fails and silently leave the capture
+#: unseeded. ``None`` means the product takes any value up to its maximum, as
+#: spot does (``limit=2000`` and ``5000`` both returned the full book). The
+#: testnet entry carries the same set as its production twin by product, not by
+#: probe: only ``fapi.binance.com`` and ``api.binance.com`` were dialled.
+DEPTH_SNAPSHOT_LIMITS: Dict[str, Optional[Tuple[int, ...]]] = {
+    "binance_futures": (5, 10, 20, 50, 100, 500, 1000),
+    "binance_futures_testnet": (5, 10, 20, 50, 100, 500, 1000),
+    "binance_spot": None,
+}
+
+#: Hard ceiling per product, used when the accepted set is open (``None`` above).
+#: Spot's is not enforced by the venue: ``limit=6000`` returns HTTP 200 with the
+#: book clamped to 5000 levels, so asking beyond it is a silently short answer
+#: rather than a rejected request -- which is why the ceiling is checked here.
+DEPTH_SNAPSHOT_MAX_LIMIT: Dict[str, int] = {
+    "binance_futures": 1000,
+    "binance_futures_testnet": 1000,
+    "binance_spot": 5000,
+}
+
 # Binance USDⓈ-M Futures environments selected by ``BINANCE_ENV``. Only public
 # endpoint metadata lives here: API keys and secrets are read from the
 # ``BINANCE_API_KEY`` / ``BINANCE_API_SECRET`` environment variables so they are
@@ -161,6 +203,18 @@ class DataIngestionSettings:
     reconnect_max_delay_s: float = 30.0
     max_reconnect_attempts: int = 0
     ws_base_url: str = ""
+    #: Seed the analysis book from a REST depth snapshot, once per connection and
+    #: with the stream already open. A diff stream resumed into an empty book has
+    #: no mid until enough deltas arrive, and the fills in that window cannot be
+    #: marked.
+    snapshot_on_connect: bool = True
+    #: Levels requested from the snapshot endpoint. There is no single ceiling:
+    #: USDⓈ-M serves 5/10/20/50/100/500/1000 and answers anything else with HTTP
+    #: 400, while spot serves any depth up to 5000 (and clamps beyond it). The
+    #: value is validated against the endpoint actually dialled, by
+    #: :func:`check_snapshot_limit`, at load.
+    snapshot_limit: int = 1000
+    snapshot_timeout_s: float = 10.0
 
     @property
     def endpoint(self) -> str:
@@ -499,6 +553,55 @@ def exchange_for_endpoint(ws_base_url: str) -> str:
     return ""
 
 
+def depth_snapshot_url(ws_base_url: str, symbol: str, limit: int = 1000) -> Optional[str]:
+    """REST URL for an absolute depth snapshot on the venue being captured.
+
+    Keyed on the endpoint dialled, not on the configured name, for the same
+    reason as :func:`exchange_for_endpoint`: an override moves the frames to
+    another venue. An endpoint that is not in :data:`DEPTH_SNAPSHOT_ENDPOINTS`
+    gets ``None`` -- guessing a REST host for an unknown server is how a capture
+    points a snapshot at the wrong book.
+    """
+    pair = DEPTH_SNAPSHOT_ENDPOINTS.get(exchange_for_endpoint(ws_base_url))
+    if pair is None:
+        return None
+    base, path = pair
+    return f"{base}{path}?symbol={str(symbol).upper()}&limit={int(limit)}"
+
+
+def check_snapshot_limit(ws_base_url: str, limit: int,
+                         field: str = "data_ingestion.snapshot_limit") -> int:
+    """Returns ``limit`` if the venue would accept it, else raises ``ConfigError``.
+
+    Checked against the endpoint being dialled -- not against the configured
+    ``exchange``, which only supplies a default URL -- because the products
+    differ: the USDⓈ-M book takes one of seven discrete sizes, while spot takes
+    any depth up to its own maximum. Bounding by the name would reject a spot
+    ``limit=2000`` that the dialled venue serves and accept a futures one that
+    400s. A value the venue rejects is worse than a config typo -- the request
+    400s, the capture continues unseeded, and the book stays blind for exactly
+    the reason the seed exists to prevent.
+    """
+    exchange = exchange_for_endpoint(ws_base_url)
+    value = int(limit)
+    if value < 1:
+        raise ConfigError(f"'{field}' must be >= 1, got {value}")
+    allowed = DEPTH_SNAPSHOT_LIMITS.get(exchange)
+    ceiling = DEPTH_SNAPSHOT_MAX_LIMIT.get(exchange, 1000)
+    if value > ceiling:
+        raise ConfigError(
+            f"'{field}' must be <= {ceiling} for {exchange or 'this endpoint'}, "
+            f"got {value}"
+        )
+    if allowed is not None and value not in allowed:
+        raise ConfigError(
+            f"'{field}' must be one of {', '.join(str(n) for n in allowed)} for "
+            f"{exchange or 'this endpoint'} (the venue answers any other depth "
+            f"with HTTP 400), got {value}"
+        )
+    return value
+
+
 def silent_aux_streams(
     aux_streams: Sequence[str], ws_base_url: str
 ) -> Tuple[str, ...]:
@@ -527,6 +630,9 @@ def _build_data_ingestion(raw: Mapping[str, Any]) -> DataIngestionSettings:
             "'data_ingestion.ws_base_url' must start with ws:// or wss://: "
             f"{base_url!r}"
         )
+    # The snapshot depth is checked against the endpoint that will actually be
+    # dialled, because that is the venue that will answer it.
+    resolved_ws = base_url or EXCHANGE_ENDPOINTS[exchange]
     storage_path = str(raw.get("storage_path", defaults.storage_path)).strip()
     if not storage_path:
         raise ConfigError("'data_ingestion.storage_path' must not be empty")
@@ -602,6 +708,28 @@ def _build_data_ingestion(raw: Mapping[str, Any]) -> DataIngestionSettings:
             raw.get("max_reconnect_attempts", defaults.max_reconnect_attempts),
             "data_ingestion.max_reconnect_attempts",
             minimum=0,
+        ),
+        snapshot_on_connect=bool(
+            raw.get("snapshot_on_connect", defaults.snapshot_on_connect)
+        ),
+        snapshot_limit=check_snapshot_limit(
+            resolved_ws,
+            # No ceiling here: the limit belongs to the endpoint being dialled,
+            # and `exchange` is only the default for it. Bounding by the
+            # configured name would reject a valid spot depth whenever
+            # `ws_base_url` points at spot, and accept an impossible one when it
+            # points the other way. check_snapshot_limit judges the venue that
+            # will actually answer.
+            _int(
+                raw.get("snapshot_limit", defaults.snapshot_limit),
+                "data_ingestion.snapshot_limit",
+                minimum=1,
+            ),
+        ),
+        snapshot_timeout_s=_float(
+            raw.get("snapshot_timeout_s", defaults.snapshot_timeout_s),
+            "data_ingestion.snapshot_timeout_s",
+            minimum=0.5,
         ),
         ws_base_url=base_url,
     )

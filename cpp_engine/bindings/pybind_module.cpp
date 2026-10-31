@@ -152,7 +152,8 @@ PYBIND11_MODULE(hft_native, m) {
     py::enum_<FeedMessageType>(m, "FeedMessageType")
         .value("UNKNOWN", FeedMessageType::Unknown)
         .value("DEPTH_UPDATE", FeedMessageType::DepthUpdate)
-        .value("TRADE", FeedMessageType::Trade);
+        .value("TRADE", FeedMessageType::Trade)
+        .value("BOOK_SNAPSHOT", FeedMessageType::BookSnapshot);
     py::enum_<SystemState>(m, "SystemState")
         .value("NORMAL", SystemState::NORMAL)
         .value("TRIGGERED", SystemState::TRIGGERED)
@@ -866,7 +867,8 @@ PYBIND11_MODULE(hft_native, m) {
         .def_readonly("depth_events", &ingest_stats::depth_events)
         .def_readonly("trade_events", &ingest_stats::trade_events)
         .def_readonly("malformed", &ingest_stats::malformed)
-        .def_readonly("gaps", &ingest_stats::gaps);
+        .def_readonly("gaps", &ingest_stats::gaps)
+        .def_readonly("snapshots", &ingest_stats::snapshots);
 
     m.def("match_taker", [](const L2Book& book, Side side, Quantity quantity) {
         return match_taker(book, side, quantity);

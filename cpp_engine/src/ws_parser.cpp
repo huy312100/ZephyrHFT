@@ -257,10 +257,21 @@ bool JsonFeedParser::parse_trade(std::string_view json, TradeTick& out) noexcept
 FeedMessageType JsonFeedParser::classify(std::string_view json) noexcept {
     RawValue value;
     if (!locate(json, "e", value) || !value.quoted) {
+        // Deliberately Unknown. Identifying the archived book seed by shape
+        // (`lastUpdateId` + `bids` + `asks`) looks sufficient and is not: the
+        // spot partial-book *stream* (`depth20@100ms`, an example in
+        // config/settings.yaml) sends frames in exactly that shape with no `e`.
+        // Shape matching would classify them as seeds, skip the delta path, and
+        // report a capture that archived a book the engine never saw as clean --
+        // a silent failure where the malformed count used to be a loud one. The
+        // seed is therefore recognised only by the marker the capture writes.
         return FeedMessageType::Unknown;
     }
     const std::string_view event(value.begin,
                                  static_cast<std::size_t>(value.end - value.begin));
+    if (event == "zephyr.bookSnapshot") {
+        return FeedMessageType::BookSnapshot;
+    }
     if (event == "depthUpdate" || event == "depth") {
         return FeedMessageType::DepthUpdate;
     }

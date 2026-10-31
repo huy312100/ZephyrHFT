@@ -45,19 +45,43 @@ data_ingestion:
   exchange: binance_futures        # binance_futures | binance_futures_testnet | binance_spot
   symbol: btcusdt                  # lowercase, as required by the stream name
   stream_type: depth@100ms         # e.g. depth@100ms, depth@500ms, depth20@100ms
+  # On USDⓈ-M a partial-book stream is still a diff stream (verified on the wire:
+  # ``e=depthUpdate`` with ``U``/``u`` and ``b``/``a``), so it ingests. On **spot**
+  # it is not: those frames arrive as an absolute book with no event type, every
+  # one counts as malformed, and the archive fails ``phase1.archive_integrity``.
+  # That shape is what the book seed below uses, which is why the seed carries an
+  # explicit marker instead of being recognised by shape.
   # Extra streams on the same socket (combined-stream form). The tape is what
   # separates "our quote was hit" from "the book crossed us" -- without prints
   # every backtested fill is adversarially selected by construction. ``trade`` is
   # the stream that actually delivers on this endpoint (@aggTrade is silently
-  # empty); ``--aux-stream aggTrade`` still works if a venue serves it. Only
-  # depth and trade payloads are parsed and every other frame counts as
-  # malformed, so asking for e.g. ``markPrice@1s`` would archive frames that
-  # fail the archive-integrity check.
+  # empty); ``--aux-stream aggTrade`` still works if a venue serves it. Native
+  # ingestion understands depth diffs, trade prints and the archived book seed
+  # below; every other frame counts as malformed, so asking for e.g.
+  # ``markPrice@1s`` would archive frames that fail the archive-integrity check.
   aux_streams: [trade]            # e.g. [trade], [] = depth only
   storage_path: data/raw_l2        # relative to the repository root
   compression: gzip                # gzip | none
   compression_level: 1             # 1 = fastest (ingest path), 9 = smallest
   flush_interval_ms: 250           # max time a record waits in the write buffer
+  # Absolute book snapshot, fetched over REST with the socket already open and
+  # archived as the first line of each connection. A depth subscription is a
+  # *diff* stream: without a seed the reader has no mid until enough deltas
+  # arrive (113 s in the 3 h capture), and every fill in that window is
+  # unmarkable -- which is exactly where the far quotes trade. The frames that
+  # land during the REST round trip are dropped rather than archived, because
+  # the seed already contains them; the first frame beyond it then has to
+  # continue the seed's update-id range or the session reports a `handoff_gap`.
+  # `false` (or `--no-snapshot`) captures the venue's stream only, undropped.
+  snapshot_on_connect: true
+  # Depth must be one the venue serves, judged against the endpoint actually
+  # dialled (`ws_base_url` if set, otherwise `exchange`'s default): USDⓈ-M
+  # accepts 5/10/20/50/100/500/1000 and answers anything else with HTTP 400, spot
+  # serves any depth to 5000 and quietly clamps larger requests back to 5000. A
+  # rejected value is refused at startup, because the failed request would leave
+  # the capture running unseeded -- the blind book this exists to prevent.
+  snapshot_limit: 1000
+  snapshot_timeout_s: 10.0
   max_file_mb: 256                 # rotate the roll file at this size (0 = never)
   rotate_seconds: 900              # ... or after this many seconds (0 = never)
   telemetry_interval_s: 10.0       # latency / throughput summary cadence

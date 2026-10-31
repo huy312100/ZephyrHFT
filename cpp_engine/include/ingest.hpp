@@ -18,6 +18,12 @@ struct ingest_stats {
     std::uint64_t trade_events{0};
     std::uint64_t malformed{0};
     std::uint64_t gaps{0};
+    // Archived REST book snapshots. Counted, never replayed as a delta: the
+    // ladder in this process is built from the diff stream, and an absolute
+    // snapshot applied through `process_update` would move levels twice. It is
+    // reported so a reader can see the capture was seeded, and the integrity
+    // check can tell a seed line from a corrupt one.
+    std::uint64_t snapshots{0};
 };
 
 [[nodiscard]] inline bool ingest_json(paper_engine& engine, std::string_view json,
@@ -44,6 +50,10 @@ struct ingest_stats {
         } else {
             ++stats.malformed;
         }
+        return true;
+    }
+    if (kind == FeedMessageType::BookSnapshot) {
+        ++stats.snapshots;
         return true;
     }
     ++stats.malformed;
