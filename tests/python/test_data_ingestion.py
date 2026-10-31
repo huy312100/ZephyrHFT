@@ -1346,10 +1346,36 @@ def test_a_snapshot_is_stamped_with_only_what_the_venue_omitted() -> None:
     assert annotated["s"] == "ETHUSDT" and annotated["E"] == 5
 
 
-def test_a_snapshot_body_that_is_not_an_object_is_left_alone() -> None:
-    """Only a JSON object can be annotated; anything else passes through."""
-    assert annotate_snapshot("not json", 1, "btcusdt") == "not json"
-    assert annotate_snapshot("[1, 2, 3]", 1, "btcusdt") == "[1, 2, 3]"
+def test_only_a_body_with_a_book_in_it_counts_as_a_snapshot() -> None:
+    """A 200 that is not a book must not be marked, archived, or counted.
+
+    A proxy or captive portal answers with whatever it likes. Marking such a body
+    would be worse than skipping it: the inserted fields trail a comma, so `{}`
+    becomes invalid JSON, and the capture would log a seeded book it never
+    received -- while archiving a line the parser has to reject into a file meant
+    to be ground truth.
+    """
+    assert annotate_snapshot("not json", 1, "btcusdt") is None
+    assert annotate_snapshot("[1, 2, 3]", 1, "btcusdt") is None
+    assert annotate_snapshot("{}", 1, "btcusdt") is None
+    # An object shaped like a book response but with no book in it.
+    assert annotate_snapshot('{"bids": [], "asks": []}', 1, "btcusdt") is None
+    # The real shape still annotates.
+    marked = annotate_snapshot(_snapshot(), 1, "btcusdt")
+    assert marked is not None and '"lastUpdateId"' in marked
+
+
+def test_a_non_book_depth_response_is_a_counted_seed_failure(tmp_path) -> None:
+    """The failure is recorded and the archive stays clean."""
+    client = _client(tmp_path, snapshot_fetcher=lambda url, timeout: "{}")
+    asyncio.run(client._seed_snapshot())
+    assert client.stats.snapshots == 0
+    assert client.stats.snapshot_failures == 1
+
+    _consume(client, [(1_700_000_000_100 * NS_PER_MS, _depth())])
+    lines = [record for path in _roll_files(tmp_path) for record in _read_roll(path)]
+    assert all("lastUpdateId" not in line for line in lines)
+    assert len(lines) == 1
 
 
 def test_the_snapshot_depth_is_validated_per_venue() -> None:

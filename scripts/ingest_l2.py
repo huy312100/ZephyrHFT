@@ -264,12 +264,20 @@ def fetch_snapshot_text(url: str, timeout_s: float) -> str:
         return response.read().decode("utf-8")
 
 
-def annotate_snapshot(text: str, now_ms: int, symbol: str) -> str:
+def annotate_snapshot(text: str, now_ms: int, symbol: str) -> Optional[str]:
     """Marks a REST book snapshot as capture metadata, textually.
 
-    Three fields, each a fact about this capture rather than a claim about the
-    market, inserted right after the opening ``{`` so the venue's own bytes stay
-    byte-for-byte:
+    Returns ``None`` unless the body is a JSON **object** carrying
+    ``lastUpdateId`` -- the one field every consumer here keys a seed on, and the
+    one thing that distinguishes a book snapshot from whatever else a 200 response
+    can hold: a proxy page, an error body, ``{}``, or a JSON array. Marking those
+    would be worse than not marking them: the inserted fields trail a comma, so an
+    empty object becomes invalid JSON, and a body with no book in it would be
+    counted and logged as a successful seed.
+
+    Three fields are added to a real snapshot, each a fact about this capture
+    rather than a claim about the market, inserted right after the opening ``{``
+    so the venue's own bytes stay byte-for-byte:
 
     * ``e`` -- the marker ``classify`` looks for. Without it the seed would have
       to be recognised by shape, which is how a partial-book *stream* would be
@@ -281,18 +289,17 @@ def annotate_snapshot(text: str, now_ms: int, symbol: str) -> str:
       frames by symbol, so an unlabelled seed is the one line a mixed capture
       could attribute to the wrong book.
 
-    A field the venue already sent is never overwritten, and a body that is not
-    a JSON object is returned unchanged.
+    A field the venue already sent is never overwritten.
     """
     start = text.find("{")
     if start < 0:
-        return text
+        return None
     try:
         payload = json.loads(text)
     except (TypeError, ValueError):
-        return text
-    if not isinstance(payload, Mapping):
-        return text
+        return None
+    if not isinstance(payload, Mapping) or "lastUpdateId" not in payload:
+        return None
     parts: List[str] = [f'"e":"{SNAPSHOT_MARKER}"']
     if payload.get("E") is None and payload.get("T") is None:
         parts.append(f'"E":{int(now_ms)}')
@@ -1069,12 +1076,22 @@ class L2IngestClient:
             logger.warning("depth snapshot failed (%s: %s); continuing unseeded",
                            type(exc).__name__, exc)
             return
-        self._stats.snapshots += 1
         received_ns = self._clock()
-        # The venue's own fields win; the capture adds only what it knows and the
-        # snapshot lacks -- its receive time and its market.
+        # The venue's own fields win; the capture adds only what it knows and a
+        # snapshot lacks -- its marker, its receive time and its market.
         seeded = annotate_snapshot(
             text, received_ns // NS_PER_MS, self._settings.symbol)
+        if seeded is None:
+            # A 200 that is not a book: a proxy page, an error body, `{}`, an
+            # array. Counting it as a seed would report a book this capture never
+            # received, and archiving it would put a line the parser must reject
+            # into an archive meant to be ground truth.
+            self._stats.snapshot_failures += 1
+            logger.warning(
+                "depth response is not a book snapshot (%d bytes, no "
+                "lastUpdateId); continuing unseeded", len(text))
+            return
+        self._stats.snapshots += 1
         logger.info("seeded the book from %s (%d bytes)", self._snapshot_url, len(seeded))
         self._handle_frame(received_ns, seeded, measure_latency=False)
 
