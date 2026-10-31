@@ -1152,8 +1152,9 @@ class L2IngestClient:
         the first frame whose last id passes ``lastUpdateId`` continues the seed
         only when its range starts at ``lastUpdateId + 1``. Anything further is a
         hole no socket carried, and the book on the other side of it is unproven
-        (a level one of the missed updates deleted is still in it). That is
-        counted, not silently kept: see :attr:`IngestStats.handoff_gaps`.
+        (a level one of the missed updates deleted is still in it). An id the
+        capture cannot read is the same verdict by a different route: unverifiable.
+        Both are counted, not silently kept: see :attr:`IngestStats.handoff_gaps`.
         """
         payload = parse_payload(raw)
         if event_kind(payload) != "depth":
@@ -1166,9 +1167,19 @@ class L2IngestClient:
             self._handoff_pending = False
             return False
         if last_id is None:
-            # A diff frame with no id cannot be placed against the seed at all;
-            # archiving it is the honest failure, dropping a real update is not.
+            # A diff frame with no id cannot be placed against the seed at all, so
+            # the handoff is *unproven* rather than clean. It is still archived --
+            # dropping a real update would hide the hole instead of reporting it --
+            # and it is counted, because the mid timeline counts the same frame: an
+            # operator must never read "0 gaps" in this summary while the study
+            # built from the same file says one.
             self._handoff_pending = False
+            self._stats.handoff_gaps += 1
+            logger.warning(
+                "book handoff cannot be verified: the first depth frame after seed "
+                "lastUpdateId=%d carries no update id",
+                snapshot_id,
+            )
             return False
         if last_id <= snapshot_id:
             self._stats.pre_handoff_drops += 1

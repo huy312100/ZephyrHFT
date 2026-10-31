@@ -1361,12 +1361,14 @@ def test_a_frame_queued_during_the_seed_is_not_sampled_as_feed_latency(tmp_path)
     assert client.stats.pre_handoff_drops == 1
 
 
-def test_a_depth_frame_with_no_update_id_is_archived_not_dropped(tmp_path) -> None:
-    """An id a capture cannot read is not a licence to delete a real update.
+def test_a_depth_frame_with_no_update_id_is_counted_and_archived(tmp_path) -> None:
+    """An id the capture cannot read makes the handoff unverifiable, not clean.
 
-    The window closes on the first depth frame either way, so a stream that names
-    no ids is archived exactly as it arrives: the honest failure is an
-    unreconciled book, not a missing one.
+    The window closes on the first depth frame either way, and the frame is still
+    archived -- deleting a real update would hide the hole rather than report it.
+    But it counts as a gap, because :class:`MarkoutTimeline` counts the same frame:
+    the capture summary and the study built from that file must not disagree about
+    whether the seeded book was ever reconciled with the stream.
     """
     client = _client(
         tmp_path,
@@ -1385,9 +1387,14 @@ def test_a_depth_frame_with_no_update_id_is_archived_not_dropped(tmp_path) -> No
 
     asyncio.run(_session())
     assert client.stats.pre_handoff_drops == 0
-    assert client.stats.handoff_gaps == 0
+    assert client.stats.handoff_gaps == 1
     lines = [record for path in _roll_files(tmp_path) for record in _read_roll(path)]
     assert len(lines) == 2
+
+    # The same archive, read by the analysis, reports the same verdict.
+    from python_analytics.backtesting.markouts import build_timeline
+
+    assert build_timeline(lines).handoff_gaps == client.stats.handoff_gaps
 
 
 def test_an_unseeded_session_drops_nothing(tmp_path) -> None:

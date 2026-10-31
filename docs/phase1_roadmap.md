@@ -75,19 +75,11 @@ frame beyond the seed then has to *continue* it: the venue publishes the range
 each frame covers, so its first id (`U`) must be `lastUpdateId + 1` or lower. A
 higher `U` means updates went by on no socket, and a level one of them deleted
 is still in the book — a phantom best bid is a mid that is wrong in a way
-nothing downstream can see. That case is counted (`IngestStats.handoff_gaps`
-here, `MarkoutTimeline.handoff_gaps` in the analysis), never repaired by
-dropping market data. One consequence of fetching after connecting is worth
-naming: a snapshot carries the venue's issuance time, and the read can lag the
-stream, so the frame that continues a seed can predate it. The seed's own mid
-is therefore held until that frame is known — published when it fits in order
-and counted in `MarkoutTimeline.seed_backdated` when it does not, because
-refusing a whole capture over one early line would lose the tape. A seed older
-than a sample already in the timeline is a different case and still raises:
-that is roll files handed over out of order. Measured on the live venue over 30
-s: 537 records handled, 4 dropped as already seeded, 0 non-contiguous handoffs,
-and 533 archived lines that ingest with `0 malformed, 0 gaps` and give the
-timeline a mid on its first line.
+nothing downstream can see. An id the capture cannot read is the same verdict
+by a different route — unverifiable — so both cases are counted
+(`IngestStats.handoff_gaps` here, `MarkoutTimeline.handoff_gaps` in the
+analysis) and the frame is still archived: counting a hole and deleting market
+data to hide it are different acts.
 
 The seed is an extra NDJSON line of the same shape as a REST book snapshot
 (`lastUpdateId`, `bids`, `asks`), annotated textually with what this capture
