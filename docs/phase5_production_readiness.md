@@ -1416,9 +1416,10 @@ the maker's:
 
 #### 11.8.5 What this changes, and what it does not
 
-It does not change the verdict: `alpha.fee_wall` still fails, and it should — the
-strategy quotes at the touch, where the tape is unambiguous. What it changes is
-which hypothesis is left standing.
+It does not change the verdict: `alpha.fee_wall` still fails, and it should —
+the strategy's locked half-spread is `0.08 bps` (§11.7.2, `k = 1.5`), about six
+ticks at this price, which is next to the curve's 8-tick row at `-1.30 bps`.
+What it changes is which hypothesis is left standing.
 
 **The market-maker hypothesis is answered, and the answer is no.** A re-quoting
 maker that holds a fill for a second loses `0.97–1.33 bps` of markout at every

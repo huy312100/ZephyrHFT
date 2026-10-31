@@ -345,6 +345,30 @@ def test_the_runner_refuses_an_unparseable_list() -> None:
                         "--no-report"]) == 2
 
 
+def test_the_runner_refuses_a_corrupt_capture(tmp_path) -> None:
+    """A truncated or corrupt roll is an input defect, not a measured "no".
+
+    ``EOFError``, ``zlib.error`` and the ``OSError`` family all mean the same
+    thing to an operator: the tape could not be read. Python's default exit for
+    an uncaught one is ``1`` — this runner's "no distance clears" — so all of
+    them are mapped to the usage code.
+    """
+    import gzip
+
+    script = _load_script()
+
+    truncated = tmp_path / "truncated.ndjson.gz"
+    with gzip.open(truncated, "wt", encoding="utf-8") as handle:
+        handle.write(_snapshot(5_000, 99.99, 100.01) + "\n")
+    body = truncated.read_bytes()
+    truncated.write_bytes(body[: len(body) - 8])
+    assert script.main(["--source", str(truncated), "--no-report"]) == 2
+
+    corrupt = tmp_path / "corrupt.ndjson.gz"
+    corrupt.write_bytes(b"not a gzip file at all")
+    assert script.main(["--source", str(corrupt), "--no-report"]) == 2
+
+
 def test_a_print_constructor_refuses_a_missing_side() -> None:
     """A defaulted side would silently invert the sign of an edge."""
     with pytest.raises(ValueError):

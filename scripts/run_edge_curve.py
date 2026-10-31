@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import sys
 import time
+import zlib
 from pathlib import Path
 from typing import List, Optional, Sequence
 
@@ -69,6 +70,16 @@ def parse_float_list(text: str) -> List[float]:
     return values
 
 
+#: Everything a capture read can throw at us while *reading* it. A truncated
+#: ``.gz`` roll raises ``EOFError``, a bad header or CRC raises
+#: ``gzip.BadGzipFile`` (an ``OSError``), a corrupt deflate body raises
+#: ``zlib.error`` (which is **not** an ``OSError``), and a vanished or unreadable
+#: file raises ``FileNotFoundError`` / ``PermissionError``. All of them are input
+#: defects, so none may escape as a traceback and exit ``1`` -- the code this
+#: runner reserves for "no distance clears".
+READ_ERRORS = (OSError, EOFError, ValueError, zlib.error)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=__doc__.splitlines()[0],
@@ -114,7 +125,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     configure_logging(level=args.log_level)
 
     try:
-        sources = resolve_sources(args.source)
         distances = parse_float_list(args.distances_bps)
         horizons = parse_float_list(args.horizons)
         config = EdgeCurveConfig(
@@ -126,25 +136,36 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             tick_size=float(args.tick_size),
             min_samples=int(args.min_samples),
         )
-    except (FileNotFoundError, ValueError, argparse.ArgumentTypeError) as exc:
+    except (ValueError, argparse.ArgumentTypeError) as exc:
         # ``ArgumentTypeError`` is not a ``ValueError``, and a bare traceback
         # would exit 1 -- the code this runner reserves for "no distance clears".
+        print(f"usage: {exc}", file=sys.stderr)
+        return EXIT_USAGE
+    try:
+        sources = resolve_sources(args.source)
+    except (FileNotFoundError, ValueError) as exc:
         print(f"usage: {exc}", file=sys.stderr)
         return EXIT_USAGE
 
     # Building the timeline is part of reading the input, not of the study: a
     # capture that mixes symbols, or roll files handed over out of order, raises
-    # ``ValueError`` here, and a traceback would exit 1 -- the code this runner
-    # reserves for "no distance clears". Input defects are usage errors.
+    # ``ValueError`` here, and a corrupt roll raises the gzip/zlib errors above.
     try:
         timeline = build_timeline_from_files(sources, symbol=args.symbol)
-    except (FileNotFoundError, ValueError) as exc:
+    except READ_ERRORS as exc:
         print(f"usage: {exc}", file=sys.stderr)
         return EXIT_USAGE
-    scan = scan_tape(
-        (line for path in sources for line in iter_capture_lines(path)),
-        symbol=args.symbol,
-    )
+    # The scan reads the same captures a second time, so it gets the same guard:
+    # a roll rotated away or corrupted between the two passes is an input defect,
+    # not a measured verdict.
+    try:
+        scan = scan_tape(
+            (line for path in sources for line in iter_capture_lines(path)),
+            symbol=args.symbol,
+        )
+    except READ_ERRORS as exc:
+        print(f"usage: {exc}", file=sys.stderr)
+        return EXIT_USAGE
     # Concatenating rolls is only sound when they are chronological; a capture
     # list given out of order would price prints against a future mid.
     backwards = [
