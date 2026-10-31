@@ -760,14 +760,24 @@ def render_markdown(summary: Mapping[str, Any], verdict: Mapping[str, Any]) -> L
         "",
         "## Round trip (two fills, two fees)",
         "",
-        f"| distance bps | {label} mean | gross (2x) | fees (2x) | net | fee ceiling |",
-        "| --- | --- | --- | --- | --- | --- |",
+        f"| distance bps | n | coverage | eligible | {label} mean | gross (2x) | "
+        "fees (2x) | net | fee ceiling |",
+        "| --- | --- | --- | --- | --- | --- | --- | --- | --- |",
     ])
     for row in summary.get("rows") or []:
         trip = row.get("round_trip") or {}
         mean = float((row.get("horizons") or {}).get(label, {}).get("mean_bps", 0.0) or 0.0)
+        coverage = float(trip.get("coverage_pct", 0.0) or 0.0)
+        # The same two gates the verdict applies, so a table reader can see which
+        # rows the conclusion speaks for instead of inferring it from the mean.
+        eligible = (
+            int(trip.get("samples", 0) or 0) >= config.min_samples
+            and coverage >= 100.0 * config.min_coverage
+        )
         lines.append(
-            f"| {float(row['distance_bps']):g} | {mean:+.3f} | "
+            f"| {float(row['distance_bps']):g} | "
+            f"{int(trip.get('samples', 0) or 0)} | {coverage:.1f}% | "
+            f"{'yes' if eligible else 'no'} | {mean:+.3f} | "
             f"{float(trip.get('gross_bps', 0.0) or 0.0):+.2f} | "
             f"{float(trip.get('fees_bps', 0.0) or 0.0):.2f} | "
             f"{float(trip.get('net_bps', 0.0) or 0.0):+.2f} | "
@@ -777,7 +787,10 @@ def render_markdown(summary: Mapping[str, Any], verdict: Mapping[str, Any]) -> L
         "A round trip pays the maker fee twice and earns the markout twice, so",
         "`2 * mean - 2 * fee` is the only per-round-trip number that means anything.",
         "The fee ceiling is the per-fill markout: a maker schedule above it loses on",
-        "this tape at that distance, whatever the fill count says.",
+        "this tape at that distance, whatever the fill count says. `eligible` applies",
+        f"the verdict's own gates ({config.min_samples} samples and "
+        f"{config.min_coverage:.0%} coverage); a `no` row is reported and not",
+        "decided.",
         "",
         "## Data quality",
         "",

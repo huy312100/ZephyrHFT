@@ -1521,7 +1521,10 @@ different kinds of problem:
    code: the capture must archive a depth snapshot on connect and on every
    reconnect (`ingest_l2.py` resumes a *diff* stream into an empty book, so the
    analysis has no mid until enough deltas arrive — 113 s in this capture). Until
-   that exists, every study of far quotes is measured on the calm subset.
+   that exists, far-quote studies have **incomplete coverage**, and the direction
+   of any resulting markout bias is unmeasured: the markouts that are missing are
+   the ones nobody can compute, so this is a hole in the sample rather than a
+   known skew.
 3. **A loop.** `run_live_trader.py` places at most one quote; re-quoting,
    inventory limits and a per-session loss cap belong in a supervisor (§11.3.4).
 4. **Funding and alerting.** Neither exists (§11.3.3, §11.3.5): a carry-heavy
