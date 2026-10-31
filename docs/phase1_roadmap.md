@@ -364,6 +364,18 @@ resolution on multi-hour sessions.
 **Reading the numbers.** This metric is venue-to-host *transit* latency: exchange egress,
 internet, kernel, and event-loop scheduling. It deliberately excludes our own processing
 (measured separately, §3.3) so that a busy host does not masquerade as a slow venue.
+It also excludes the **book-seeding window**: `recv_ns` is taken when a frame is yielded,
+not when it arrives on the wire, and the capture opens the socket before fetching the REST
+snapshot — so the frames that pile up in the socket queue during that round trip would
+each report the wait as latency. Every frame handled while the window is open (the dropped
+ones, the prints kept, and the frame that closes the window) is therefore skipped by the
+histogram, because one reconnect would otherwise put a multi-second sample in the p99 and
+trip `latency_warn_ms` on a healthy feed. Measured on the live venue, first interval
+before/after the exclusion: `p99=333.48 ms, max=333.52, lat_breaches=7` against
+`p99=58.90 ms, max=60.02, no breaches`, with steady-state intervals in both runs at
+`p99≈57-80 ms`. The exclusion covers the frame that *closes* the window as well: the
+window state is read before it is cleared, and that frame was queued behind the snapshot
+like the rest — sampling only the dropped frames would have kept the worst sample of the set.
 
 **Interpreting anomalous values**
 
@@ -373,6 +385,7 @@ internet, kernel, and event-loop scheduling. It deliberately excludes our own pr
 | `p99 ≫ p50` (e.g. 30 ms vs 1.2 s) | Network jitter, ISP path change, venue congestion | Correlate with `reconnects`; consider a co-located VPS |
 | `lat_ms` steadily climbing | Event loop starvation (oversized `max_queue`, or a co-tenant process) | Check CPU affinity/load; verify the receive path still has 0 awaits |
 | `lat_breaches` growing but `p99` flat | Single outlier frames (large snapshots) | Expected: a post-reconnect snapshot is ~10× the median size |
+| A spike confined to the interval right after each connect | The seeding window's queue wait | Fixed and excluded (§3.5); if it reappears, check that `_handle_frame` still skips `window_open` frames |
 
 ### 3.6 Reconnection state machine
 
