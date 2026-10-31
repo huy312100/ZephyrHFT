@@ -1429,11 +1429,14 @@ What it changes is which hypothesis is left standing.
 maker that holds a fill for a second loses `0.52–1.33 bps` of gross markout at
 every distance the tape reaches. Net of the `2 bps` maker fee that is a mean
 loss of `2.52–3.33 bps` per marked fill — and it is a *mean over marked fills*,
-not a per-fill promise. With a *zero* fee the same cells are still negative. No
-parameter or filter changes that, because the number is what the mid does after
-the fill. Queue position does not change the markout of a fill that happened
-either — it changes which fills happen, so it can move the aggregate while
-leaving the mechanism here untouched.
+not a per-fill promise. With a *zero* fee the same cells are still negative.
+What a parameter or a filter chooses is *which* row of the curve the quote sits
+on and which fills happen, and every row the tape reaches is negative, so it can
+only pick among losing configurations. For a fill that has already happened it
+cannot matter at all, because the number is what the mid does afterwards. Queue
+position is the same: it does not change the markout of a fill that happened,
+it changes which fills happen, so it can move the aggregate while leaving the
+mechanism here untouched.
 
 **The sweep-reversion hypothesis is what the tape actually supports.** Quote
 154–231 ticks out, get filled by a sweep, hold ten seconds:
