@@ -203,11 +203,16 @@ class DataIngestionSettings:
     reconnect_max_delay_s: float = 30.0
     max_reconnect_attempts: int = 0
     ws_base_url: str = ""
-    #: Seed the analysis book from a REST depth snapshot on connect and on every
-    #: reconnect. A diff stream resumed into an empty book has no mid until
-    #: enough deltas arrive, and the fills in that window cannot be marked.
+    #: Seed the analysis book from a REST depth snapshot, once per connection and
+    #: with the stream already open. A diff stream resumed into an empty book has
+    #: no mid until enough deltas arrive, and the fills in that window cannot be
+    #: marked.
     snapshot_on_connect: bool = True
-    #: Levels requested from the snapshot endpoint; the venue caps this at 1000.
+    #: Levels requested from the snapshot endpoint. There is no single ceiling:
+    #: USDⓈ-M serves 5/10/20/50/100/500/1000 and answers anything else with HTTP
+    #: 400, while spot serves any depth up to 5000 (and clamps beyond it). The
+    #: value is validated against the endpoint actually dialled, by
+    #: :func:`check_snapshot_limit`, at load.
     snapshot_limit: int = 1000
     snapshot_timeout_s: float = 10.0
 
