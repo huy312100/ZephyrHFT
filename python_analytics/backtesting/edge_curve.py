@@ -169,7 +169,10 @@ def scan_tape(lines: Iterable[str], *, symbol: Optional[str] = None) -> TapeScan
     Prints for another symbol are counted in ``ignored`` instead of blended in.
     """
     want = str(symbol).upper() if symbol else None
-    scan = TapeScan(prints=[])
+    # A caller that named the market already knows it, and the first trade is
+    # not necessarily that market: assigning ``scan.symbol`` from the first frame
+    # would label an ignored ETH print as the population of a BTCUSDT study.
+    scan = TapeScan(prints=[], symbol=want)
     for raw in lines:
         text = raw.strip() if isinstance(raw, str) else str(raw).strip()
         if not text:

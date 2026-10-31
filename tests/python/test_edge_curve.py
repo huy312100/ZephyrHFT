@@ -41,10 +41,12 @@ def _load_script():
     return module
 
 
-def _snapshot(ts_ms: int, bid: float, ask: float) -> str:
+def _snapshot(ts_ms: int, bid: float, ask: float,
+              symbol: str = "BTCUSDT") -> str:
     """An absolute book snapshot, the form the timeline builder reads directly."""
     return json.dumps({
         "lastUpdateId": ts_ms,
+        "s": symbol,
         "bids": [[f"{bid:.2f}", "1.0"]],
         "asks": [[f"{ask:.2f}", "1.0"]],
         "E": BASE_MS + ts_ms,
@@ -52,13 +54,13 @@ def _snapshot(ts_ms: int, bid: float, ask: float) -> str:
 
 
 def _print(ts_ms: int, price: float, quantity: float = 0.1,
-           buyer_is_maker: bool = True) -> str:
+           buyer_is_maker: bool = True, symbol: str = "BTCUSDT") -> str:
     """A trade frame. ``buyer_is_maker`` is the venue's ``m`` flag."""
     return json.dumps({
         "e": "trade",
         "E": BASE_MS + ts_ms,
         "T": BASE_MS + ts_ms,
-        "s": "BTCUSDT",
+        "s": symbol,
         "p": f"{price:.3f}",
         "q": f"{quantity:.3f}",
         "m": buyer_is_maker,
@@ -367,6 +369,50 @@ def test_the_runner_refuses_a_corrupt_capture(tmp_path) -> None:
     corrupt = tmp_path / "corrupt.ndjson.gz"
     corrupt.write_bytes(b"not a gzip file at all")
     assert script.main(["--source", str(corrupt), "--no-report"]) == 2
+
+
+def test_the_scan_names_the_market_it_was_asked_for() -> None:
+    """A leading print from another market must not label the study.
+
+    ``scan_tape`` used to take ``symbol`` from the first trade it read, so asking
+    a BTCUSDT capture for BTCUSDT while an ETHUSDT print came first reported
+    ETHUSDT as the population of a BTCUSDT study.
+    """
+    scan = scan_tape([
+        _print(1_100, 3_000.0, symbol="ETHUSDT"),
+        _print(1_200, 99.99),
+    ], symbol="BTCUSDT")
+    assert scan.symbol == "BTCUSDT"
+    assert len(scan.prints) == 1
+    assert scan.ignored == 1
+
+
+def test_the_runner_prices_prints_against_their_own_market(tmp_path) -> None:
+    """The scan must follow the timeline's market, not the first print's.
+
+    A capture whose first depth frame is BTCUSDT and whose first print is
+    ETHUSDT would otherwise fill every ETH sell against a BTC bid, and each of
+    those fills would be marked at the distance it was posted at — a fabricated
+    edge in exactly the units the report compares against the fee.
+    """
+    capture = tmp_path / "mixed.ndjson"
+    capture.write_text("\n".join([
+        _snapshot(1_000, 99.99, 100.01, symbol="BTCUSDT"),
+        _print(1_100, 3_000.0, symbol="ETHUSDT"),
+        _print(1_200, 99.99, symbol="BTCUSDT"),
+        _snapshot(2_200, 101.00, 101.02, symbol="BTCUSDT"),
+    ]) + "\n", encoding="utf-8")
+    script = _load_script()
+    assert script.main([
+        "--source", str(capture), "--tick-size", "0.01",
+        "--distances-bps", "0.5", "--min-samples", "1",
+        "--report-dir", str(tmp_path), "--stem", "mixed",
+    ]) == 0
+    payload = json.loads((tmp_path / "mixed.json").read_text(encoding="utf-8"))
+    tape = payload["summary"]["tape"]
+    assert tape["symbol"] == "BTCUSDT"
+    assert tape["prints"] == 1
+    assert tape["ignored"] == 1
 
 
 def test_a_print_constructor_refuses_a_missing_side() -> None:

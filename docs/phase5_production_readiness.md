@@ -1407,11 +1407,12 @@ the maker's:
    that reaches 2–3 bps the price keeps going for a second and then comes back
    over ten. That reversion is the first positive gross edge in this study.
 4. **The break-even fee is negative at a 1 s holding time and positive at 10 s.**
-   At `1 s` the best cell is `-0.97 bps`, so no maker fee at or above zero is
-   payable — that configuration needs a *rebate*. At `10 s` and `2–3 bps` out,
-   the tape pays `+0.12 … +1.49 bps` gross, so a fee below that clears it.
+   At `1 s` the best cell is `-0.52 bps` (231 ticks out), so no maker fee at or
+   above zero is payable — that configuration needs a *rebate*. At `10 s` and
+   `2–3 bps` out, the tape pays `+0.12 … +1.49 bps` gross, so a fee below that
+   clears it.
 5. **The smoke test's `+0.13 bps` cell is now `-1.08`.** Same instrument, same
-   distance, 72x the tape, opposite sign. Nothing about the method changed; the
+   distance, 79x the tape, opposite sign. Nothing about the method changed; the
    window did.
 
 #### 11.8.5 What this changes, and what it does not
@@ -1422,11 +1423,13 @@ ticks at this price, which is next to the curve's 8-tick row at `-1.30 bps`.
 What it changes is which hypothesis is left standing.
 
 **The market-maker hypothesis is answered, and the answer is no.** A re-quoting
-maker that holds a fill for a second loses `0.97–1.33 bps` of markout at every
+maker that holds a fill for a second loses `0.52–1.33 bps` of markout at every
 distance the tape reaches, before any fee. At retail `2 bps` that is a `3 bps`
-loss per fill; with a *zero* fee it is still a loss. No parameter, filter or
-queue position changes that, because the number is what the mid does after the
-fill.
+loss per fill; with a *zero* fee it is still a loss. No parameter or filter
+changes that, because the number is what the mid does after the fill. Queue
+position does not change the markout of a fill that happened either — it changes
+which fills happen, so it can move the aggregate while leaving the mechanism
+here untouched.
 
 **The sweep-reversion hypothesis is what the tape actually supports.** Quote
 154–231 ticks out, get filled by a sweep, hold ten seconds:

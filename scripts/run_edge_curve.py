@@ -158,10 +158,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # The scan reads the same captures a second time, so it gets the same guard:
     # a roll rotated away or corrupted between the two passes is an input defect,
     # not a measured verdict.
+    # The prints must come from the same market as the mids. The timeline takes
+    # its symbol from the first depth frame and the scan from the first print, so
+    # a capture carrying two markets could price ETH prints against BTC mids --
+    # every ETH sell would then "fill" a BTC bid and be marked at the distance.
+    market = args.symbol or timeline.symbol
     try:
         scan = scan_tape(
             (line for path in sources for line in iter_capture_lines(path)),
-            symbol=args.symbol,
+            symbol=market,
         )
     except READ_ERRORS as exc:
         print(f"usage: {exc}", file=sys.stderr)
