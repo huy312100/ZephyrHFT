@@ -47,10 +47,14 @@ DEPTH_SNAPSHOT_ENDPOINTS: Dict[str, Tuple[str, str]] = {
 }
 
 #: Depth limits each venue actually accepts, measured against the live API
-#: rather than read off a page: USDⓈ-M ``/fapi/v1/depth`` answers ``limit=7`` and
-#: ``limit=1001`` with HTTP 400, so a free 1-1000 integer range would configure
-#: a request that always fails and silently leave the capture unseeded. ``None``
-#: means the product takes any value up to its maximum, as spot does.
+#: rather than read off a page: USDⓈ-M ``/fapi/v1/depth`` rejects ``limit=7``
+#: (HTTP 400, -4021 "7 is not valid depth limit") as well as ``limit=1001`` and
+#: ``limit=2000`` (HTTP 400, -1130), so a free 1-1000 integer range would
+#: configure a request that always fails and silently leave the capture
+#: unseeded. ``None`` means the product takes any value up to its maximum, as
+#: spot does (``limit=2000`` and ``5000`` both returned the full book). The
+#: testnet entry carries the same set as its production twin by product, not by
+#: probe: only ``fapi.binance.com`` and ``api.binance.com`` were dialled.
 DEPTH_SNAPSHOT_LIMITS: Dict[str, Optional[Tuple[int, ...]]] = {
     "binance_futures": (5, 10, 20, 50, 100, 500, 1000),
     "binance_futures_testnet": (5, 10, 20, 50, 100, 500, 1000),
@@ -58,6 +62,9 @@ DEPTH_SNAPSHOT_LIMITS: Dict[str, Optional[Tuple[int, ...]]] = {
 }
 
 #: Hard ceiling per product, used when the accepted set is open (``None`` above).
+#: Spot's is not enforced by the venue: ``limit=6000`` returns HTTP 200 with the
+#: book clamped to 5000 levels, so asking beyond it is a silently short answer
+#: rather than a rejected request -- which is why the ceiling is checked here.
 DEPTH_SNAPSHOT_MAX_LIMIT: Dict[str, int] = {
     "binance_futures": 1000,
     "binance_futures_testnet": 1000,
@@ -561,11 +568,14 @@ def check_snapshot_limit(ws_base_url: str, limit: int,
                          field: str = "data_ingestion.snapshot_limit") -> int:
     """Returns ``limit`` if the venue would accept it, else raises ``ConfigError``.
 
-    Checked against the endpoint being dialled because the products differ: the
-    USDⓈ-M book takes one of seven discrete sizes, while spot takes any depth up
-    to its own maximum. A value the venue rejects is worse than a config typo --
-    the request 400s, the capture continues unseeded, and the book stays blind
-    for exactly the reason the seed exists to prevent.
+    Checked against the endpoint being dialled -- not against the configured
+    ``exchange``, which only supplies a default URL -- because the products
+    differ: the USDⓈ-M book takes one of seven discrete sizes, while spot takes
+    any depth up to its own maximum. Bounding by the name would reject a spot
+    ``limit=2000`` that the dialled venue serves and accept a futures one that
+    400s. A value the venue rejects is worse than a config typo -- the request
+    400s, the capture continues unseeded, and the book stays blind for exactly
+    the reason the seed exists to prevent.
     """
     exchange = exchange_for_endpoint(ws_base_url)
     value = int(limit)

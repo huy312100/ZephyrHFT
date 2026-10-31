@@ -70,8 +70,10 @@ data_ingestion:
   # every fill in that window is unmarkable -- which is exactly where the far
   # quotes trade. `false` (or `--no-snapshot`) captures the venue's stream only.
   snapshot_on_connect: true
-  # Depth must be one the venue serves: USDⓈ-M accepts 5/10/20/50/100/500/1000
-  # and answers anything else with HTTP 400, spot accepts any depth to 5000. A
+  # Depth must be one the venue serves, judged against the endpoint actually
+  # dialled (`ws_base_url` if set, otherwise `exchange`'s default): USDⓈ-M
+  # accepts 5/10/20/50/100/500/1000 and answers anything else with HTTP 400, spot
+  # serves any depth to 5000 and quietly clamps larger requests back to 5000. A
   # rejected value is refused at startup, because the failed request would leave
   # the capture running unseeded -- the blind book this exists to prevent.
   snapshot_limit: 1000
