@@ -424,6 +424,11 @@ python3 scripts/generate_readiness_report.py \
 # 6. Write a named bundle for an audit packet
 python3 scripts/generate_readiness_report.py \
   --report-dir reports/release-2026-10-24 --stem pre_live
+
+# 7. Is there any distance from the mid where a quote pays its fee? (§11.8)
+#    exit 0 a distance clears, 1 none does, 2 usage, 3 no priced print
+python3 scripts/run_edge_curve.py \
+  --source data/raw_l2/*.ndjson.gz --tick-size 0.1
 ```
 
 ### 5.2 How the evidence is produced
@@ -1281,3 +1286,191 @@ meeting.
 With `alpha.fee_wall` in the report, the promotion checklist in §10 cannot pass
 a study whose edge is smaller than the fee it will be charged, and the number
 that has to change is now named on every run.
+
+### 11.8 The edge curve: what a quote earns at each distance
+
+§11.6 measured the strategy's fills and §11.7 measured the fee against the
+spread. Both leave one question open, and it is the one that decides whether a
+maker can be viable on this instrument at *any* setting: **is there a distance
+from the mid at which a resting quote is paid more than its fee, and does the
+tape ever go there?**
+
+#### 11.8.1 The measurement, and what it is not
+
+`scripts/run_edge_curve.py` answers it with no strategy in the loop. For every
+print in a capture, an order resting `d` basis points on the passive side would
+have been filled if the print traded at or through its price; that hypothetical
+fill is marked from **the quote's own price** — a print that trades through us
+fills us at our limit, not at its own price — at the configured horizons. Those
+markouts are **gross**: the maker fee is applied separately, to the fee-adjusted
+result and to the verdict. Each distance is then summarised by edge and by how
+often the tape reached it.
+
+Two boundaries matter, because they are what keep this from being a fantasy:
+
+- **The quote is re-anchored to the mid before every print.** That models a maker
+  that reprices on each update — which is what this engine does — and it is not
+  the same experiment as the hold-until-filled walk-forward of §11.6. A quote
+  that stays put is filled when the market walks to it, and those fills are the
+  adverse ones; §11.6 already measured them. The curve measures the other half:
+  what is available to a maker who keeps his distance.
+- **Queue position, latency and our size are not modelled.** None of the three
+  is neutral. A quote re-priced from a stale mid — what a real maker posts while
+  it waits for its next update — can be reached by a print the idealised quote
+  would have moved away from, so latency can raise the fill count as well as
+  lower it, and the fills it changes are not the same fills: their markout moves
+  too. The curve is therefore conditional on its fill rule (the price on our
+  side is the mid before the print) and is not an execution estimate.
+
+#### 11.8.2 The first tape: 151 s, and what it could not see
+
+151 s capture, 6,240 prints, 1,466 depth frames, tick `0.10`, median mid
+`81,389.95`, `2.0 bps` maker fee. `ticks` is that distance on the venue grid:
+
+| distance bps | ticks | fills | fills/min | `h=0` | `h=1s` | `h=1s` t | win % | `h=10s` |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `0.0125` | 1 | 3,111 | 1,249.7 | `+0.018` | `-0.801` | `-76.03` | 4 | `-1.201` |
+| `0.1` | 8 | 2,501 | 1,004.7 | `+0.104` | `-0.752` | `-63.81` | 6 | `-1.112` |
+| `0.5` | 41 | 1,167 | 468.8 | `+0.510` | `-0.424` | `-22.96` | 22 | `-0.693` |
+| `1` | 81 | 231 | 92.8 | `+1.002` | `+0.131` | `+3.18` | 50 | `-0.604` |
+| `1.5` | 122 | 0 | 0.0 | — | — | — | — | — |
+| `2` | 163 | 0 | 0.0 | — | — | — | — | — |
+
+The `h=0` column is not an edge and is printed to keep the table honest: it
+reproduces the distance almost exactly (`+1.002` at `1 bps`) because a fill is
+marked against the mid it was quoted away from.
+
+This first run read two things into that table: that `1 bps` was the only
+distance with a positive *gross* `1 s` markout, and that the tape never reached
+`1.5 bps` or beyond. The first is not a distance that paid: `+0.131 bps` is
+pre-fee, so it failed the `2.0 bps` maker fee like every other row — the run's
+verdict is `NO_CLEARING_DISTANCE` for that reason. **Both readings were
+nevertheless artefacts of a two-and-a-half-minute window.** A single 15-minute
+roll was already enough to falsify them — `1.5` and `2 bps` fill, and `1 bps` is
+`-1.43` at `1 s` in that roll — and the 3 h 20 m capture in §11.8.3 confirms it:
+`1.5` and `2 bps` fill (38,694 and 25,637 times) and `+0.13 bps` at `1 bps` does
+not survive. The smoke test stays in this document because deleting it would
+hide the lesson — a 151 s capture cannot separate a plateau from a regime, which
+is exactly what §11.6.5 warned about.
+
+#### 11.8.3 Three hours of the same instrument
+
+A 3 h 20 m capture on the same endpoint (`scripts/ingest_l2.py --duration 12000`,
+`depth@100ms` + `trade`), 14 consecutive rolls, **643,077 prints over 12,000 s**.
+The tape is not committed — `data/` is git-ignored — so these numbers are
+reproducible by re-capturing, not by cloning; the command is at the end of this
+section. Tick `0.10`, median mid `76,900`, `2.0 bps` maker fee, mid ended the
+session at `-0.24 %`:
+
+| distance bps | ticks | fills | fills/min | `h=0` | `h=1s` | `h=1s` t | `h=1s` n | win % | `h=10s` | `h=10s` t |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `0.0125` | 1 | 366,309 | 1,831.6 | `+0.019` | `-1.326` | `-657.8` | 348,157 | 7.2 | `-1.303` | `-267.3` |
+| `0.1` | 8 | 308,203 | 1,541.1 | `+0.111` | `-1.295` | `-577.8` | 291,574 | 8.0 | `-1.241` | `-232.0` |
+| `0.5` | 38 | 177,985 | 890.0 | `+0.504` | `-1.145` | `-356.1` | 161,565 | 11.8 | `-0.980` | `-134.3` |
+| `1` | 77 | 75,976 | 379.9 | `+1.009` | `-1.076` | `-178.0` | 59,824 | 18.6 | `-0.671` | `-54.6` |
+| `1.5` | 115 | 38,694 | 193.5 | `+1.508` | `-1.076` | `-99.3` | 22,732 | 18.5 | `-0.296` | `-15.4` |
+| `2` | 154 | 25,637 | 128.2 | `+2.007` | `-0.971` | `-54.8` | 9,675 | 26.0 | **`+0.121`** | `+4.4` |
+| `3` | 231 | 18,436 | 92.2 | `+3.013` | `-0.522` | `-13.2` | 2,474 | 54.0 | **`+1.489`** | `+33.4` |
+
+Two caveats travel with this table, and both are the study's own honesty rather
+the maker's:
+
+- **`n` is smaller than `fills` at every distance.** 16,000–18,000 fills per
+  distance had no mid inside the 2 s tolerance and are excluded, never
+  interpolated — at `3 bps` that is 15,962 of 18,436. They are not a random
+  subset: the websocket reconnect at `18:52` left a 113 s hole in the mid
+  timeline, and 15,261 of the `3 bps` fills landed inside it. That episode was
+  the most violent of the session. **The direction of the resulting bias is
+  unmeasured**: the excluded fills have no markouts by construction, and
+  volatility moves passive-fill markouts in either direction, so this is a hole
+  in the sample rather than a known skew. The module reports the count
+  (`truncated`) instead of shrinking the sample quietly.
+- **The per-roll spread is the regime.** At the touch, the `1 s` markout is
+  negative in **14 of 14** rolls (`-1.12` to `-1.49 bps`). At `2 bps` it is
+  negative in 12 of 14 and positive in two (`+1.31`, `+0.15`). A single roll
+  would have supported almost any story; fourteen make the sign of the touch
+  unambiguous and the sign of the far quotes obviously regime-dependent.
+
+#### 11.8.4 What the shape says
+
+1. **At the touch, being filled is the adverse event.** One tick out, the `1 s`
+   markout is `-1.33 bps` over 348,157 fills, `t = -658`, and only 7.2 % of fills
+   are positive one second later. This is not a trend: the session ended where it
+   started, and the damage is inside the second after each print. §11.6.3 reached
+   the same conclusion from the strategy's own fills (`-0.404 bps`, 0 % win) on 28
+   marked fills; this is the same measurement with four orders of magnitude more
+   of them.
+2. **Distance helps monotonically and never clears `1 s`.** `-1.33` at the touch,
+   `-1.30` at 8 ticks, `-1.15` at 38, `-1.08` at 77, `-1.08` at 115, `-0.97` at
+   154, `-0.52` at 231. Every one of those `t` statistics is far past `-1.96`. A
+   maker cannot quote its way out of the fee while it holds the fill for a second.
+3. **The `10 s` horizon flips, and only far out.** `-1.30` at the touch, still
+   negative at 77 and 115 ticks, then `+0.12` at 154 ticks and `+1.49` at 231
+   (`t = +33`). Short-horizon momentum, longer-horizon reversion: after a sweep
+   that reaches 2–3 bps the price keeps going for a second and then comes back
+   over ten. That reversion is the first positive gross edge in this study.
+4. **The break-even fee is negative at a 1 s holding time and positive at 10 s.**
+   At `1 s` the best cell is `-0.52 bps` (231 ticks out), so no maker fee at or
+   above zero is payable — that configuration needs a *rebate*. At `10 s` and
+   `2–3 bps` out, the tape pays `+0.12 … +1.49 bps` gross, so a fee below that
+   clears it.
+5. **The smoke test's `+0.13 bps` cell is now `-1.08`.** Same instrument, same
+   distance, 79x the tape, opposite sign. Nothing about the method changed; the
+   window did.
+
+#### 11.8.5 What this changes, and what it does not
+
+It does not change the verdict: `alpha.fee_wall` still fails, and it should —
+the strategy's locked half-spread is `0.08 bps` (§11.7.2, `k = 1.5`), about six
+ticks at this price, which is next to the curve's 8-tick row at `-1.30 bps`.
+What it changes is which hypothesis is left standing.
+
+**The market-maker hypothesis is answered, and the answer is no.** A re-quoting
+maker that holds a fill for a second loses `0.52–1.33 bps` of gross markout at
+every distance the tape reaches. Net of the `2 bps` maker fee that is a mean
+loss of `2.52–3.33 bps` per marked fill — and it is a *mean over marked fills*,
+not a per-fill promise. With a *zero* fee the same cells are still negative.
+What a parameter or a filter chooses is *which* row of the curve the quote sits
+on and which fills happen, and every row the tape reaches is negative, so it can
+only pick among losing configurations. For a fill that has already happened it
+cannot matter at all, because the number is what the mid does afterwards. Queue
+position is the same: it does not change the markout of a fill that happened,
+it changes which fills happen, so it can move the aggregate while leaving the
+mechanism here untouched.
+
+**The sweep-reversion hypothesis is what the tape actually supports.** Quote
+154–231 ticks out, get filled by a sweep, hold ten seconds:
+
+| configuration | fills/min | gross `h=10s` | fee that clears | sample |
+| --- | --- | --- | --- | --- |
+| `2 bps` (154 ticks) | 128.2 | `+0.121 bps` | `< 0.12 bps` | 10,098 |
+| `3 bps` (231 ticks) | 92.2 | `+1.489 bps` | `< 1.49 bps` | 2,897 |
+
+That is not a market maker: it is a strategy that rests far from the touch,
+accepts a fill only when the market runs, and then waits for the reversion. Its
+edge is real in this tape and its risks are not measured here — inventory held
+for ten seconds through a trend, the `2 bps` row's `+0.12 bps` sitting well
+inside a fee, and the `3 bps` row's 2,474 marked one-second fills being a small
+sample of a violent regime. It needs its own study before it means anything, and
+it is the same finding as §11.6.5 option 2 ("attack the decay") from the
+strategy side.
+
+The rest of the business case is unchanged but now quantified: a fee tier is
+still a prerequisite for anything that holds a fill for a second, a wider-grid
+venue is still the other lever, and the curve is how you tell which of the two
+you are looking at.
+
+```bash
+# the method on the committed 151 s tape (reproduces the first table)
+python3 scripts/run_edge_curve.py \
+  --source data/raw_l2/binance_futures_btcusdt_depth_100ms_trade_20261029T163929Z_00001.ndjson.gz \
+  --tick-size 0.1 --distances-bps 0.0125,0.1,0.5,1,1.5,2
+
+# a multi-roll capture, read as one chronological tape (the 3 h numbers)
+python3 scripts/run_edge_curve.py \
+  --source data/raw_l2/binance_futures_btcusdt_depth_100ms_trade_20261030T*_0000[1-9].ndjson.gz \
+           data/raw_l2/binance_futures_btcusdt_depth_100ms_trade_20261030T*_0001[0-4].ndjson.gz \
+  --tick-size 0.1 --distances-bps 0.0125,0.1,0.5,1,1.5,2,3
+# exit 0 a distance clears, 1 none does, 2 usage, 3 no priced print
+```
+
