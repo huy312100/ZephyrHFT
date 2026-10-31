@@ -1258,15 +1258,17 @@ On 3 h of the same instrument (643,077 prints over 12,000 s, 14 rolls, tick
 | 2 | 154 | 128.2 | −0.971 | −54.8 | **+0.121** |
 | 3 | 231 | 92.2 | −0.522 | −13.2 | **+1.489** |
 
-Verdict `NO_CLEARING_DISTANCE`. At a one-second holding time the markout is
+Verdict `NO_CLEARING_DISTANCE`. At a one-second holding time the gross markout is
 negative at every distance the tape reaches — worst at the touch (`−1.33 bps`,
 `t = −658`, 7.2 % of fills positive), improving monotonically with distance and
 never clearing zero. A maker cannot quote its way out of the fee. At ten seconds
-the far distances flip positive (`+0.12 bps` at 154 ticks, `+1.49 bps` at 231),
-which is a sweep-reversion edge rather than a market-making one: quote far, get
-filled by a run, hold. A 151 s smoke test had reported `+0.13 bps` at `1 bps` and
-no fills beyond `1.5 bps`; 79× the tape reverses that sign and fills the far
-distances, which is why the study needed hours and not minutes.
+the far distances flip gross-positive (`+0.12 bps` at 154 ticks, `+1.49 bps` at
+231), but neither clears the 2 bps fee — they need a fee below `0.12` and `1.49`
+bps respectively, which is a sweep-reversion hypothesis rather than a
+market-making one: quote far, get filled by a run, hold. A 151 s smoke test had
+reported `+0.13 bps` at `1 bps` and no fills beyond `1.5 bps`; 79× the tape
+reverses that sign and fills the far distances, which is why the study needed
+hours and not minutes.
 [`docs/phase5_production_readiness.md` §11.8](docs/phase5_production_readiness.md#118-the-edge-curve-what-a-quote-earns-at-each-distance)
 works it through, including the fills that a reconnect's 113 s hole in the mid
 timeline could not mark.

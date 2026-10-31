@@ -1426,13 +1426,14 @@ ticks at this price, which is next to the curve's 8-tick row at `-1.30 bps`.
 What it changes is which hypothesis is left standing.
 
 **The market-maker hypothesis is answered, and the answer is no.** A re-quoting
-maker that holds a fill for a second loses `0.52–1.33 bps` of markout at every
-distance the tape reaches, before any fee. At retail `2 bps` that is a `3 bps`
-loss per fill; with a *zero* fee it is still a loss. No parameter or filter
-changes that, because the number is what the mid does after the fill. Queue
-position does not change the markout of a fill that happened either — it changes
-which fills happen, so it can move the aggregate while leaving the mechanism
-here untouched.
+maker that holds a fill for a second loses `0.52–1.33 bps` of gross markout at
+every distance the tape reaches. Net of the `2 bps` maker fee that is a mean
+loss of `2.52–3.33 bps` per marked fill — and it is a *mean over marked fills*,
+not a per-fill promise. With a *zero* fee the same cells are still negative. No
+parameter or filter changes that, because the number is what the mid does after
+the fill. Queue position does not change the markout of a fill that happened
+either — it changes which fills happen, so it can move the aggregate while
+leaving the mechanism here untouched.
 
 **The sweep-reversion hypothesis is what the tape actually supports.** Quote
 154–231 ticks out, get filled by a sweep, hold ten seconds:

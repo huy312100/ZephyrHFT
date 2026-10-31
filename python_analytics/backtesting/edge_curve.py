@@ -25,7 +25,7 @@ test:
 The number that matters on a retail crypto schedule is stark: on BTCUSDT
 perpetuals a tick of ``0.10`` at ``81_000`` is ``0.012 bps``, so a ``2 bps``
 maker fee is **~160 ticks**. A passive maker on that instrument has to rest a
-sixteenth of a percent away from the mid to be paid for the fill, and this module
+fiftieth of a percent away from the mid to be paid for the fill, and this module
 measures whether the tape ever goes there.
 
 What this does not model
