@@ -63,10 +63,23 @@ and every reader starts empty, including after a reconnect — has no mid until
 enough deltas arrive; in a 3 h capture that took 113 s, and every fill in the
 window was unmarkable (`docs/phase5_production_readiness.md` §11.8.7). The seed is
 an extra NDJSON line of the same shape as a REST book snapshot (`lastUpdateId`,
-`bids`, `asks`, `E`), so the archive stays self-describing. Seeding *after* the
-connect is wrong and the analysis proves it: the snapshot's venue time then lands
-after the frames the socket buffered during the HTTP round trip, and the mid
-timeline refuses a non-monotonic file.
+`bids`, `asks`), annotated textually with the two things the venue's response
+does not carry and this process knows: its receive time (`E`; the USDⓈ-M snapshot
+has one, the spot snapshot has none) and its market (`s` — **neither** product
+names its symbol in this response, and an unlabelled line is the one record a
+mixed capture could attribute to the wrong book). The venue's own bytes are never
+re-serialised.
+
+What the seed cannot do is hand off contiguously: whatever changed between its
+`lastUpdateId` and the first frame was not on any socket yet, so it is not in the
+archive. The reconstructed book is therefore correct *from the seed forward*, up
+to one REST round trip of level changes — enough for a mid timeline, which is
+what the seed is for, and explicitly not a replacement for Binance's
+event-id-contiguous local-book procedure. The analysis side enforces the part of
+that procedure which is cheap and load-bearing: a diff frame whose last update id
+is at or below the seed's is already inside the snapshot, and is counted in
+`MarkoutTimeline.stale` rather than applied a second time (applying it twice moves
+a level twice, and produces a mid that looks plausible).
 
 ### 1.1 Headline outcomes
 

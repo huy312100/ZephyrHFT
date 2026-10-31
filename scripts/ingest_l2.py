@@ -59,7 +59,8 @@ from collections import deque
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, AsyncIterator, Callable, Deque, Mapping, Optional, Sequence, Tuple
+from typing import (Any, AsyncIterator, Callable, Deque, List, Mapping, Optional,
+                    Sequence, Tuple)
 
 # Make the repository root importable when this script is run directly.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -69,6 +70,7 @@ from python_analytics.utils.config import (
     COMPRESSION_CHOICES,
     ConfigError,
     DataIngestionSettings,
+    check_snapshot_limit,
     depth_snapshot_url,
     parse_stream_names,
     silent_aux_streams,
@@ -252,18 +254,22 @@ def fetch_snapshot_text(url: str, timeout_s: float) -> str:
         return response.read().decode("utf-8")
 
 
-def stamp_snapshot_time(text: str, now_ms: int) -> str:
-    """Gives a snapshot body a timestamp when the venue sent none.
+def annotate_snapshot(text: str, now_ms: int, symbol: str) -> str:
+    """Adds the capture metadata a REST book snapshot needs but does not carry.
 
-    Binance's USDⓈ-M snapshot carries ``E``/``T``; the spot one carries neither,
-    and a book with no time cannot be placed on the mid timeline, so it would be
-    archived and then ignored. The stamp is inserted **textually** right after
-    the leading ``{`` -- the venue's bytes stay byte-for-byte what the venue
-    said, and the only addition is the instant this process received them, which
-    is a fact about the capture rather than a guess about the market.
+    Two fields, both facts about this capture rather than claims about the
+    market, and both inserted **textually** right after the opening brace so the
+    venue's own bytes stay byte-for-byte:
 
-    Bodies that already carry a timestamp, and bodies that are not a JSON
-    object, are returned unchanged.
+    * ``E`` -- Binance's USDⓈ-M snapshot carries ``E``/``T``; the spot one
+      carries neither, and a book with no time cannot be placed on the mid
+      timeline, so it would be archived and then ignored.
+    * ``s`` -- neither snapshot names its market, and the consumers select
+      frames by symbol. An unlabelled seed is the one line in the archive that a
+      mixed capture would accept from any market and use as its first mid.
+
+    Bodies that already carry a field keep it, and anything that is not a JSON
+    object is returned unchanged.
     """
     start = text.find("{")
     if start < 0:
@@ -274,9 +280,14 @@ def stamp_snapshot_time(text: str, now_ms: int) -> str:
         return text
     if not isinstance(payload, Mapping):
         return text
-    if payload.get("E") is not None or payload.get("T") is not None:
+    parts: List[str] = []
+    if payload.get("E") is None and payload.get("T") is None:
+        parts.append(f'"E":{int(now_ms)}')
+    if payload.get("s") is None and payload.get("symbol") is None:
+        parts.append(f'"s":"{str(symbol).upper()}"')
+    if not parts:
         return text
-    return f'{text[:start + 1]}"E":{int(now_ms)},{text[start + 1:]}'
+    return f'{text[:start + 1]}{",".join(parts)},{text[start + 1:]}'
 
 
 def percentile(samples: Sequence[int], fraction: float) -> float:
@@ -1049,11 +1060,12 @@ class L2IngestClient:
             return
         self._stats.snapshots += 1
         received_ns = self._clock()
-        # The venue's own timestamp wins; the receive time only fills a gap, and
-        # only textually, so the body stays the venue's bytes.
-        stamped = stamp_snapshot_time(text, received_ns // NS_PER_MS)
-        logger.info("seeded the book from %s (%d bytes)", self._snapshot_url, len(stamped))
-        self._handle_frame(received_ns, stamped, measure_latency=False)
+        # The venue's own fields win; the capture adds only what it knows and the
+        # snapshot lacks -- its receive time and its market.
+        seeded = annotate_snapshot(
+            text, received_ns // NS_PER_MS, self._settings.symbol)
+        logger.info("seeded the book from %s (%d bytes)", self._snapshot_url, len(seeded))
+        self._handle_frame(received_ns, seeded, measure_latency=False)
 
     async def run(self) -> IngestStats:
         """Connects, ingests and reconnects until stopped."""
@@ -1110,10 +1122,13 @@ class L2IngestClient:
                 # socket buffered while it was in flight, and the archive would
                 # then hold a book that is timestamped after the deltas that
                 # follow it -- which the analysis refuses, correctly, as a
-                # non-monotonic timeline. Ordering first, exactness second: the
-                # deltas in that one round trip are not applied, and the mid is
-                # correct from the first frame onwards, which is what the
-                # timeline needs.
+                # non-monotonic timeline. What the seed cannot do is hand off
+                # contiguously: whatever changed between its ``lastUpdateId`` and
+                # the first frame was not on any socket yet, so it is absent from
+                # the archive. The book is therefore correct *from the seed
+                # forward*, up to one round trip of level changes; the analysis
+                # discards any frame whose id the seed already contains rather
+                # than applying it twice.
                 await self._seed_snapshot()
                 frames = await self.consume(source)
             except FeedUnavailable:
@@ -1282,7 +1297,14 @@ def build_settings(args: argparse.Namespace) -> DataIngestionSettings:
     elif args.aux_streams:
         overrides["aux_streams"] = parse_stream_names(args.aux_streams)
     overrides = {name: value for name, value in overrides.items() if value is not None}
-    return replace(settings, **overrides) if overrides else settings
+    settings = replace(settings, **overrides) if overrides else settings
+    # ``dataclasses.replace`` does not re-run the settings validation, so a CLI
+    # value could otherwise reach the venue with a depth it answers with HTTP
+    # 400 -- an unseeded capture that still exits clean. Checked against the
+    # endpoint the merged settings will actually dial.
+    check_snapshot_limit(
+        settings.endpoint, settings.snapshot_limit, "--snapshot-limit")
+    return settings
 
 
 def install_signal_handlers(client: L2IngestClient) -> None:

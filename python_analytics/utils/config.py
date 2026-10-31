@@ -46,6 +46,24 @@ DEPTH_SNAPSHOT_ENDPOINTS: Dict[str, Tuple[str, str]] = {
     "binance_spot": ("https://api.binance.com", "/api/v3/depth"),
 }
 
+#: Depth limits each venue actually accepts, measured against the live API
+#: rather than read off a page: USDⓈ-M ``/fapi/v1/depth`` answers ``limit=7`` and
+#: ``limit=1001`` with HTTP 400, so a free 1-1000 integer range would configure
+#: a request that always fails and silently leave the capture unseeded. ``None``
+#: means the product takes any value up to its maximum, as spot does.
+DEPTH_SNAPSHOT_LIMITS: Dict[str, Optional[Tuple[int, ...]]] = {
+    "binance_futures": (5, 10, 20, 50, 100, 500, 1000),
+    "binance_futures_testnet": (5, 10, 20, 50, 100, 500, 1000),
+    "binance_spot": None,
+}
+
+#: Hard ceiling per product, used when the accepted set is open (``None`` above).
+DEPTH_SNAPSHOT_MAX_LIMIT: Dict[str, int] = {
+    "binance_futures": 1000,
+    "binance_futures_testnet": 1000,
+    "binance_spot": 5000,
+}
+
 # Binance USDⓈ-M Futures environments selected by ``BINANCE_ENV``. Only public
 # endpoint metadata lives here: API keys and secrets are read from the
 # ``BINANCE_API_KEY`` / ``BINANCE_API_SECRET`` environment variables so they are
@@ -539,6 +557,36 @@ def depth_snapshot_url(ws_base_url: str, symbol: str, limit: int = 1000) -> Opti
     return f"{base}{path}?symbol={str(symbol).upper()}&limit={int(limit)}"
 
 
+def check_snapshot_limit(ws_base_url: str, limit: int,
+                         field: str = "data_ingestion.snapshot_limit") -> int:
+    """Returns ``limit`` if the venue would accept it, else raises ``ConfigError``.
+
+    Checked against the endpoint being dialled because the products differ: the
+    USDⓈ-M book takes one of seven discrete sizes, while spot takes any depth up
+    to its own maximum. A value the venue rejects is worse than a config typo --
+    the request 400s, the capture continues unseeded, and the book stays blind
+    for exactly the reason the seed exists to prevent.
+    """
+    exchange = exchange_for_endpoint(ws_base_url)
+    value = int(limit)
+    if value < 1:
+        raise ConfigError(f"'{field}' must be >= 1, got {value}")
+    allowed = DEPTH_SNAPSHOT_LIMITS.get(exchange)
+    ceiling = DEPTH_SNAPSHOT_MAX_LIMIT.get(exchange, 1000)
+    if value > ceiling:
+        raise ConfigError(
+            f"'{field}' must be <= {ceiling} for {exchange or 'this endpoint'}, "
+            f"got {value}"
+        )
+    if allowed is not None and value not in allowed:
+        raise ConfigError(
+            f"'{field}' must be one of {', '.join(str(n) for n in allowed)} for "
+            f"{exchange or 'this endpoint'} (the venue answers any other depth "
+            f"with HTTP 400), got {value}"
+        )
+    return value
+
+
 def silent_aux_streams(
     aux_streams: Sequence[str], ws_base_url: str
 ) -> Tuple[str, ...]:
@@ -567,6 +615,9 @@ def _build_data_ingestion(raw: Mapping[str, Any]) -> DataIngestionSettings:
             "'data_ingestion.ws_base_url' must start with ws:// or wss://: "
             f"{base_url!r}"
         )
+    # The snapshot depth is checked against the endpoint that will actually be
+    # dialled, because that is the venue that will answer it.
+    resolved_ws = base_url or EXCHANGE_ENDPOINTS[exchange]
     storage_path = str(raw.get("storage_path", defaults.storage_path)).strip()
     if not storage_path:
         raise ConfigError("'data_ingestion.storage_path' must not be empty")
@@ -646,11 +697,14 @@ def _build_data_ingestion(raw: Mapping[str, Any]) -> DataIngestionSettings:
         snapshot_on_connect=bool(
             raw.get("snapshot_on_connect", defaults.snapshot_on_connect)
         ),
-        snapshot_limit=_int(
-            raw.get("snapshot_limit", defaults.snapshot_limit),
-            "data_ingestion.snapshot_limit",
-            minimum=1,
-            maximum=1000,
+        snapshot_limit=check_snapshot_limit(
+            resolved_ws,
+            _int(
+                raw.get("snapshot_limit", defaults.snapshot_limit),
+                "data_ingestion.snapshot_limit",
+                minimum=1,
+                maximum=DEPTH_SNAPSHOT_MAX_LIMIT.get(exchange, 1000),
+            ),
         ),
         snapshot_timeout_s=_float(
             raw.get("snapshot_timeout_s", defaults.snapshot_timeout_s),

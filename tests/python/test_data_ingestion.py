@@ -12,7 +12,7 @@ import json
 import random
 from dataclasses import replace
 from pathlib import Path
-from typing import Any, Dict, List, Sequence
+from typing import Any, Dict, List, Optional, Sequence
 
 import pytest
 import yaml
@@ -23,6 +23,7 @@ from python_analytics.utils.config import (
     ConfigError,
     DataIngestionSettings,
     as_dict,
+    check_snapshot_limit,
     depth_snapshot_url,
     load_settings,
     silent_aux_streams,
@@ -34,6 +35,7 @@ from scripts.ingest_l2 import (  # noqa: E402 - sys.path bootstrap lives in the 
     LatencyTracker,
     L2IngestClient,
     RawL2Writer,
+    annotate_snapshot,
     build_settings,
     event_kind,
     event_timestamp_ns,
@@ -41,7 +43,6 @@ from scripts.ingest_l2 import (  # noqa: E402 - sys.path bootstrap lives in the 
     parse_payload,
     percentile,
     reconnect_delay,
-    stamp_snapshot_time,
     unwrap_frame_text,
 )
 
@@ -1048,11 +1049,22 @@ def test_cli_rejects_unknown_compression() -> None:
 # Snapshot seeding
 # --------------------------------------------------------------------------- #
 def _snapshot(levels: int = 2, event_ms: int = 1_700_000_000_000,
-              symbol: str = "BTCUSDT") -> str:
+              last_update_id: int = 42, symbol: Optional[str] = None) -> str:
+    """A REST depth snapshot **in the shape the venue sends it**.
+
+    Neither product's snapshot names its market, so ``symbol`` defaults to
+    ``None``: a fixture that supplied it would hide the case where a mixed
+    capture's seed is claimed by the wrong market.
+    """
     bids = [[f"{100.0 - index * 0.5:.2f}", "1.0"] for index in range(levels)]
     asks = [[f"{100.5 + index * 0.5:.2f}", "1.0"] for index in range(levels)]
-    return json.dumps({"lastUpdateId": 42, "E": event_ms, "T": event_ms,
-                       "s": symbol, "bids": bids, "asks": asks})
+    payload: Dict[str, Any] = {
+        "lastUpdateId": last_update_id, "E": event_ms, "T": event_ms,
+        "bids": bids, "asks": asks,
+    }
+    if symbol is not None:
+        payload["s"] = symbol
+    return json.dumps(payload)
 
 
 def test_a_snapshot_is_archived_as_the_first_line_of_the_roll(tmp_path) -> None:
@@ -1076,7 +1088,11 @@ def test_a_snapshot_is_archived_as_the_first_line_of_the_roll(tmp_path) -> None:
 
     assert asyncio.run(_session()) == 1
     lines = [record for path in _roll_files(tmp_path) for record in _read_roll(path)]
-    assert json.loads(lines[0])["lastUpdateId"] == 42
+    seed = json.loads(lines[0])
+    assert seed["lastUpdateId"] == 42
+    # The venue sent no market; the archive must carry one, or the seed is the
+    # one line a mixed capture cannot attribute.
+    assert seed["s"] == "BTCUSDT"
     assert client.stats.snapshots == 1
     assert client.stats.snapshot_failures == 0
 
@@ -1090,28 +1106,38 @@ def test_the_seeded_file_builds_a_monotonic_timeline(tmp_path) -> None:
     """
     from python_analytics.backtesting.markouts import build_timeline
 
-    client = _client(tmp_path, snapshot_fetcher=lambda url, timeout: _snapshot())
+    client = _client(tmp_path, snapshot_fetcher=lambda url, timeout: _snapshot(
+        last_update_id=1))
 
     async def _session() -> None:
         try:
             # Seeded before the socket opens, so its venue time precedes every
-            # frame that follows it.
+            # frame that follows it, and its id precedes theirs so none of them
+            # is discarded as already contained in the seed.
             await client._seed_snapshot()
             await client.consume(_FrameSource([
-                (1_700_000_000_250 * NS_PER_MS, _depth(1_700_000_000_200)),
-                (1_700_000_000_350 * NS_PER_MS, _depth(1_700_000_000_300)),
+                (1_700_000_000_250 * NS_PER_MS,
+                 _depth(1_700_000_000_200, b=[["99.99", "1.0"]],
+                        a=[["100.51", "1.0"]])),
+                (1_700_000_000_350 * NS_PER_MS,
+                 _depth(1_700_000_000_300, b=[["100.00", "2.0"]],
+                        a=[["100.50", "2.0"]])),
             ]))
         finally:
             await client.aclose()
 
     asyncio.run(_session())
     lines = [record for path in _roll_files(tmp_path) for record in _read_roll(path)]
-    assert json.loads(lines[0])["lastUpdateId"] == 42
+    assert json.loads(lines[0])["lastUpdateId"] == 1
 
     timeline = build_timeline(lines)
     first_ts, first_mid, _ = next(timeline.samples())
     assert first_ts == 1_700_000_000_000 * NS_PER_MS
     assert first_mid == pytest.approx(100.25)
+    # Seed, then each of the two frames: the mid follows the book, it does not
+    # go missing because a fixture priced a level inconsistently.
+    assert len(timeline) == 3
+    assert timeline.stale == 0
     assert timeline.max_gap_s < 1.0
 
 
@@ -1120,8 +1146,8 @@ def test_a_live_session_seeds_before_it_reads_the_stream(tmp_path, monkeypatch) 
 
     A snapshot fetched *after* connecting carries a venue time later than the
     frames the socket buffered while the HTTP round trip was in flight, so the
-    archive would hold a book stamped after the deltas that follow it and the
-    mid timeline would refuse the whole capture. Seeding first is the fix; this
+    archive would hold a book stamped after the deltas that follow it and the mid
+    timeline would refuse the whole capture. Seeding first is the fix; this
     drives ``run()`` so a future edit to that order cannot pass.
     """
     from python_analytics.backtesting.markouts import build_timeline
@@ -1129,7 +1155,15 @@ def test_a_live_session_seeds_before_it_reads_the_stream(tmp_path, monkeypatch) 
     frame_ms = 1_700_000_000_400
 
     class _OneFrame:
+        """Yields one frame, then asks for the stop a reconnect would trigger.
+
+        Ending the session cleanly matters: a second attempt would archive the
+        same old snapshot a second time, and the backward timestamp would be what
+        failed the test rather than what it is checking.
+        """
+
         def __init__(self, client: L2IngestClient) -> None:
+            self._client = client
             self._done = False
 
         def __aiter__(self) -> "_OneFrame":
@@ -1137,31 +1171,54 @@ def test_a_live_session_seeds_before_it_reads_the_stream(tmp_path, monkeypatch) 
 
         async def __anext__(self) -> Frame:
             if self._done:
+                self._client.request_stop()
                 raise StopAsyncIteration
             self._done = True
-            return frame_ms * NS_PER_MS, _depth(frame_ms)
+            return (frame_ms * NS_PER_MS,
+                    _depth(frame_ms, b=[["100.00", "2.0"]], a=[["100.50", "2.0"]]))
 
         async def aclose(self) -> None:
             return None
 
     monkeypatch.setattr(ingest_module, "_SocketFrames", _OneFrame)
-    settings = _settings(
-        max_reconnect_attempts=1,
-        reconnect_base_delay_s=0.001,
-        reconnect_max_delay_s=0.002,
-        telemetry_interval_s=0.5,
+    client = _client(
+        tmp_path,
+        settings=_settings(snapshot_limit=500),
+        snapshot_fetcher=lambda url, timeout: _snapshot(
+            event_ms=frame_ms - 300, last_update_id=1),
     )
-    # The snapshot's venue time is *earlier* than the frame that follows it.
-    client = _client(tmp_path, settings=settings,
-                     snapshot_fetcher=lambda url, timeout: _snapshot(
-                         event_ms=frame_ms - 300))
     stats = asyncio.run(client.run())
 
-    assert stats.snapshots >= 1
+    assert stats.snapshots == 1
     lines = [record for path in _roll_files(tmp_path) for record in _read_roll(path)]
-    assert json.loads(lines[0])["lastUpdateId"] == 42
+    assert len(lines) == 2
+    seed = json.loads(lines[0])
+    assert seed["lastUpdateId"] == 1 and seed["s"] == "BTCUSDT"
     timeline = build_timeline(lines)
     assert timeline.first_ts_ns == (frame_ms - 300) * NS_PER_MS
+    # The seed's own book, then the stream's: two samples, no stale discard.
+    assert len(timeline) == 2
+    assert timeline.stale == 0
+
+
+def test_a_frame_already_contained_in_the_seed_is_not_applied_twice(tmp_path) -> None:
+    """The REST request finished before the stream was read, so ids can overlap.
+
+    A delta at or below the seed's ``lastUpdateId`` is already in the book; if it
+    is applied again a level moves twice and the resulting mid is wrong in the
+    way no human would notice -- it looks plausible.
+    """
+    from python_analytics.backtesting.markouts import build_timeline
+
+    seed = _snapshot(event_ms=1_700_000_000_000, last_update_id=100)
+    stale = _depth(1_700_000_000_100, U=50, u=60)
+    fresh = _depth(1_700_000_000_200, U=101, u=101,
+                   b=[["100.00", "2.0"]], a=[["100.50", "2.0"]])
+
+    timeline = build_timeline([seed, stale, fresh])
+    assert timeline.stale == 1
+    assert len(timeline) == 2
+    assert list(timeline.samples())[-1][1] == pytest.approx(100.25)
 
 
 def test_the_seeded_snapshot_is_readable_by_the_mid_timeline(tmp_path) -> None:
@@ -1217,19 +1274,62 @@ def test_the_snapshot_url_follows_the_endpoint_that_is_dialled() -> None:
     assert depth_snapshot_url("wss://example.invalid/ws", "btcusdt") is None
 
 
-def test_a_spot_snapshot_is_stamped_with_its_receive_time_only() -> None:
-    """Spot sends no ``E``; the stamp adds one and changes nothing else."""
-    body = '{"lastUpdateId": 7, "bids": [["100.0", "1.0"]], "asks": [["100.5", "1.0"]]}'
-    stamped = stamp_snapshot_time(body, 1_700_000_000_123)
-    assert stamped.startswith('{"E":1700000000123,')
-    assert stamped.split(",", 1)[1] == body[1:]
-    assert json.loads(stamped)["E"] == 1_700_000_000_123
+def test_a_snapshot_is_stamped_with_only_what_the_venue_omitted() -> None:
+    """Missing receive time and market are added; everything else is untouched.
 
-    # A body that already carries a venue timestamp is left alone.
-    assert stamp_snapshot_time(_snapshot(), 1) == _snapshot()
+    Neither product's REST depth response names its symbol, and spot sends no
+    timestamp either. An archive line that identifies neither its market nor its
+    instant cannot be used by a consumer that filters on one of them.
+    """
+    spot = '{"lastUpdateId": 7, "bids": [["100.0", "1.0"]], "asks": [["100.5", "1.0"]]}'
+    seeded = annotate_snapshot(spot, 1_700_000_000_123, "btcusdt")
+    assert seeded.startswith('{"E":1700000000123,"s":"BTCUSDT",')
+    # The venue's own bytes survive the textual insert unchanged.
+    assert seeded.split('"BTCUSDT",', 1)[1] == spot[1:]
+    parsed = json.loads(seeded)
+    assert parsed["lastUpdateId"] == 7 and parsed["bids"] == [["100.0", "1.0"]]
+
+    # A USDⓈ-M body already carries E/T, so only the market is added.
+    futures = _snapshot(event_ms=1_700_000_000_000)
+    assert json.loads(annotate_snapshot(futures, 1, "btcusdt"))["E"] == 1_700_000_000_000
+    assert json.loads(annotate_snapshot(futures, 1, "btcusdt"))["s"] == "BTCUSDT"
+
+    # A body that already names its market keeps the venue's spelling; the
+    # missing timestamp is still added, because nothing can place it in time.
+    named = '{"lastUpdateId": 7, "s": "ETHUSDT", "bids": [], "asks": []}'
+    annotated = json.loads(annotate_snapshot(named, 5, "btcusdt"))
+    assert annotated["s"] == "ETHUSDT" and annotated["E"] == 5
 
 
 def test_a_snapshot_body_that_is_not_an_object_is_left_alone() -> None:
-    """Only a JSON object can be stamped; anything else passes through."""
-    assert stamp_snapshot_time("not json", 1) == "not json"
-    assert stamp_snapshot_time("[1, 2, 3]", 1) == "[1, 2, 3]"
+    """Only a JSON object can be annotated; anything else passes through."""
+    assert annotate_snapshot("not json", 1, "btcusdt") == "not json"
+    assert annotate_snapshot("[1, 2, 3]", 1, "btcusdt") == "[1, 2, 3]"
+
+
+def test_the_snapshot_depth_is_validated_per_venue() -> None:
+    """The venue answers a depth it does not serve with HTTP 400.
+
+    Measured against the live API: USDⓈ-M accepts 5/10/20/50/100/500/1000 and
+    rejects 7 and 1001. A configured value it rejects is worse than a typo -- the
+    seed silently never happens, leaving the book blind for the exact reason the
+    seed exists to prevent.
+    """
+    futures = EXCHANGE_ENDPOINTS["binance_futures"]
+    spot = EXCHANGE_ENDPOINTS["binance_spot"]
+    assert check_snapshot_limit(futures, 1000) == 1000
+    assert check_snapshot_limit(spot, 1234) == 1234
+    with pytest.raises(ConfigError, match="HTTP 400"):
+        check_snapshot_limit(futures, 7)
+    with pytest.raises(ConfigError, match="<= 1000"):
+        check_snapshot_limit(futures, 1001)
+    with pytest.raises(ConfigError, match="<= 5000"):
+        check_snapshot_limit(spot, 6000)
+
+
+def test_the_cli_snapshot_depth_goes_through_the_same_contract() -> None:
+    """``dataclasses.replace`` does not re-run validation, so this is explicit."""
+    args = parse_args(["--snapshot-limit", "500"])
+    assert build_settings(args).snapshot_limit == 500
+    with pytest.raises(ConfigError, match="--snapshot-limit"):
+        build_settings(parse_args(["--snapshot-limit", "7"]))

@@ -255,7 +255,8 @@ class MarkoutTimeline:
     sample count.
     """
 
-    __slots__ = ("symbol", "_ts", "_mid", "_spread", "malformed", "ignored")
+    __slots__ = ("symbol", "_ts", "_mid", "_spread", "malformed", "ignored",
+                 "stale")
 
     def __init__(self, symbol: Optional[str] = None) -> None:
         self.symbol = symbol
@@ -264,6 +265,8 @@ class MarkoutTimeline:
         self._spread: List[float] = []
         self.malformed = 0
         self.ignored = 0
+        #: Diff frames already contained in a snapshot that followed them.
+        self.stale = 0
 
     # ------------------------------------------------------------- building
     def add(self, ts_ns: int, mid: float, spread_bps: float = 0.0) -> bool:
@@ -452,6 +455,24 @@ def iter_capture_lines(path: Path) -> Iterable[str]:
             yield line
 
 
+def _update_id(message: Mapping[str, Any]) -> Optional[int]:
+    """The last update id a diff frame carries, or ``None`` when it has none.
+
+    Both Binance spellings are read (futures ``u``, spot ``last_update_id``).
+    A frame with no id cannot be placed against a snapshot, and guessing one is
+    how a book gets the same delta applied twice.
+    """
+    for key in ("u", "last_update_id", "L"):
+        raw = message.get(key)
+        if raw is None or isinstance(raw, bool):
+            continue
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
 class _TimelineBuilder:
     """Stateful feed parser: one book, one ticker, one timeline.
 
@@ -460,9 +481,16 @@ class _TimelineBuilder:
     of the second file may delete a level created by the first. Parsing each
     file with a fresh ladder would drop that delta — and a midpoint computed
     from half a book is not a measurement, it is a fabrication.
+
+    A snapshot seeds the ladder, and the frames it already contains are
+    discarded: the REST request that produced the seed finished *before* the
+    stream was read, so a frame whose last update id is at or below the
+    snapshot's is already in the book. Applying it again moves a level twice,
+    which is exactly the "mid that is wrong but looks plausible" failure.
     """
 
-    __slots__ = ("timeline", "book", "ticker", "want", "explicit", "file_symbol")
+    __slots__ = ("timeline", "book", "ticker", "want", "explicit", "file_symbol",
+                 "snapshot_id")
 
     def __init__(self, symbol: Optional[str] = None) -> None:
         self.timeline = MarkoutTimeline(symbol=symbol)
@@ -472,6 +500,8 @@ class _TimelineBuilder:
         self.explicit = bool(symbol)
         #: First symbol seen in the file most recently passed to :meth:`feed`.
         self.file_symbol: Optional[str] = None
+        #: ``lastUpdateId`` of the newest snapshot applied, if any.
+        self.snapshot_id: Optional[int] = None
 
     def feed(self, lines: Iterable[str]) -> MarkoutTimeline:
         """Applies one capture's lines to the running book and timeline."""
@@ -509,6 +539,13 @@ class _TimelineBuilder:
 
             if kind == "depthUpdate" or ("b" in message and "a" in message
                                          and isinstance(message.get("b"), list)):
+                update_id = _update_id(message)
+                if (self.snapshot_id is not None and update_id is not None
+                        and update_id <= self.snapshot_id):
+                    # Already inside the seeded book: applying it again would
+                    # move a level twice and report the result as a mid.
+                    timeline.stale += 1
+                    continue
                 book.apply("BUY", message.get("b") or ())
                 book.apply("SELL", message.get("a") or ())
                 mid = book.mid
@@ -524,6 +561,12 @@ class _TimelineBuilder:
 
             if "lastUpdateId" in message:
                 book.set(message.get("bids") or (), message.get("asks") or ())
+                # The seed replaces the ladder, so everything before it is now
+                # inside the book and must not be applied on top of it.
+                try:
+                    self.snapshot_id = int(message.get("lastUpdateId"))
+                except (TypeError, ValueError):
+                    self.snapshot_id = None
                 if ts_ns is None:
                     timeline.ignored += 1
                     continue
