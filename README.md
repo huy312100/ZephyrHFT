@@ -65,11 +65,14 @@ used at the orchestration/analytics boundary.
   ADVERSE_SELECTION — the difference between "the fees ate the edge" and "the
   quote was picked off".
 - **Edge curve** (`python_analytics/backtesting/edge_curve.py` +
-  `scripts/run_edge_curve.py`): with no strategy in the loop, measures what a
-  quote resting `d` bps from the mid would have earned on a capture and how
-  often the tape reached that far. It returns the distance at which a maker fee
-  is actually paid back, or says that no distance in the grid is — the
-  difference between "tune harder" and "this fee tier cannot be traded".
+  `scripts/run_edge_curve.py`): with no strategy in the loop, measures the gross
+  markout a hypothetical quote resting `d` bps from the mid would have earned on
+  a capture, and how often the tape reached that far. Under that modelled fill
+  rule it names the distance at which a maker fee would be paid back, or reports
+  that no distance in the grid is — the difference between "tune harder" and
+  "this fee tier cannot be traded". Queue position, latency and order size are
+  not modelled, so the number is conditional on the rule, not an execution
+  estimate.
 
 ## Phase status
 

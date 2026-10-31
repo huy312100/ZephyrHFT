@@ -1301,8 +1301,9 @@ tape ever go there?**
 print in a capture, an order resting `d` basis points on the passive side would
 have been filled if the print traded at or through its price; that hypothetical
 fill is marked from **the quote's own price** — a print that trades through us
-fills us at our limit, not at its own price — at the configured horizons, and
-the maker fee is subtracted. Each distance is then summarised by edge and by how
+fills us at our limit, not at its own price — at the configured horizons. Those
+markouts are **gross**: the maker fee is applied separately, to the fee-adjusted
+result and to the verdict. Each distance is then summarised by edge and by how
 often the tape reached it.
 
 Two boundaries matter, because they are what keep this from being a fantasy:
@@ -1379,9 +1380,11 @@ the maker's:
   interpolated — at `3 bps` that is 15,962 of 18,436. They are not a random
   subset: the websocket reconnect at `18:52` left a 113 s hole in the mid
   timeline, and 15,261 of the `3 bps` fills landed inside it. That episode was
-  the most violent of the session, so the surviving means are if anything
-  **flattering**. The module now reports the count (`truncated`) instead of
-  shrinking the sample quietly.
+  the most violent of the session. **The direction of the resulting bias is
+  unmeasured**: the excluded fills have no markouts by construction, and
+  volatility moves passive-fill markouts in either direction, so this is a hole
+  in the sample rather than a known skew. The module reports the count
+  (`truncated`) instead of shrinking the sample quietly.
 - **The per-roll spread is the regime.** At the touch, the `1 s` markout is
   negative in **14 of 14** rolls (`-1.12` to `-1.49 bps`). At `2 bps` it is
   negative in 12 of 14 and positive in two (`+1.31`, `+0.15`). A single roll
@@ -1457,7 +1460,7 @@ you are looking at.
 # the method on the committed 151 s tape (reproduces the first table)
 python3 scripts/run_edge_curve.py \
   --source data/raw_l2/binance_futures_btcusdt_depth_100ms_trade_20261029T163929Z_00001.ndjson.gz \
-  --tick-size 0.1 --distances-bps 0.0125,0.025,0.05,0.1,0.25,0.5,1,1.5,2
+  --tick-size 0.1 --distances-bps 0.0125,0.1,0.5,1,1.5,2
 
 # a multi-roll capture, read as one chronological tape (the 3 h numbers)
 python3 scripts/run_edge_curve.py \
