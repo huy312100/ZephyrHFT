@@ -1261,17 +1261,19 @@ On 3 h of the same instrument (643,077 prints over 12,000 s, 14 rolls, tick
 Verdict `NO_CLEARING_DISTANCE`. At a one-second holding time the gross markout is
 negative at every distance the tape reaches — worst at the touch (`−1.33 bps`,
 `t = −658`, 7.2 % of fills positive), improving monotonically with distance and
-never clearing zero. A maker cannot quote its way out of the fee. At ten seconds
-the far distances flip gross-positive (`+0.12 bps` at 154 ticks, `+1.49 bps` at
-231), but neither clears the 2 bps fee — they need a fee below `0.12` and `1.49`
-bps respectively, which is a sweep-reversion hypothesis rather than a
-market-making one: quote far, get filled by a run, hold. A 151 s smoke test had
-reported `+0.13 bps` at `1 bps` and no fills beyond `1.5 bps`; 79× the tape
-reverses that sign and fills the far distances, which is why the study needed
-hours and not minutes.
+never clearing zero. A maker cannot quote its way out of the fee.
+
+A round trip is what a maker actually does, and it pays the fee **twice**:
+`2 * markout − 2 * fee`. On this tape that is `−5.94 bps` at the best 1 s
+distance and `−3.76 bps` at the best 10 s one, so the fee ceiling — the per-side
+rate at which a round trip breaks even — is `+0.12 bps` at a 10 s hold and
+negative at 1 s. Retail is `2.0 bps`. The one cell that would clear a retail fee
+(`4 bps` out, 10 s hold, `+0.25 bps` per round trip) is computed on **7.3 %** of
+that distance's fills: coverage falls with distance because far fills happen in
+the violent stretches where the depth stream breaks, and the curve now refuses to
+let such a row decide (`min_coverage`, default 25 %).
 [`docs/phase5_production_readiness.md` §11.8](docs/phase5_production_readiness.md#118-the-edge-curve-what-a-quote-earns-at-each-distance)
-works it through, including the fills that a reconnect's 113 s hole in the mid
-timeline could not mark.
+carries the arithmetic and §11.8.7 names what is missing for go-live.
 
 ### Continuous integration
 

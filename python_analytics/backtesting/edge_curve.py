@@ -230,6 +230,7 @@ class EdgeCurveConfig:
     maker_bps: float = DEFAULT_MAKER_BPS
     tick_size: float = 0.0
     min_samples: int = 30
+    min_coverage: float = 0.25
     primary_horizon_s: Optional[float] = None
 
     def __post_init__(self) -> None:
@@ -255,12 +256,15 @@ class EdgeCurveConfig:
             raise ValueError("tick_size must be >= 0")
         if int(self.min_samples) < 1:
             raise ValueError("min_samples must be >= 1")
+        if not 0.0 <= float(self.min_coverage) <= 1.0:
+            raise ValueError("min_coverage must be between 0 and 1")
         object.__setattr__(self, "distances_bps", distances)
         object.__setattr__(self, "horizons_s", horizons)
         object.__setattr__(self, "tolerance_s", float(self.tolerance_s))
         object.__setattr__(self, "maker_bps", float(self.maker_bps))
         object.__setattr__(self, "tick_size", float(self.tick_size))
         object.__setattr__(self, "min_samples", int(self.min_samples))
+        object.__setattr__(self, "min_coverage", float(self.min_coverage))
 
         primary = self.primary_horizon_s
         if primary is None:
@@ -293,6 +297,7 @@ class EdgeCurveConfig:
             "maker_bps": self.maker_bps,
             "tick_size": self.tick_size,
             "min_samples": self.min_samples,
+            "min_coverage": self.min_coverage,
             "primary_horizon_s": float(self.primary_horizon_s or 0.0),
         }
 
@@ -438,9 +443,38 @@ def measure_edge_curve(scan: TapeScan, timeline: MarkoutTimeline,
     mids = [sample[1] for sample in timeline.samples() if sample[1]]
     median_mid = _median(mids)
     rows: List[Dict[str, Any]] = []
+    primary_label = horizon_label(config.primary_horizon_s or 0.0)
     for distance in config.distances_bps:
         count = fills[distance]
-        block = {
+        horizons = {
+            label: _block(samples[distance][label], config.maker_bps, count)
+            for label in labels
+        }
+        # A round trip is two fills, so it pays the fee twice and earns the
+        # markout twice: 2*mean - 2*fee. `breakeven_maker_bps` is the per-side
+        # fee at which that expression is zero, which is simply the per-fill
+        # markout -- the number a fee tier has to beat for the configuration to
+        # be worth anything at all. Both sides are assumed to fill at the same
+        # distance, which is the standard maker decomposition and not a promise
+        # that the exit arrives on schedule.
+        primary_mean = float(horizons[primary_label]["mean_bps"])
+        primary_samples = int(horizons[primary_label]["samples"])
+        round_trip = {
+            "horizon": primary_label,
+            "gross_bps": 2.0 * primary_mean,
+            "fees_bps": 2.0 * float(config.maker_bps),
+            "net_bps": 2.0 * primary_mean - 2.0 * float(config.maker_bps),
+            "breakeven_maker_bps": primary_mean,
+            "samples": primary_samples,
+            # What fraction of this distance's fills could be marked at all. A
+            # cell computed on a small share of its fills is a statement about
+            # the fills that happened to be markable, and far-distance fills
+            # cluster in the volatile stretches where the timeline goes blind.
+            "coverage_pct": (
+                100.0 * primary_samples / count if count else 0.0
+            ),
+        }
+        rows.append({
             "distance_bps": distance,
             "distance_ticks": (
                 distance / 10_000.0 * median_mid / config.tick_size
@@ -449,12 +483,9 @@ def measure_edge_curve(scan: TapeScan, timeline: MarkoutTimeline,
             "fills": count,
             "reach_pct": 100.0 * count / matched if matched else 0.0,
             "fills_per_min": count / minutes if minutes > 0.0 else 0.0,
-            "horizons": {
-                label: _block(samples[distance][label], config.maker_bps, count)
-                for label in labels
-            },
-        }
-        rows.append(block)
+            "horizons": horizons,
+            "round_trip": round_trip,
+        })
 
     return {
         "config": config.as_dict(),
@@ -507,6 +538,12 @@ def edge_curve_verdict(summary: Mapping[str, Any],
             "net_bps": None,
             "fills": 0,
             "fills_per_min": 0.0,
+            "round_trip": {
+                "distance_bps": None,
+                "net_bps": None,
+                "breakeven_maker_bps": None,
+                "breakeven_distance_bps": None,
+            },
             "reasons": [
                 "no print had a mid before it, so no hypothetical quote could be "
                 "priced; check that the capture carries depth frames as well as trades",
@@ -514,6 +551,16 @@ def edge_curve_verdict(summary: Mapping[str, Any],
         }
 
     eligible = [row for row in rows if _samples_at(row, label) >= config.min_samples]
+    under_covered = [
+        row for row in eligible
+        if float(((row.get("round_trip") or {}).get("coverage_pct", 100.0)) or 0.0)
+        < 100.0 * config.min_coverage
+    ]
+    # A row that could only be marked for a small share of its fills is not
+    # evidence about the distance, however many samples it has: the unmarkable
+    # fills are the ones that happened while the timeline was blind, which is
+    # where the violent moves -- and the far fills -- live.
+    eligible = [row for row in eligible if row not in under_covered]
     clearing = [row for row in eligible if _net_at(row, label) > 0.0]
     if clearing:
         best = min(clearing, key=lambda row: float(row["distance_bps"]))
@@ -532,16 +579,29 @@ def edge_curve_verdict(summary: Mapping[str, Any],
         verdict = "NO_CLEARING_DISTANCE"
         if eligible:
             best = max(eligible, key=lambda row: _net_at(row, label))
+            # Every claim below is about the rows that passed *both* gates. A row
+            # excluded for coverage is described separately, so "no distance
+            # cleared" is never read as "every measured cell was negative".
             reasons.append(
-                f"no distance in the grid cleared the {config.maker_bps:g} bps fee "
-                f"at {label}; the best was {float(best['distance_bps']):g} bps "
+                f"among the {len(eligible)} covered distance(s) with at least "
+                f"{config.min_samples} samples, none cleared the "
+                f"{config.maker_bps:g} bps fee at {label}; the best was "
+                f"{float(best['distance_bps']):g} bps "
                 f"({float(best['distance_ticks'] or 0.0):.0f} ticks) with net "
                 f"{_net_at(best, label):+.2f} bps on {_samples_at(best, label)} fill(s)")
         else:
-            reachable = [
-                row for row in rows if _samples_at(row, label) > 0
+            reachable = [row for row in rows if _samples_at(row, label) > 0]
+            enough_samples = [
+                row for row in reachable
+                if _samples_at(row, label) >= config.min_samples
             ]
-            if reachable:
+            if enough_samples:
+                reasons.append(
+                    f"no distance could decide: {len(enough_samples)} had the "
+                    f"{config.min_samples} samples a verdict needs but not the "
+                    f"{config.min_coverage:.0%} coverage, and the rest had too few "
+                    f"samples at {label}")
+            elif reachable:
                 furthest = max(reachable, key=lambda row: float(row["distance_bps"]))
                 reasons.append(
                     f"the tape reached {float(furthest['distance_bps']):g} bps "
@@ -559,6 +619,77 @@ def edge_curve_verdict(summary: Mapping[str, Any],
         "count is not an execution estimate, and those effects change both how "
         "often a quote fills and what the fills that remain are worth, so read "
         "the edge as conditional on the idealised fill rule")
+
+    # One fill is not a business: a round trip pays the fee twice and earns the
+    # markout twice, so the fee ceiling is the per-fill markout itself. This is
+    # the number a fee tier has to beat, and it is the one an operator can act
+    # on -- a venue schedule is negotiable in a way that adverse selection is
+    # not.
+    if under_covered:
+        worst = min(
+            under_covered,
+            key=lambda row: float(row["round_trip"]["coverage_pct"]),
+        )
+        reasons.append(
+            f"{len(under_covered)} distance(s) were excluded for coverage, not for "
+            f"edge: at {float(worst['distance_bps']):g} bps only "
+            f"{float(worst['round_trip']['coverage_pct']):.1f}% of "
+            f"{int(worst['fills'])} fills could be marked at {label}, so a mean over "
+            f"what was left is a statement about a selected subset and cannot "
+            f"carry a verdict")
+    round_trip_rows = [
+        row for row in rows
+        if int((row.get("round_trip") or {}).get("samples", 0) or 0) >= config.min_samples
+        and row not in under_covered
+    ]
+    best_round_trip = max(
+        round_trip_rows,
+        key=lambda row: float(row["round_trip"]["net_bps"]),
+        default=None,
+    )
+    best_ceiling = max(
+        round_trip_rows,
+        key=lambda row: float(row["round_trip"]["breakeven_maker_bps"]),
+        default=None,
+    )
+    round_trip: Dict[str, Any] = {
+        "distance_bps": (
+            None if best_round_trip is None
+            else float(best_round_trip["distance_bps"])
+        ),
+        "net_bps": (
+            None if best_round_trip is None
+            else float(best_round_trip["round_trip"]["net_bps"])
+        ),
+        "breakeven_maker_bps": (
+            None if best_ceiling is None
+            else float(best_ceiling["round_trip"]["breakeven_maker_bps"])
+        ),
+        "breakeven_distance_bps": (
+            None if best_ceiling is None
+            else float(best_ceiling["distance_bps"])
+        ),
+    }
+    if best_round_trip is not None:
+        net = round_trip["net_bps"] or 0.0
+        if net > 0.0:
+            reasons.append(
+                f"a round trip at {round_trip['distance_bps']:g} bps nets "
+                f"{net:+.2f} bps after two {config.maker_bps:g} bps maker fees "
+                f"at {label} (covered rows only)")
+        else:
+            reasons.append(
+                f"no round trip among the {len(round_trip_rows)} covered distance(s) "
+                f"clears two {config.maker_bps:g} bps maker fees: the best is "
+                f"{net:+.2f} bps at {round_trip['distance_bps']:g} bps")
+    if best_ceiling is not None:
+        reasons.append(
+            f"the fee ceiling for a covered round trip is "
+            f"{round_trip['breakeven_maker_bps']:+.3f} bps per side at "
+            f"{round_trip['breakeven_distance_bps']:g} bps of quote offset "
+            f"({label}, idealised fill rule); a maker schedule above that cannot "
+            f"pay for a round trip on this tape")
+
     return {
         "verdict": verdict,
         "primary_horizon": label,
@@ -569,6 +700,7 @@ def edge_curve_verdict(summary: Mapping[str, Any],
         "net_bps": _net_at(clearing[0], label) if clearing else None,
         "fills": int(clearing[0]["fills"]) if clearing else 0,
         "fills_per_min": float(clearing[0]["fills_per_min"]) if clearing else 0.0,
+        "round_trip": round_trip,
         "reasons": reasons,
     }
 
@@ -626,7 +758,43 @@ def render_markdown(summary: Mapping[str, Any], verdict: Mapping[str, Any]) -> L
             f"{float(block.get('net_bps', 0.0) or 0.0):+.2f} |")
     lines.extend([
         "",
-        "`dropped` counts the fills whose target time landed in a hole in the mid",
+        "## Round trip (two fills, two fees)",
+        "",
+        f"| distance bps | n | coverage | eligible | {label} mean | gross (2x) | "
+        "fees (2x) | net | fee ceiling |",
+        "| --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+    ])
+    for row in summary.get("rows") or []:
+        trip = row.get("round_trip") or {}
+        mean = float((row.get("horizons") or {}).get(label, {}).get("mean_bps", 0.0) or 0.0)
+        coverage = float(trip.get("coverage_pct", 0.0) or 0.0)
+        # The same two gates the verdict applies, so a table reader can see which
+        # rows the conclusion speaks for instead of inferring it from the mean.
+        eligible = (
+            int(trip.get("samples", 0) or 0) >= config.min_samples
+            and coverage >= 100.0 * config.min_coverage
+        )
+        lines.append(
+            f"| {float(row['distance_bps']):g} | "
+            f"{int(trip.get('samples', 0) or 0)} | {coverage:.1f}% | "
+            f"{'yes' if eligible else 'no'} | {mean:+.3f} | "
+            f"{float(trip.get('gross_bps', 0.0) or 0.0):+.2f} | "
+            f"{float(trip.get('fees_bps', 0.0) or 0.0):.2f} | "
+            f"{float(trip.get('net_bps', 0.0) or 0.0):+.2f} | "
+            f"{float(trip.get('breakeven_maker_bps', 0.0) or 0.0):+.3f} |")
+    lines.extend([
+        "",
+        "A round trip pays the maker fee twice and earns the markout twice, so",
+        "`2 * mean - 2 * fee` is the only per-round-trip number that means anything.",
+        "The fee ceiling is the per-fill markout: a maker schedule above it loses on",
+        "this tape at that distance, whatever the fill count says. `eligible` applies",
+        f"the verdict's own gates ({config.min_samples} samples and "
+        f"{config.min_coverage:.0%} coverage); a `no` row is reported and not",
+        "decided.",
+        "",
+        "## Data quality",
+        "",
+        "`dropped` above counts the fills whose target time landed in a hole in the",
         "timeline. They are excluded, never interpolated, and on a real capture they",
         "are not a random subset: they cluster around reconnects and violent moves.",
         "Read a row's `n` before its mean.",

@@ -1460,6 +1460,83 @@ still a prerequisite for anything that holds a fill for a second, a wider-grid
 venue is still the other lever, and the curve is how you tell which of the two
 you are looking at.
 
+#### 11.8.6 The round trip, and why the best cell is not evidence
+
+One fill is not a business. A round trip is two fills, so it pays the maker fee
+twice and earns the markout twice:
+
+```
+round_trip_net(d, h) = 2 * markout(d, h) - 2 * maker_bps
+fee ceiling(d, h)    = markout(d, h)          # per side, where the net is zero
+```
+
+That reframes every number above, and it is the arithmetic a fee tier has to
+survive — **under the same idealised fill rule as every other number here**. The
+markout is what the mid did after a fill; a filter, a better queue position or a
+seeded book changes *which* fills happen and how many of them can be measured,
+not what the mid does afterwards, so none of them turns this into an execution
+estimate. On the same 3 h capture, with the fee at `2.0 bps`:
+
+| primary horizon | best **covered** distance | per-fill mean | round-trip net | fee ceiling |
+| --- | --- | --- | --- | --- |
+| `1 s` | `2 bps` (154 ticks) | `-0.971` | `-5.94 bps` | `-0.971 bps` |
+| `10 s` | `2 bps` (154 ticks) | `+0.121` | `-3.76 bps` | `+0.121 bps` |
+
+The `10 s` holding time is the only one with a positive fee ceiling, and it is
+`+0.12 bps` per side on the rows with enough coverage — a maker schedule at or
+below that, under this fill rule, or nothing. Retail is `2.0 bps`, which is
+sixteen times too expensive for this tape.
+
+**Why the 4 bps cell in §11.8.3 is not the answer.** At `4 bps` and a `10 s`
+hold the tape pays `+2.12 bps` per fill and `+0.25 bps` per round trip — the only
+cell in the whole study that clears a retail fee. It is also the *best measured*
+cell, not a proven one: it is computed on **7.3 %** of that distance's fills, and
+coverage falls monotonically with distance:
+
+| distance | 0.0125 bps | 0.5 bps | 2 bps | 3 bps | 4 bps |
+| --- | --- | --- | --- | --- | --- |
+| `10 s` coverage | 94.9 % | 90.7 % | 39.4 % | 15.7 % | 7.3 % |
+
+That gradient is not an accident of the marking method: far fills happen during
+violent moves, violent moves are when the depth stream is most likely to break,
+and a broken stream is exactly what leaves the mid timeline with no sample. The
+fills that would tell us whether the far quote works are the ones the capture
+cannot price. The curve now refuses to let such a row decide — `min_coverage`
+(default `25 %`) excludes it and says why, so the `4 bps` cell is reported and
+not counted.
+
+#### 11.8.7 What is actually missing
+
+Four things stand between this repository and a live deployment, and they are
+different kinds of problem:
+
+1. **An edge that survives two fees.** The measured ceiling is `+0.12 bps` per
+   side at a `10 s` hold and `2 bps` out; the fee on a retail schedule is `2.0`.
+   This is a business decision (a volume tier, a rebate programme, or an
+   instrument whose quoted spread is several bps wide), not a parameter. No
+   `k`, no filter and no queue position changes a number that is `2 * markout
+   - 2 * fee`.
+2. **A capture that does not go blind where it matters.** The coverage gradient
+   above is the reason the far cells cannot be trusted, and it is fixable in
+   code: the capture must archive a depth snapshot on connect and on every
+   reconnect (`ingest_l2.py` resumes a *diff* stream into an empty book, so the
+   analysis has no mid until enough deltas arrive — 113 s in this capture). Until
+   that exists, far-quote studies have **incomplete coverage**, and the direction
+   of any resulting markout bias is unmeasured: the markouts that are missing are
+   the ones nobody can compute, so this is a hole in the sample rather than a
+   known skew.
+3. **A loop.** `run_live_trader.py` places at most one quote; re-quoting,
+   inventory limits and a per-session loss cap belong in a supervisor (§11.3.4).
+4. **Funding and alerting.** Neither exists (§11.3.3, §11.3.5): a carry-heavy
+   session drifts from the ledger, and `panic()` returns failures to nobody.
+
+Items 3 and 4 are engineering with a known shape and no unknown in them. Item 1
+is the one that decides whether 3 and 4 are worth doing at all, and item 2 is
+what makes item 1 answerable: with the book seeded across reconnects, the `3 bps`
+and `4 bps` rows would be measured on their real fills instead of on 15 % and
+7 % of them.
+
+
 ```bash
 # the method on the committed 151 s tape (reproduces the first table)
 python3 scripts/run_edge_curve.py \

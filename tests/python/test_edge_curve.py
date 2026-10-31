@@ -208,7 +208,7 @@ def test_the_verdict_refuses_a_distance_the_fee_eats() -> None:
     verdict = edge_curve_verdict(summary, config)
     assert verdict["verdict"] == "NO_CLEARING_DISTANCE"
     assert verdict["distance_bps"] is None
-    assert any("no distance in the grid cleared" in reason
+    assert any("none cleared" in reason and "covered distance" in reason
                for reason in verdict["reasons"])
 
 
@@ -413,6 +413,63 @@ def test_the_runner_prices_prints_against_their_own_market(tmp_path) -> None:
     assert tape["symbol"] == "BTCUSDT"
     assert tape["prints"] == 1
     assert tape["ignored"] == 1
+
+
+def test_a_round_trip_pays_the_fee_twice_and_earns_the_markout_twice() -> None:
+    """One fill is not a business: the round trip is `2 * mean - 2 * fee`.
+
+    With a +3 bps per-fill markout and a 2 bps maker fee the round trip nets
+    +2 bps, and the fee ceiling -- the per-side fee at which it is exactly zero
+    -- is the markout itself. A row whose per-fill net looks positive can still
+    lose as a round trip, which is the mistake this pins.
+    """
+    lines = [
+        _snapshot(1_000, 99.99, 100.01),
+        _print(1_100, 99.99),
+        _snapshot(2_200, 100.01, 100.03),
+    ]
+    summary, _ = _curve(lines, _config(distances_bps=(1.0,), horizons_s=(0.0, 1.0)))
+    trip = summary["rows"][0]["round_trip"]
+    mean = summary["rows"][0]["horizons"]["1s"]["mean_bps"]
+    assert mean == pytest.approx(3.0, rel=0, abs=2e-3)
+    assert trip["gross_bps"] == pytest.approx(2.0 * mean, rel=0, abs=1e-9)
+    assert trip["fees_bps"] == pytest.approx(4.0, rel=0, abs=1e-9)
+    assert trip["net_bps"] == pytest.approx(2.0 * mean - 4.0, rel=0, abs=1e-9)
+    assert trip["breakeven_maker_bps"] == pytest.approx(mean, rel=0, abs=1e-9)
+
+
+def test_a_distance_marked_for_a_fraction_of_its_fills_cannot_decide() -> None:
+    """Ten fills with one markout is a selected subset, not a distance.
+
+    The far fills are the ones that happen while the timeline is blind -- a
+    reconnect, a burst -- so a coverage rule is what stops the cell that looks
+    best (and is measured on 7 % of its fills) from carrying the verdict.
+    """
+    lines = [_snapshot(1_000, 99.99, 100.01)]
+    # Nineteen prints whose 1 s target lands in a hole, then one that can be
+    # marked: 5 % coverage, and a mean that would otherwise clear easily.
+    for index in range(19):
+        lines.append(_print(1_100 + index, 99.99))
+    lines.append(_print(5_000, 99.99))
+    lines.append(_snapshot(6_600, 101.00, 101.02))
+    strict, strict_config = _curve(lines, _config(
+        distances_bps=(1.0,), horizons_s=(0.0, 1.0), min_samples=1, min_coverage=0.9))
+    verdict = edge_curve_verdict(strict, strict_config)
+    assert verdict["verdict"] == "NO_CLEARING_DISTANCE"
+    assert any("excluded for coverage" in reason for reason in verdict["reasons"])
+
+    lenient, lenient_config = _curve(lines, _config(
+        distances_bps=(1.0,), horizons_s=(0.0, 1.0), min_samples=1, min_coverage=0.0))
+    assert edge_curve_verdict(lenient, lenient_config)["verdict"] == "CLEARS"
+
+
+def test_the_runner_refuses_a_primary_horizon_it_did_not_measure() -> None:
+    """A verdict horizon has to be one of the measured horizons."""
+    script = _load_script()
+    assert script.main([
+        "--source", str(SAMPLE), "--horizons", "0,1",
+        "--primary-horizon", "5", "--no-report",
+    ]) == 2
 
 
 def test_a_print_constructor_refuses_a_missing_side() -> None:
