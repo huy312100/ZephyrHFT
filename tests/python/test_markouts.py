@@ -844,3 +844,41 @@ def test_fills_supplied_from_outside_record_no_fill_model(tmp_path) -> None:
 
     assert payload["inputs"]["mode"] == "fills"
     assert payload["inputs"]["fill_model"] is None
+
+
+def test_a_snapshot_with_no_book_in_it_does_not_clear_the_ladder() -> None:
+    """A malformed absolute snapshot must not destroy a book that was working.
+
+    ``set`` replaced the ladder before applying the payload, so
+    ``{"lastUpdateId": 1}`` -- right keys, no levels -- wiped both sides and left
+    the capture with no mid and nothing in the report saying so. A diff stream
+    that is one-sided for a while is indistinguishable from a quiet market, which
+    is the failure this whole file keeps having to relearn.
+    """
+    book = TopOfBook()
+    book.set([["100.0", "1.0"]], [["100.5", "1.0"]])
+    assert book.mid == pytest.approx(100.25)
+
+    assert book.set("ab", "cd") is False          # strings, not level lists
+    assert book.set([], []) is False                 # an empty book
+    assert book.mid == pytest.approx(100.25)         # the ladder survived
+
+    assert book.set([["99.0", "1.0"]], [["101.0", "1.0"]]) is True
+    assert book.mid == pytest.approx(100.0)
+
+
+def test_a_malformed_snapshot_frame_is_ignored_and_keeps_the_mid() -> None:
+    """The same guarantee one level up: the timeline keeps its mid."""
+    lines = [
+        json.dumps({"lastUpdateId": 1, "E": BASE_MS + 1,
+                    "bids": [["100.0", "1.0"]], "asks": [["100.5", "1.0"]]}),
+        json.dumps({"lastUpdateId": 2, "E": BASE_MS + 2}),      # no levels at all
+        json.dumps({"lastUpdateId": 3, "E": BASE_MS + 3,
+                    "bids": [], "asks": []}),                   # empty levels
+    ]
+    timeline = build_timeline(lines)
+    assert len(timeline) == 1                       # only the usable seed sampled
+    assert timeline.ignored == 2
+    # E is in ms; the sample lands at (BASE_MS + 1) ms in ns.
+    assert timeline.at_or_before((BASE_MS + 3) * 1_000_000)[1] == pytest.approx(
+        100.25)

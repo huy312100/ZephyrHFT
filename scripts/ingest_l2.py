@@ -268,12 +268,14 @@ def annotate_snapshot(text: str, now_ms: int, symbol: str) -> Optional[str]:
     """Marks a REST book snapshot as capture metadata, textually.
 
     Returns ``None`` unless the body is a JSON **object** carrying
-    ``lastUpdateId`` -- the one field every consumer here keys a seed on, and the
-    one thing that distinguishes a book snapshot from whatever else a 200 response
-    can hold: a proxy page, an error body, ``{}``, or a JSON array. Marking those
-    would be worse than not marking them: the inserted fields trail a comma, so an
-    empty object becomes invalid JSON, and a body with no book in it would be
-    counted and logged as a successful seed.
+    ``lastUpdateId`` and non-empty array-valued ``bids``/``asks`` -- the fields
+    every consumer here keys a seed on, and the one thing that distinguishes a
+    book snapshot from whatever else a 200 response can hold: a proxy page, an
+    error body, ``{}``, a JSON array, or a well-keyed object with no levels in
+    it. Marking those would be worse than not marking them: the inserted fields
+    trail a comma, so an empty object becomes invalid JSON, and a body with no
+    book in it would be counted and logged as a successful seed -- and, downstream,
+    would clear a ladder that was working.
 
     Three fields are added to a real snapshot, each a fact about this capture
     rather than a claim about the market, inserted right after the opening ``{``
@@ -299,6 +301,14 @@ def annotate_snapshot(text: str, now_ms: int, symbol: str) -> Optional[str]:
     except (TypeError, ValueError):
         return None
     if not isinstance(payload, Mapping) or "lastUpdateId" not in payload:
+        return None
+    # A response can carry the right keys and still hold no book. Archived as a
+    # seed it would replace a ladder that was working with nothing, so the check
+    # is on the contents, not just the field names.
+    bids, asks = payload.get("bids"), payload.get("asks")
+    if not isinstance(bids, list) or not isinstance(asks, list):
+        return None
+    if not bids or not asks:
         return None
     parts: List[str] = [f'"e":"{SNAPSHOT_MARKER}"']
     if payload.get("E") is None and payload.get("T") is None:

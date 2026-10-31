@@ -1341,7 +1341,8 @@ def test_a_snapshot_is_stamped_with_only_what_the_venue_omitted() -> None:
 
     # A body that already names its market keeps the venue's spelling; the
     # missing timestamp is still added, because nothing can place it in time.
-    named = '{"lastUpdateId": 7, "s": "ETHUSDT", "bids": [], "asks": []}'
+    named = ('{"lastUpdateId": 7, "s": "ETHUSDT",'
+             ' "bids": [["100.0", "1.0"]], "asks": [["100.5", "1.0"]]}')
     annotated = json.loads(annotate_snapshot(named, 5, "btcusdt"))
     assert annotated["s"] == "ETHUSDT" and annotated["E"] == 5
 
@@ -1360,6 +1361,13 @@ def test_only_a_body_with_a_book_in_it_counts_as_a_snapshot() -> None:
     assert annotate_snapshot("{}", 1, "btcusdt") is None
     # An object shaped like a book response but with no book in it.
     assert annotate_snapshot('{"bids": [], "asks": []}', 1, "btcusdt") is None
+    # Right keys, empty levels: archiving this as a seed would replace a working
+    # ladder with nothing at all.
+    assert annotate_snapshot('{"lastUpdateId": 1}', 1, "btcusdt") is None
+    assert annotate_snapshot('{"lastUpdateId": 1, "bids": [], "asks": []}',
+                             1, "btcusdt") is None
+    assert annotate_snapshot('{"lastUpdateId": 1, "bids": "x", "asks": "y"}',
+                             1, "btcusdt") is None
     # The real shape still annotates.
     marked = annotate_snapshot(_snapshot(), 1, "btcusdt")
     assert marked is not None and '"lastUpdateId"' in marked

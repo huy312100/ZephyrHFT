@@ -387,12 +387,26 @@ class TopOfBook:
             applied += 1
         return applied
 
-    def set(self, bids: Iterable[Sequence[Any]], asks: Iterable[Sequence[Any]]) -> None:
-        """Replaces the ladder with an absolute snapshot."""
+    def set(self, bids: Iterable[Sequence[Any]], asks: Iterable[Sequence[Any]]) -> bool:
+        """Replaces the ladder with an absolute snapshot.
+
+        Returns ``False`` when the payload cannot describe a two-sided book, and
+        in that case changes nothing. Clearing first and applying second would let
+        a malformed snapshot -- ``{"lastUpdateId": 1}``, or an ``asks`` field that
+        is a string rather than a list -- wipe a ladder that was working and leave
+        the capture with no mid and nothing to say about it.
+        """
+        if not isinstance(bids, Sequence) or not isinstance(asks, Sequence):
+            return False
+        if isinstance(bids, (str, bytes)) or isinstance(asks, (str, bytes)):
+            return False
+        if not bids or not asks:
+            return False
         self._bids.clear()
         self._asks.clear()
         self.apply("BUY", bids)
         self.apply("SELL", asks)
+        return True
 
     @property
     def best_bid(self) -> Optional[float]:
@@ -560,7 +574,11 @@ class _TimelineBuilder:
                 continue
 
             if "lastUpdateId" in message:
-                book.set(message.get("bids") or (), message.get("asks") or ())
+                if not book.set(message.get("bids") or (), message.get("asks") or ()):
+                    # A snapshot that cannot describe a two-sided book must not
+                    # replace one. The frame is counted, and the ladder survives.
+                    timeline.ignored += 1
+                    continue
                 # The seed replaces the ladder, so everything before it is now
                 # inside the book and must not be applied on top of it.
                 try:
