@@ -58,6 +58,14 @@ data_ingestion:
   compression: gzip                # gzip | none
   compression_level: 1             # 1 = fastest (ingest path), 9 = smallest
   flush_interval_ms: 250           # max time a record waits in the write buffer
+  # Absolute book snapshot, fetched over REST and archived as the first line of
+  # each connection. A depth subscription is a *diff* stream: without a seed the
+  # reader has no mid until enough deltas arrive (113 s in the 3 h capture), and
+  # every fill in that window is unmarkable -- which is exactly where the far
+  # quotes trade. `false` (or `--no-snapshot`) captures the venue's stream only.
+  snapshot_on_connect: true
+  snapshot_limit: 1000             # levels (venue maximum)
+  snapshot_timeout_s: 10.0
   max_file_mb: 256                 # rotate the roll file at this size (0 = never)
   rotate_seconds: 900              # ... or after this many seconds (0 = never)
   telemetry_interval_s: 10.0       # latency / throughput summary cadence

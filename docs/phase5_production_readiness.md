@@ -1035,7 +1035,10 @@ cannot hold. Four properties matter:
   is not repeated until it changes. After a re-anchor that loses depth, a live
   deployment must reseed from a REST snapshot (`seed_from_snapshot`) instead of
   trusting the near touch; the `depth20@100ms` partial-book stream is a
-  snapshot-style exception and does not make the diff path safe.
+  snapshot-style exception and does not make the diff path safe. The *capture*
+  now does the same thing for the same reason (§11.8.7): `ingest_l2.py` archives
+  one REST depth snapshot per connection, before the socket opens, so a resumed
+  diff stream is never analysed against a book that does not exist yet.
 - **A frame is truncated toward the touch, not from the front.** `DepthUpdate`
   holds `kMaxDepthLevels` (32) levels per side, but a partial-book burst on this
   feed carries hundreds — one frame here listed 407 bids and 440 asks — and the
@@ -1517,14 +1520,17 @@ different kinds of problem:
    `k`, no filter and no queue position changes a number that is `2 * markout
    - 2 * fee`.
 2. **A capture that does not go blind where it matters.** The coverage gradient
-   above is the reason the far cells cannot be trusted, and it is fixable in
-   code: the capture must archive a depth snapshot on connect and on every
-   reconnect (`ingest_l2.py` resumes a *diff* stream into an empty book, so the
-   analysis has no mid until enough deltas arrive — 113 s in this capture). Until
-   that exists, far-quote studies have **incomplete coverage**, and the direction
-   of any resulting markout bias is unmeasured: the markouts that are missing are
-   the ones nobody can compute, so this is a hole in the sample rather than a
-   known skew.
+   above is the reason the far cells cannot be trusted, and the direction of the
+   resulting bias is **unmeasured** — the markouts that are missing are the ones
+   nobody can compute, so it is a hole in the sample rather than a known skew.
+   The capture now archives an absolute REST depth snapshot per connection,
+   **before** the socket opens: fetched after connecting, its venue time lands
+   *after* the frames the socket buffered meanwhile, the mid timeline is then
+   non-monotonic, and the analysis refuses the file — which is exactly how this
+   was found. The seed gives the timeline a mid at its first sample instead of
+   after a delta backlog (113 s in the 3 h capture), and it is a line in the roll
+   file, so the archive stays self-describing. What this does not yet do is prove
+   the far cells: that needs a fresh capture, which is now worth taking.
 3. **A loop.** `run_live_trader.py` places at most one quote; re-quoting,
    inventory limits and a per-session loss cap belong in a supervisor (§11.3.4).
 4. **Funding and alerting.** Neither exists (§11.3.3, §11.3.5): a carry-heavy
@@ -1532,10 +1538,10 @@ different kinds of problem:
 
 Items 3 and 4 are engineering with a known shape and no unknown in them. Item 1
 is the one that decides whether 3 and 4 are worth doing at all, and item 2 is
-what makes item 1 answerable: with the book seeded across reconnects, the `3 bps`
-and `4 bps` rows would be measured on their real fills instead of on 15 % and
-7 % of them.
-
+what makes item 1 answerable: with the book seeded per connection, the next
+capture can measure the `3 bps` and `4 bps` rows on their real fills instead of
+on 15 % and 7 % of them. That capture is the immediate next step, and it is the
+only one that can move the alpha verdict without a venue negotiation.
 
 ```bash
 # the method on the committed 151 s tape (reproduces the first table)

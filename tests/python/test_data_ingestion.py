@@ -23,6 +23,7 @@ from python_analytics.utils.config import (
     ConfigError,
     DataIngestionSettings,
     as_dict,
+    depth_snapshot_url,
     load_settings,
     silent_aux_streams,
 )
@@ -40,6 +41,7 @@ from scripts.ingest_l2 import (  # noqa: E402 - sys.path bootstrap lives in the 
     parse_payload,
     percentile,
     reconnect_delay,
+    stamp_snapshot_time,
     unwrap_frame_text,
 )
 
@@ -690,6 +692,10 @@ def test_main_refuses_to_capture_into_an_unusable_archive(tmp_path, capsys,
 # --------------------------------------------------------------------------- #
 def _client(tmp_path: Path, **kwargs: Any) -> L2IngestClient:
     settings = kwargs.pop("settings", _settings())
+    # Tests never reach the network: the snapshot fetcher is stubbed unless a
+    # test is specifically exercising it. The stub is a valid book, so a test
+    # that drives ``run()`` sees exactly one seeded record per attempt.
+    kwargs.setdefault("snapshot_fetcher", lambda url, timeout: _snapshot())
     return L2IngestClient(settings, directory=tmp_path, **kwargs)
 
 
@@ -958,8 +964,13 @@ def test_client_reconnects_with_backoff_and_gives_up(tmp_path, monkeypatch) -> N
     assert stats.connections == 0
     assert stats.connect_failures == 3  # initial attempt + two retries
     assert stats.reconnects == 2
+    # A dead feed still archives the book it tried to capture: one seed per
+    # attempt, and no venue frames. The seed is what lets the analysis place the
+    # book in time, so it is recorded whether or not the socket ever opens.
+    assert stats.snapshots == 3
     assert client.writer_stats is not None
-    assert client.writer_stats.files == 0
+    assert client.writer_stats.records == 3
+    assert client.stats.depth_frames == 0
 
 
 def test_missing_websockets_aborts_instead_of_reconnecting(
@@ -1031,3 +1042,194 @@ def test_cli_depth_only_wins_over_an_explicit_aux_stream() -> None:
 def test_cli_rejects_unknown_compression() -> None:
     with pytest.raises(SystemExit):
         parse_args(["--compression", "lz4"])
+
+
+# --------------------------------------------------------------------------- #
+# Snapshot seeding
+# --------------------------------------------------------------------------- #
+def _snapshot(levels: int = 2, event_ms: int = 1_700_000_000_000,
+              symbol: str = "BTCUSDT") -> str:
+    bids = [[f"{100.0 - index * 0.5:.2f}", "1.0"] for index in range(levels)]
+    asks = [[f"{100.5 + index * 0.5:.2f}", "1.0"] for index in range(levels)]
+    return json.dumps({"lastUpdateId": 42, "E": event_ms, "T": event_ms,
+                       "s": symbol, "bids": bids, "asks": asks})
+
+
+def test_a_snapshot_is_archived_as_the_first_line_of_the_roll(tmp_path) -> None:
+    """The seed gives the analysis a mid before the first venue frame arrives.
+
+    Without it a diff stream starts from an empty book: the timeline has no
+    sample until enough deltas land (113 s in the 3 h capture), and every fill
+    in that window is unmarkable.
+    """
+    client = _client(tmp_path, snapshot_fetcher=lambda url, timeout: _snapshot())
+
+    async def _session() -> int:
+        try:
+            # The same order ``_consume_with_reconnect`` uses: connect, seed,
+            # then read the stream.
+            await client._seed_snapshot()
+            return await client.consume(_FrameSource(
+                [(1_700_000_000_100 * NS_PER_MS, _depth())]))
+        finally:
+            await client.aclose()
+
+    assert asyncio.run(_session()) == 1
+    lines = [record for path in _roll_files(tmp_path) for record in _read_roll(path)]
+    assert json.loads(lines[0])["lastUpdateId"] == 42
+    assert client.stats.snapshots == 1
+    assert client.stats.snapshot_failures == 0
+
+
+def test_the_seeded_file_builds_a_monotonic_timeline(tmp_path) -> None:
+    """The archive the client writes is analysable from its first line.
+
+    This is the whole point of the seed: a diff stream resumed into an empty
+    book leaves the mid timeline with no sample until enough deltas arrive, and
+    the fills in that window cannot be marked.
+    """
+    from python_analytics.backtesting.markouts import build_timeline
+
+    client = _client(tmp_path, snapshot_fetcher=lambda url, timeout: _snapshot())
+
+    async def _session() -> None:
+        try:
+            # Seeded before the socket opens, so its venue time precedes every
+            # frame that follows it.
+            await client._seed_snapshot()
+            await client.consume(_FrameSource([
+                (1_700_000_000_250 * NS_PER_MS, _depth(1_700_000_000_200)),
+                (1_700_000_000_350 * NS_PER_MS, _depth(1_700_000_000_300)),
+            ]))
+        finally:
+            await client.aclose()
+
+    asyncio.run(_session())
+    lines = [record for path in _roll_files(tmp_path) for record in _read_roll(path)]
+    assert json.loads(lines[0])["lastUpdateId"] == 42
+
+    timeline = build_timeline(lines)
+    first_ts, first_mid, _ = next(timeline.samples())
+    assert first_ts == 1_700_000_000_000 * NS_PER_MS
+    assert first_mid == pytest.approx(100.25)
+    assert timeline.max_gap_s < 1.0
+
+
+def test_a_live_session_seeds_before_it_reads_the_stream(tmp_path, monkeypatch) -> None:
+    """The call-site order is what keeps the archived file monotonic.
+
+    A snapshot fetched *after* connecting carries a venue time later than the
+    frames the socket buffered while the HTTP round trip was in flight, so the
+    archive would hold a book stamped after the deltas that follow it and the
+    mid timeline would refuse the whole capture. Seeding first is the fix; this
+    drives ``run()`` so a future edit to that order cannot pass.
+    """
+    from python_analytics.backtesting.markouts import build_timeline
+
+    frame_ms = 1_700_000_000_400
+
+    class _OneFrame:
+        def __init__(self, client: L2IngestClient) -> None:
+            self._done = False
+
+        def __aiter__(self) -> "_OneFrame":
+            return self
+
+        async def __anext__(self) -> Frame:
+            if self._done:
+                raise StopAsyncIteration
+            self._done = True
+            return frame_ms * NS_PER_MS, _depth(frame_ms)
+
+        async def aclose(self) -> None:
+            return None
+
+    monkeypatch.setattr(ingest_module, "_SocketFrames", _OneFrame)
+    settings = _settings(
+        max_reconnect_attempts=1,
+        reconnect_base_delay_s=0.001,
+        reconnect_max_delay_s=0.002,
+        telemetry_interval_s=0.5,
+    )
+    # The snapshot's venue time is *earlier* than the frame that follows it.
+    client = _client(tmp_path, settings=settings,
+                     snapshot_fetcher=lambda url, timeout: _snapshot(
+                         event_ms=frame_ms - 300))
+    stats = asyncio.run(client.run())
+
+    assert stats.snapshots >= 1
+    lines = [record for path in _roll_files(tmp_path) for record in _read_roll(path)]
+    assert json.loads(lines[0])["lastUpdateId"] == 42
+    timeline = build_timeline(lines)
+    assert timeline.first_ts_ns == (frame_ms - 300) * NS_PER_MS
+
+
+def test_the_seeded_snapshot_is_readable_by_the_mid_timeline(tmp_path) -> None:
+    """The archived line is the shape the analysis builder consumes."""
+    from python_analytics.backtesting.markouts import build_timeline
+
+    client = _client(tmp_path, snapshot_fetcher=lambda url, timeout: _snapshot())
+    asyncio.run(client._seed_snapshot())
+    asyncio.run(client.aclose())
+    lines = [record for path in _roll_files(tmp_path) for record in _read_roll(path)]
+
+    timeline = build_timeline(lines)
+    assert len(timeline) == 1
+    assert timeline.at_or_before(1_700_000_000_000 * NS_PER_MS)[1] == pytest.approx(100.25)
+
+
+def test_a_failed_snapshot_is_recorded_and_the_capture_continues(tmp_path) -> None:
+    """A seed failure is a hole in the book, never a dead capture."""
+
+    def _boom(url: str, timeout: float) -> str:
+        raise OSError("connection refused")
+
+    client = _client(tmp_path, snapshot_fetcher=_boom)
+    asyncio.run(client._seed_snapshot())
+    assert client.stats.snapshot_failures == 1
+    assert client.stats.snapshots == 0
+
+    _consume(client, [(1_700_000_000_100 * NS_PER_MS, _depth())])
+    assert client.stats.frames == 1
+
+
+def test_snapshot_seeding_can_be_switched_off(tmp_path) -> None:
+    """``--no-snapshot`` must not fetch, and must not count a failure."""
+    calls: List[str] = []
+
+    def _record(url: str, timeout: float) -> str:
+        calls.append(url)
+        return _snapshot()
+
+    client = _client(tmp_path, settings=_settings(snapshot_on_connect=False),
+                     snapshot_fetcher=_record)
+    asyncio.run(client._seed_snapshot())
+    assert calls == []
+    assert client.stats.snapshots == 0 and client.stats.snapshot_failures == 0
+
+
+def test_the_snapshot_url_follows_the_endpoint_that_is_dialled() -> None:
+    """The REST host is the venue's, and an unknown endpoint gets nothing."""
+    assert depth_snapshot_url(EXCHANGE_ENDPOINTS["binance_futures"], "btcusdt") == (
+        "https://fapi.binance.com/fapi/v1/depth?symbol=BTCUSDT&limit=1000")
+    assert depth_snapshot_url(EXCHANGE_ENDPOINTS["binance_spot"], "ethusdt", 50) == (
+        "https://api.binance.com/api/v3/depth?symbol=ETHUSDT&limit=50")
+    assert depth_snapshot_url("wss://example.invalid/ws", "btcusdt") is None
+
+
+def test_a_spot_snapshot_is_stamped_with_its_receive_time_only() -> None:
+    """Spot sends no ``E``; the stamp adds one and changes nothing else."""
+    body = '{"lastUpdateId": 7, "bids": [["100.0", "1.0"]], "asks": [["100.5", "1.0"]]}'
+    stamped = stamp_snapshot_time(body, 1_700_000_000_123)
+    assert stamped.startswith('{"E":1700000000123,')
+    assert stamped.split(",", 1)[1] == body[1:]
+    assert json.loads(stamped)["E"] == 1_700_000_000_123
+
+    # A body that already carries a venue timestamp is left alone.
+    assert stamp_snapshot_time(_snapshot(), 1) == _snapshot()
+
+
+def test_a_snapshot_body_that_is_not_an_object_is_left_alone() -> None:
+    """Only a JSON object can be stamped; anything else passes through."""
+    assert stamp_snapshot_time("not json", 1) == "not json"
+    assert stamp_snapshot_time("[1, 2, 3]", 1) == "[1, 2, 3]"

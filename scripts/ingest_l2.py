@@ -53,11 +53,13 @@ import random
 import signal
 import sys
 import time
+import urllib.error
+import urllib.request
 from collections import deque
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, AsyncIterator, Deque, Mapping, Optional, Sequence, Tuple
+from typing import Any, AsyncIterator, Callable, Deque, Mapping, Optional, Sequence, Tuple
 
 # Make the repository root importable when this script is run directly.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -67,6 +69,7 @@ from python_analytics.utils.config import (
     COMPRESSION_CHOICES,
     ConfigError,
     DataIngestionSettings,
+    depth_snapshot_url,
     parse_stream_names,
     silent_aux_streams,
 )
@@ -230,6 +233,50 @@ def parse_payload(raw: str) -> Optional[Any]:
         return json.loads(raw)
     except (TypeError, ValueError):
         return None
+
+
+def fetch_snapshot_text(url: str, timeout_s: float) -> str:
+    """Fetches an absolute depth snapshot and returns the venue's raw body.
+
+    Runs on a worker thread (``asyncio.to_thread``), so the receive loop never
+    blocks on HTTP. The body is returned **verbatim**: it is archived as a line
+    of the roll file and re-serialising it would make the capture disagree with
+    the venue about number formatting, which is the one thing the archive exists
+    not to do. Raises on any failure; the caller decides what a failed seed means
+    (the capture continues, it just records the hole).
+    """
+    request = urllib.request.Request(
+        url, headers={"User-Agent": "ZephyrHFT-ingest/1.0", "Accept": "application/json"}
+    )
+    with urllib.request.urlopen(request, timeout=timeout_s) as response:
+        return response.read().decode("utf-8")
+
+
+def stamp_snapshot_time(text: str, now_ms: int) -> str:
+    """Gives a snapshot body a timestamp when the venue sent none.
+
+    Binance's USDⓈ-M snapshot carries ``E``/``T``; the spot one carries neither,
+    and a book with no time cannot be placed on the mid timeline, so it would be
+    archived and then ignored. The stamp is inserted **textually** right after
+    the leading ``{`` -- the venue's bytes stay byte-for-byte what the venue
+    said, and the only addition is the instant this process received them, which
+    is a fact about the capture rather than a guess about the market.
+
+    Bodies that already carry a timestamp, and bodies that are not a JSON
+    object, are returned unchanged.
+    """
+    start = text.find("{")
+    if start < 0:
+        return text
+    try:
+        payload = json.loads(text)
+    except (TypeError, ValueError):
+        return text
+    if not isinstance(payload, Mapping):
+        return text
+    if payload.get("E") is not None or payload.get("T") is not None:
+        return text
+    return f'{text[:start + 1]}"E":{int(now_ms)},{text[start + 1:]}'
 
 
 def percentile(samples: Sequence[int], fraction: float) -> float:
@@ -672,6 +719,8 @@ class IngestStats:
     disconnects: int = 0
     reconnects: int = 0
     connect_failures: int = 0
+    snapshots: int = 0
+    snapshot_failures: int = 0
 
     def elapsed_s(self, now_ns: int) -> float:
         if not self.started_ns:
@@ -781,11 +830,15 @@ class L2IngestClient:
         clock=time.time_ns,
         rng: Optional[random.Random] = None,
         max_file_bytes: Optional[int] = None,
+        snapshot_fetcher: Optional[Callable[[str, float], str]] = None,
     ) -> None:
         self._settings = settings
         self._clock = clock
         self._rng = rng
         self._track_latency = track_latency
+        self._snapshot_fetcher = snapshot_fetcher or fetch_snapshot_text
+        self._snapshot_url: Optional[str] = None
+        self._snapshot_url_logged = False
         self._writer = (
             None
             if dry_run
@@ -895,7 +948,8 @@ class L2IngestClient:
         return str(message)
 
     # -- hot path ---------------------------------------------------------- #
-    def _handle_frame(self, recv_ns: int, raw: str) -> None:
+    def _handle_frame(self, recv_ns: int, raw: str,
+                      measure_latency: bool = True) -> None:
         """Archives + measures one frame. No awaits, no copies beyond JSON."""
         stats = self._stats
         stats.frames += 1
@@ -924,7 +978,7 @@ class L2IngestClient:
         if event_ns is None:
             stats.no_timestamp += 1
             return
-        if not self._track_latency:
+        if not measure_latency or not self._track_latency:
             return
 
         latency_ns = recv_ns - event_ns
@@ -952,6 +1006,55 @@ class L2IngestClient:
         return consumed
 
     # -- session drivers --------------------------------------------------- #
+    async def _seed_snapshot(self) -> None:
+        """Archives an absolute depth snapshot so the book has a mid at once.
+
+        A depth subscription is a *diff* stream. A reader that starts empty --
+        and every reader starts empty, and every reader is empty again after a
+        reconnect until enough deltas arrive -- has no book, and a study that
+        marks fills against a missing mid drops them. Fetching one snapshot per
+        connection turns a 113 s blind window into a single line in the roll
+        file that the analysis can rebuild the book from.
+
+        Failing to seed is a recorded hole, not a capture failure: the venue's
+        own stream is still archived byte-for-byte, so nothing here can corrupt
+        the tape.
+        """
+        if not self._settings.snapshot_on_connect:
+            return
+        if self._snapshot_url is None:
+            self._snapshot_url = depth_snapshot_url(
+                self._settings.endpoint,
+                self._settings.symbol,
+                self._settings.snapshot_limit,
+            )
+            if self._snapshot_url is None and not self._snapshot_url_logged:
+                self._snapshot_url_logged = True
+                logger.warning(
+                    "no depth snapshot endpoint is known for %s; the archive "
+                    "will have no seeded book (see --no-snapshot to silence this)",
+                    self._settings.endpoint,
+                )
+        if self._snapshot_url is None:
+            return
+        try:
+            text = await asyncio.to_thread(
+                self._snapshot_fetcher, self._snapshot_url,
+                self._settings.snapshot_timeout_s,
+            )
+        except Exception as exc:  # noqa: BLE001 - a seed failure is never fatal
+            self._stats.snapshot_failures += 1
+            logger.warning("depth snapshot failed (%s: %s); continuing unseeded",
+                           type(exc).__name__, exc)
+            return
+        self._stats.snapshots += 1
+        received_ns = self._clock()
+        # The venue's own timestamp wins; the receive time only fills a gap, and
+        # only textually, so the body stays the venue's bytes.
+        stamped = stamp_snapshot_time(text, received_ns // NS_PER_MS)
+        logger.info("seeded the book from %s (%d bytes)", self._snapshot_url, len(stamped))
+        self._handle_frame(received_ns, stamped, measure_latency=False)
+
     async def run(self) -> IngestStats:
         """Connects, ingests and reconnects until stopped."""
         if not self._settings.enabled:
@@ -1002,6 +1105,16 @@ class L2IngestClient:
             error: Optional[BaseException] = None
             source = _SocketFrames(self)
             try:
+                # Seed **before** the socket opens. A snapshot fetched after
+                # connecting carries a venue time later than the frames the
+                # socket buffered while it was in flight, and the archive would
+                # then hold a book that is timestamped after the deltas that
+                # follow it -- which the analysis refuses, correctly, as a
+                # non-monotonic timeline. Ordering first, exactness second: the
+                # deltas in that one round trip are not applied, and the mid is
+                # correct from the first frame onwards, which is what the
+                # timeline needs.
+                await self._seed_snapshot()
                 frames = await self.consume(source)
             except FeedUnavailable:
                 raise
@@ -1074,6 +1187,8 @@ class L2IngestClient:
             parts.append(f"malformed={stats.malformed}")
         if stats.reconnects or stats.connect_failures:
             parts.append(f"reconnects={stats.reconnects} fail={stats.connect_failures}")
+        if stats.snapshots or stats.snapshot_failures:
+            parts.append(f"snapshots={stats.snapshots} snap_fail={stats.snapshot_failures}")
         if self._writer is not None:
             writer = self._writer.stats()
             ratio = (
@@ -1128,6 +1243,14 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
                         help="latency/throughput summary cadence in seconds")
     parser.add_argument("--latency-warn-ms", type=float, default=None,
                         help="WARNING threshold for feed latency")
+    parser.add_argument("--no-snapshot", dest="snapshot_on_connect",
+                        action="store_false", default=None,
+                        help="do not seed the book from a REST depth snapshot on "
+                             "connect/reconnect (the archive then has no mid until "
+                             "the venue's deltas rebuild one)")
+    parser.add_argument("--snapshot-limit", type=int, default=None,
+                        help="levels requested from the snapshot endpoint "
+                             "(1-1000, default 1000)")
     parser.add_argument("--dry-run", action="store_true",
                         help="connect and measure only; write no files")
     parser.add_argument("--replay", type=Path, default=None,
@@ -1149,6 +1272,8 @@ def build_settings(args: argparse.Namespace) -> DataIngestionSettings:
         "flush_interval_ms": args.flush_interval_ms,
         "telemetry_interval_s": args.telemetry_interval,
         "latency_warn_ms": args.latency_warn_ms,
+        "snapshot_on_connect": args.snapshot_on_connect,
+        "snapshot_limit": args.snapshot_limit,
     }
     # ``--depth-only`` wins over ``--aux-stream``: an explicit request to drop
     # the tape must not be undone by a flag earlier on the command line.
@@ -1215,6 +1340,9 @@ def _print_summary(
     if stats.reconnects:
         print(f"  Reconnects    : {stats.reconnects}"
               f"  (failures: {stats.connect_failures})")
+    if stats.snapshots or stats.snapshot_failures:
+        print(f"  Book seeds    : {stats.snapshots}"
+              f"  (failed: {stats.snapshot_failures})")
     if stats.malformed or stats.no_timestamp:
         print(f"  Diagnostics   : malformed={stats.malformed}"
               f"  no_timestamp={stats.no_timestamp}")

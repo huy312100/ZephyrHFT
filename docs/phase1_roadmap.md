@@ -56,6 +56,18 @@ loop** and **everything expensive**: JSON parsing is the only per-frame CPU cost
 the event loop, while compression, disk I/O and `fsync` are delegated to a worker
 thread. A slow disk therefore degrades *buffering*, never *completeness*.
 
+Each connection is seeded with one absolute depth snapshot from the venue's REST
+API, archived **before** the socket opens (`snapshot_on_connect`, `--no-snapshot`
+to disable). The depth feed is a *diff* stream, so a reader that starts empty —
+and every reader starts empty, including after a reconnect — has no mid until
+enough deltas arrive; in a 3 h capture that took 113 s, and every fill in the
+window was unmarkable (`docs/phase5_production_readiness.md` §11.8.7). The seed is
+an extra NDJSON line of the same shape as a REST book snapshot (`lastUpdateId`,
+`bids`, `asks`, `E`), so the archive stays self-describing. Seeding *after* the
+connect is wrong and the analysis proves it: the snapshot's venue time then lands
+after the frames the socket buffered during the HTTP round trip, and the mid
+timeline refuses a non-monotonic file.
+
 ### 1.1 Headline outcomes
 
 | Objective | Result |
