@@ -242,8 +242,9 @@ def test_file_suffix_tracks_compression() -> None:
     assert _settings(compression="none").file_suffix == ".ndjson"
 
 
-def _write_settings(tmp_path: Path, block: Dict[str, Any]) -> Path:
-    path = tmp_path / "settings.yaml"
+def _write_settings(tmp_path: Path, block: Dict[str, Any],
+                    name: str = "settings.yaml") -> Path:
+    path = tmp_path / name
     path.write_text(yaml.safe_dump({"data_ingestion": block}), encoding="utf-8")
     return path
 
@@ -1404,6 +1405,40 @@ def test_the_snapshot_depth_is_validated_per_venue() -> None:
         check_snapshot_limit(futures, 1001)
     with pytest.raises(ConfigError, match="<= 5000"):
         check_snapshot_limit(spot, 6000)
+
+
+def test_the_snapshot_ceiling_belongs_to_the_endpoint_being_dialled(
+    tmp_path,
+) -> None:
+    """``exchange`` picks a default URL; the venue that answers sets the ceiling.
+
+    Bounding the configured value by the configured *name* was wrong in both
+    directions: spot serves ``limit=2000``, so a spot ``ws_base_url`` under
+    ``exchange: binance_futures`` was refused over a number its own venue accepts,
+    while a futures URL under ``exchange: binance_spot`` was waved through with a
+    depth USD-M answers by HTTP 400 -- an unseeded capture that looks configured.
+    """
+    spot = EXCHANGE_ENDPOINTS["binance_spot"]
+    futures = EXCHANGE_ENDPOINTS["binance_futures"]
+
+    settings = load_settings(_write_settings(tmp_path, {
+        "exchange": "binance_futures",
+        "ws_base_url": spot,
+        "snapshot_limit": 2000,
+    })).data_ingestion
+    assert settings.endpoint == spot
+    assert settings.snapshot_limit == 2000
+
+    with pytest.raises(ConfigError, match="<= 1000"):
+        load_settings(_write_settings(
+            tmp_path,
+            {
+                "exchange": "binance_spot",
+                "ws_base_url": futures,
+                "snapshot_limit": 2000,
+            },
+            name="wrong_venue.yaml",
+        ))
 
 
 def test_the_cli_snapshot_depth_goes_through_the_same_contract() -> None:

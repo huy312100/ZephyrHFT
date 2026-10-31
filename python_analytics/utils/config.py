@@ -699,11 +699,16 @@ def _build_data_ingestion(raw: Mapping[str, Any]) -> DataIngestionSettings:
         ),
         snapshot_limit=check_snapshot_limit(
             resolved_ws,
+            # No ceiling here: the limit belongs to the endpoint being dialled,
+            # and `exchange` is only the default for it. Bounding by the
+            # configured name would reject a valid spot depth whenever
+            # `ws_base_url` points at spot, and accept an impossible one when it
+            # points the other way. check_snapshot_limit judges the venue that
+            # will actually answer.
             _int(
                 raw.get("snapshot_limit", defaults.snapshot_limit),
                 "data_ingestion.snapshot_limit",
                 minimum=1,
-                maximum=DEPTH_SNAPSHOT_MAX_LIMIT.get(exchange, 1000),
             ),
         ),
         snapshot_timeout_s=_float(
