@@ -66,6 +66,7 @@ def ingest_batch(engine: "hft_native.PaperEngine", lines: List[str]) -> Dict[str
         "trade": stats.trade_events,
         "malformed": stats.malformed,
         "gaps": stats.gaps,
+        "snapshot": stats.snapshots,
     }
 
 

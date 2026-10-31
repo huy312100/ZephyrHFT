@@ -867,6 +867,26 @@ def test_a_mark_price_stream_is_not_ingestible() -> None:
     assert (stats["depth"], stats["trade"], stats["malformed"]) == (1, 1, 1)
 
 
+def test_a_seeded_capture_is_an_input_and_not_a_malformed_line() -> None:
+    """Why the gate must survive the seed the capture now writes.
+
+    ``phase1.archive_integrity`` requires zero malformed lines, and the archived
+    REST book snapshot carries no lowercase ``e`` -- so a classifier that knows
+    only stream events reads the seed as junk and turns every seeded capture into
+    a BUILD NO-GO. It has to be a counted input that never reaches the delta path.
+    """
+    from python_analytics.bridge import build_paper_engine, ingest_batch
+
+    seed = _snapshot(event_ms=1_700_000_000_000)
+    assert (hft_native.classify_json(seed)
+            == hft_native.FeedMessageType.BOOK_SNAPSHOT)
+
+    engine = build_paper_engine(tick_size="0.50", center="30000.00")
+    stats = ingest_batch(engine, [seed, _depth(), _agg_trade()])
+    assert (stats["depth"], stats["trade"], stats["malformed"]) == (1, 1, 0)
+    assert stats["snapshot"] == 1
+
+
 def test_event_kind_separates_depth_from_tape() -> None:
     assert event_kind(json.loads(_depth())) == "depth"
     assert event_kind(json.loads(_agg_trade())) == "trade"

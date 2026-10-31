@@ -59,6 +59,30 @@ def source(tmp_path_factory) -> Path:
     return _archive(tmp_path_factory.mktemp("archive") / "events.ndjson")
 
 
+def test_a_seeded_archive_still_passes_the_integrity_check(gate, tmp_path) -> None:
+    """The capture seeds each connection with a REST book snapshot; the gate reads it.
+
+    ``phase1.archive_integrity`` blocks the build by default, and the seed line
+    carries no event type of its own -- so either the classifier fails to see it
+    (every seeded capture turns NO-GO) or the ingest counters fail to add it up
+    (the gate raises before it can report anything). Both are covered here,
+    because the archive that triggers them is the normal case now, not the edge.
+    """
+    archive = _archive(tmp_path / "seeded.ndjson", count=64)
+    seed = json.dumps({"lastUpdateId": 5, "E": 1_700_000_000_000 - 1000,
+                       "bids": [["100.00", "1.0"]], "asks": [["100.50", "1.0"]]})
+    archive.write_text(seed + "\n" + archive.read_text(encoding="utf-8"),
+                       encoding="utf-8")
+
+    checks, _evidence = gate.measure_ingestion(
+        archive, tick_size="0.5", center="100.00")
+    integrity = next(check for check in checks
+                     if check.id == "phase1.archive_integrity")
+    assert integrity.passed, integrity.measured
+    assert "0 malformed" in integrity.measured
+    assert "1 book seed(s) accepted" in integrity.measured
+
+
 @pytest.fixture(scope="module")
 def green(gate, source, tmp_path_factory):
     """The report the other tests perturb: small book, recomputed windows."""

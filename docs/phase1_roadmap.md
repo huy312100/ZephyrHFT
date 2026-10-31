@@ -70,6 +70,16 @@ names its symbol in this response, and an unlabelled line is the one record a
 mixed capture could attribute to the wrong book). The venue's own bytes are never
 re-serialised.
 
+Native ingestion knows this line as its own input kind (`FeedMessageType::
+BookSnapshot`), counted in `ingest_stats.snapshots` and never routed through
+`process_update`. That distinction is load-bearing rather than cosmetic:
+`phase1.archive_integrity` requires **zero** malformed lines, so a classifier that
+saw the seed as junk would turn every seeded capture into a BUILD NO-GO at the
+release gate -- and feeding an absolute book through the delta path would move
+each level twice. A stream frame the parser cannot classify is still malformed,
+which is what makes an un-ingestible stream like `markPrice@1s` a failed capture
+instead of a silently partial one.
+
 What the seed cannot do is hand off contiguously: whatever changed between its
 `lastUpdateId` and the first frame was not on any socket yet, so it is not in the
 archive. The reconstructed book is therefore correct *from the seed forward*, up

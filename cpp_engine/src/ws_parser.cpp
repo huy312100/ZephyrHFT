@@ -257,7 +257,15 @@ bool JsonFeedParser::parse_trade(std::string_view json, TradeTick& out) noexcept
 FeedMessageType JsonFeedParser::classify(std::string_view json) noexcept {
     RawValue value;
     if (!locate(json, "e", value) || !value.quoted) {
-        return FeedMessageType::Unknown;
+        // The archived REST book snapshot has no event type of its own -- it is
+        // identified by the shape the venue answers with. Recognising it here is
+        // what keeps a seeded capture from being counted as a malformed line,
+        // and counting it separately from the diff path is what stops an
+        // absolute book being applied as a delta.
+        RawValue ids, bids, asks;
+        const bool snapshot = locate(json, "lastUpdateId", ids)
+            && locate(json, "bids", bids) && locate(json, "asks", asks);
+        return snapshot ? FeedMessageType::BookSnapshot : FeedMessageType::Unknown;
     }
     const std::string_view event(value.begin,
                                  static_cast<std::size_t>(value.end - value.begin));

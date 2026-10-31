@@ -1264,8 +1264,9 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
                              "connect/reconnect (the archive then has no mid until "
                              "the venue's deltas rebuild one)")
     parser.add_argument("--snapshot-limit", type=int, default=None,
-                        help="levels requested from the snapshot endpoint "
-                             "(1-1000, default 1000)")
+                        help="levels requested from the snapshot endpoint; the "
+                             "venue's own set applies (USD-M: 5, 10, 20, 50, 100, "
+                             "500, 1000; spot: any depth to 5000). Default 1000.")
     parser.add_argument("--dry-run", action="store_true",
                         help="connect and measure only; write no files")
     parser.add_argument("--replay", type=Path, default=None,

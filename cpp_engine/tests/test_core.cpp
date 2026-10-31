@@ -1692,6 +1692,33 @@ void test_paper_engine_gap_detection() {
     CHECK(engine.metrics().gap_events == 1);
 }
 
+// The capture archives one REST book snapshot per connection to seed the mid
+// timeline. It carries no lowercase `e`, so a classifier that only knows stream
+// events sees junk -- and `phase1.archive_integrity`, which requires zero
+// malformed lines, would fail every seeded capture at the release gate. It must
+// be counted as an input and *not* applied: pushing an absolute book through the
+// delta path moves levels twice.
+void test_archived_book_snapshot_is_an_input_not_a_malformed_line() {
+    hft::paper_engine engine{P("0.5"), P("30000")};
+    std::vector<std::string> lines;
+    lines.push_back(R"({"lastUpdateId":42,"E":1000,"T":1000,"bids":[["30000.00","1"]],"asks":[["30001.00","1"]]})");
+    const hft::ingest_stats seeded = hft::ingest_lines(engine, lines);
+    CHECK(seeded.lines == 1);
+    CHECK(seeded.snapshots == 1);
+    CHECK(seeded.depth_events == 0);
+    CHECK(seeded.malformed == 0);
+    CHECK(!engine.bbo().is_valid());
+
+    lines.push_back(R"({"e":"depthUpdate","E":1100,"U":43,"u":44,"b":[["30000.50","1"]],"a":[["30001.50","1"]]})");
+    lines.push_back(R"({"e":"markPriceUpdate","E":1200,"p":"30000"})");
+    const hft::ingest_stats all = hft::ingest_lines(engine, lines);
+    CHECK(all.lines == 3);
+    CHECK(all.snapshots == 1);
+    CHECK(all.depth_events == 1);
+    CHECK(all.malformed == 1);  // the unrecognised stream, never the seed
+    CHECK(engine.bbo().bid_price == P("30000.50"));
+}
+
 void test_ingest_lines() {
     hft::paper_engine engine{P("0.5"), P("30000")};
     std::vector<std::string> lines;
@@ -1747,6 +1774,7 @@ int main() {
     test_matching_slippage();
     test_paper_engine_taker();
     test_paper_engine_gap_detection();
+    test_archived_book_snapshot_is_an_input_not_a_malformed_line();
     test_ingest_lines();
     if (g_failures != 0) {
         std::fprintf(stderr, "%d test assertion(s) failed\n", g_failures);
