@@ -345,18 +345,22 @@ def measure_ingestion(source: Path, *, tick_size: str, center: str,
                       batch_size: int = 512) -> tuple[List[Check], Dict[str, Any]]:
     """Phase 1: does the real archive ingest cleanly and at what rate?"""
     engine = build_paper_engine(tick_size, center)
-    totals = {"lines": 0, "depth": 0, "trade": 0, "malformed": 0, "gaps": 0}
+    totals = {"lines": 0, "depth": 0, "trade": 0, "malformed": 0, "gaps": 0,
+              "snapshot": 0}
     batch: List[str] = []
     started = time.monotonic()
     for line in _read_source(source):
         batch.append(line)
         if len(batch) >= batch_size:
             for key, value in ingest_batch(engine, batch).items():
-                totals[key] += value
+                # Added rather than assumed: a counter the bridge reports and
+                # this dict does not carry would raise on the next capture
+                # feature instead of degrading the evidence line.
+                totals[key] = totals.get(key, 0) + value
             batch = []
     if batch:
         for key, value in ingest_batch(engine, batch).items():
-            totals[key] += value
+            totals[key] = totals.get(key, 0) + value
     elapsed = max(time.monotonic() - started, 1e-9)
     rate = totals["lines"] / elapsed
 
@@ -366,7 +370,8 @@ def measure_ingestion(source: Path, *, tick_size: str, center: str,
             phase="phase1",
             title=f"{source.name}",
             measured=f"{totals['malformed']} malformed, {totals['gaps']} gaps "
-                     f"in {totals['lines']:,} lines",
+                     f"in {totals['lines']:,} lines "
+                     f"({totals['snapshot']} book seed(s) accepted)",
             threshold="0 malformed, 0 gaps",
             passed=totals["malformed"] == 0 and totals["gaps"] == 0
             and totals["lines"] > 0,

@@ -45,7 +45,18 @@ public:
                                                std::size_t scratch_capacity) noexcept;
 };
 
-enum class FeedMessageType : std::uint8_t { Unknown = 0, DepthUpdate = 1, Trade = 2 };
+enum class FeedMessageType : std::uint8_t {
+    Unknown = 0,
+    DepthUpdate = 1,
+    Trade = 2,
+    // A REST book snapshot archived by the capture client to seed the book. It
+    // carries `lastUpdateId`/`bids`/`asks` and no lowercase `e`, so the stream
+    // classifier cannot see it as anything but junk -- and the archive-integrity
+    // check, which requires zero malformed lines, then failed every seeded
+    // capture. It is a real input, and it is not a diff: feeding it through
+    // `process_update` would apply an absolute book as if it were a delta.
+    BookSnapshot = 3,
+};
 
 class JsonFeedParser {
 public:

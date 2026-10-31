@@ -56,6 +56,77 @@ loop** and **everything expensive**: JSON parsing is the only per-frame CPU cost
 the event loop, while compression, disk I/O and `fsync` are delegated to a worker
 thread. A slow disk therefore degrades *buffering*, never *completeness*.
 
+Each connection is seeded with one absolute depth snapshot from the venue's REST
+API (`snapshot_on_connect`, `--no-snapshot` to disable). The depth feed is a *diff*
+stream, so a reader that starts empty — and every reader starts empty, including
+after a reconnect — has no mid until enough deltas arrive; in a 3 h capture that
+took 113 s, and every fill in the window was unmarkable
+(`docs/phase5_production_readiness.md` §11.8.7).
+
+The snapshot is fetched with the socket **already open**, which is the venue's
+own procedure for maintaining a local book, and it is what makes the handoff a
+check rather than an assumption. The frames the socket delivered while the REST
+request was in flight are on the socket, so each can be placed against the seed
+by its update ids: a frame whose last id (`u`) is at or below the seed's
+`lastUpdateId` is already in the archived book and is **dropped** — kept, it
+would sit *behind* the seed line that precedes it, and the mid timeline refuses
+a non-chronological file (that refusal is what forced this order). The first
+frame beyond the seed then has to *continue* it: the venue publishes the range
+each frame covers, so its first id (`U`) must be `lastUpdateId + 1` or lower. A
+higher `U` means updates went by on no socket, and a level one of them deleted
+is still in the book — a phantom best bid is a mid that is wrong in a way
+nothing downstream can see. An id the capture cannot read is the same verdict
+by a different route — unverifiable — so both cases are counted
+(`IngestStats.handoff_gaps` here, `MarkoutTimeline.handoff_gaps` in the
+analysis) and the frame is still archived: counting a hole and deleting market
+data to hide it are different acts.
+
+The seed is an extra NDJSON line of the same shape as a REST book snapshot
+(`lastUpdateId`, `bids`, `asks`), annotated textually with what this capture
+knows and the venue's response does not send: a marker in `e` (next paragraph)
+and its market (`s` — **neither** product names its symbol in this response,
+and an unlabelled line is the one record a mixed capture could attribute to the
+wrong book). No timestamp is ever added. USDⓈ-M stamps its snapshot with `E`, a
+venue-domain time comparable with the frames around it; spot sends neither `E`
+nor `T`, and the capture's own receive time stays out of the archive (decision
+`P1-D1`, §9.1) and out of the venue's field name above all — ordering a host
+clock against venue-stamped frames compares two machines, so a fast host would
+place the seed after lines it precedes and a slow one would publish a mid
+before the market it describes. A spot seed therefore seeds the book only, and
+the first frame that continues `lastUpdateId` carries the mid: at most one
+depth interval later, in a domain that means something. The venue's own bytes
+are never re-serialised.
+
+Native ingestion knows this line as its own input kind (`FeedMessageType::
+BookSnapshot`), counted in `ingest_stats.snapshots` and never routed through
+`process_update`. Recognition is by an explicit marker the capture writes —
+`"e": "zephyr.bookSnapshot"` — and never by shape. Shape matching looks
+equivalent and is not: the spot partial-book *stream* answers with frames shaped
+`{lastUpdateId, bids, asks}` and no event type, so a shape-based seed would
+reclassify a stream the engine cannot use as a series of seeds, skip the delta
+path entirely, and report a clean archive of an empty book. That is a silent
+failure where the malformed count used to be a loud one, which is the exact
+failure class this repository keeps re-learning.
+
+The distinction is load-bearing rather than cosmetic: `phase1.archive_integrity`
+requires **zero** malformed lines, so a classifier that saw the seed as junk would
+turn every seeded capture into a BUILD NO-GO at the release gate — and feeding an
+absolute book through the delta path would move each level twice. A stream frame
+the parser cannot classify is still malformed, which is what makes an
+un-ingestible stream like `markPrice@1s` a failed capture instead of a silently
+partial one.
+
+What the seed cannot do is hand off contiguously: whatever changed between its
+`lastUpdateId` and the first frame was not on any socket yet, so it is not in the
+archive. The reconstructed book is therefore correct *from the seed forward*, up
+to one REST round trip of level changes — enough for a mid timeline, which is
+what the seed is for, and explicitly not a replacement for Binance's
+event-id-contiguous local-book procedure. The analysis side enforces the part of
+that procedure which is cheap and load-bearing: a diff frame whose last update id
+is at or below the seed's is already inside the snapshot, and is counted in
+`MarkoutTimeline.stale` rather than applied a second time (applying it twice moves
+a level twice, and produces a mid that looks plausible).
+
 ### 1.1 Headline outcomes
 
 | Objective | Result |
@@ -285,6 +356,18 @@ resolution on multi-hour sessions.
 **Reading the numbers.** This metric is venue-to-host *transit* latency: exchange egress,
 internet, kernel, and event-loop scheduling. It deliberately excludes our own processing
 (measured separately, §3.3) so that a busy host does not masquerade as a slow venue.
+It also excludes the **book-seeding window**: `recv_ns` is taken when a frame is yielded,
+not when it arrives on the wire, and the capture opens the socket before fetching the REST
+snapshot — so the frames that pile up in the socket queue during that round trip would
+each report the wait as latency. Every frame handled while the window is open (the dropped
+ones, the prints kept, and the frame that closes the window) is therefore skipped by the
+histogram, because one reconnect would otherwise put a multi-second sample in the p99 and
+trip `latency_warn_ms` on a healthy feed. Measured on the live venue, first interval
+before/after the exclusion: `p99=333.48 ms, max=333.52, lat_breaches=7` against
+`p99=58.90 ms, max=60.02, no breaches`, with steady-state intervals in both runs at
+`p99≈57-80 ms`. The exclusion covers the frame that *closes* the window as well: the
+window state is read before it is cleared, and that frame was queued behind the snapshot
+like the rest — sampling only the dropped frames would have kept the worst sample of the set.
 
 **Interpreting anomalous values**
 
@@ -294,6 +377,7 @@ internet, kernel, and event-loop scheduling. It deliberately excludes our own pr
 | `p99 ≫ p50` (e.g. 30 ms vs 1.2 s) | Network jitter, ISP path change, venue congestion | Correlate with `reconnects`; consider a co-located VPS |
 | `lat_ms` steadily climbing | Event loop starvation (oversized `max_queue`, or a co-tenant process) | Check CPU affinity/load; verify the receive path still has 0 awaits |
 | `lat_breaches` growing but `p99` flat | Single outlier frames (large snapshots) | Expected: a post-reconnect snapshot is ~10× the median size |
+| A spike confined to the interval right after each connect | The seeding window's queue wait | Fixed and excluded (§3.5); if it reappears, check that `_handle_frame` still skips `window_open` frames |
 
 ### 3.6 Reconnection state machine
 

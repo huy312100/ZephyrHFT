@@ -175,6 +175,81 @@ def test_build_timeline_handles_snapshots_and_counts_junk() -> None:
     assert timeline.at_or_before(BASE_NS + 2_000_000)[1] == pytest.approx(201.0)
 
 
+def test_a_seed_the_stream_cannot_continue_is_reported_not_repaired() -> None:
+    """``u`` beyond the seed proves novelty; only ``U`` proves contiguity.
+
+    A snapshot ending at update 5 followed by a frame that starts at 9 means
+    updates 6..8 never reached the archive. If one of them deleted the best bid,
+    the seeded book still holds it and every mid built on it is wrong -- so the
+    timeline counts the exposure. It does not discard the samples: the fallback
+    is the blind book this seed exists to prevent, and a count the study can read
+    is worth more than a silent rollback.
+    """
+    seed = json.dumps({"lastUpdateId": 5, "E": BASE_MS,
+                       "bids": [["100.0", "1"]], "asks": [["102.0", "1"]]})
+    gap = json.dumps({"e": "depthUpdate", "E": BASE_MS + 100, "s": "BTCUSDT",
+                      "U": 9, "u": 10,
+                      "b": [["100.0", "1"]], "a": [["101.0", "1"]]})
+    contiguous = json.dumps({"e": "depthUpdate", "E": BASE_MS + 200,
+                             "s": "BTCUSDT", "U": 6, "u": 7,
+                             "b": [["100.0", "1"]], "a": [["101.0", "1"]]})
+    later = json.dumps({"e": "depthUpdate", "E": BASE_MS + 300, "s": "BTCUSDT",
+                        "U": 41, "u": 12,
+                        "b": [["100.0", "1"]], "a": [["101.0", "1"]]})
+
+    broken = build_timeline([seed, gap])
+    assert broken.handoff_gaps == 1
+    assert build_timeline([seed, contiguous]).handoff_gaps == 0
+    # Only the frame that first passes the seed is judged: by the time the stream
+    # has moved on, an id jump is the venue's own batching, not the handoff.
+    assert build_timeline([seed, contiguous, later]).handoff_gaps == 0
+    assert build_timeline([seed, gap, contiguous]).handoff_gaps == 1
+    # No seed at all: there is no handoff to establish, so nothing is counted.
+    assert build_timeline([gap]).handoff_gaps == 0
+
+
+def test_a_seed_that_lands_after_the_frame_continuing_it_is_counted_not_refused() -> None:
+    """The straddling frame may predate the snapshot that covers its ids.
+
+    Binance's procedure keeps a frame whose range spans ``lastUpdateId`` precisely
+    because the REST read can lag the stream, and a lagging read is stamped with a
+    later issuance time. Adding the seed's sample first would make the next sample
+    go backwards, which the mid timeline refuses -- an entire capture lost because
+    one line is early. So the seed's mid is held until the frame after it is known:
+    published when it fits, counted and dropped when it does not.
+    """
+    seed = json.dumps({"lastUpdateId": 5, "E": BASE_MS + 100,
+                       "bids": [["100.0", "1"]], "asks": [["102.0", "1"]]})
+    early = json.dumps({"e": "depthUpdate", "E": BASE_MS, "s": "BTCUSDT",
+                        "U": 5, "u": 6,
+                        "b": [["100.0", "1"]], "a": [["101.0", "1"]]})
+    later = json.dumps({"e": "depthUpdate", "E": BASE_MS + 200, "s": "BTCUSDT",
+                        "U": 7, "u": 7,
+                        "b": [["100.0", "0"], ["99.0", "1"]],
+                        "a": [["101.0", "1"]]})
+
+    timeline = build_timeline([seed, early, later])
+    assert timeline.seed_backdated == 1
+    # Refusing nothing: both frames still carry mids, in order.
+    assert len(timeline) == 2
+    assert timeline.at_or_before(BASE_NS)[1] == pytest.approx(100.5)
+    assert timeline.at_or_before(BASE_NS + 200 * 1_000_000)[1] == pytest.approx(100.0)
+    # The seed's own book is not lost either -- it is in the ladder the frames were
+    # applied to, which is why the ask above is 101.0 and not something invented.
+    assert timeline.handoff_gaps == 0
+
+    # The ordinary case still publishes the seed's mid, before the frame's.
+    in_order = build_timeline([
+        json.dumps({"lastUpdateId": 5, "E": BASE_MS,
+                    "bids": [["100.0", "1"]], "asks": [["102.0", "1"]]}),
+        json.dumps({"e": "depthUpdate", "E": BASE_MS + 100, "s": "BTCUSDT",
+                    "U": 5, "u": 6,
+                    "b": [["100.0", "1"]], "a": [["101.0", "1"]]}),
+    ])
+    assert in_order.seed_backdated == 0
+    assert len(in_order) == 2
+
+
 def test_build_timeline_uses_a_book_ticker_when_there_is_no_ladder() -> None:
     lines = [json.dumps({"e": "bookTicker", "E": BASE_MS, "s": "BTCUSDT",
                          "b": "199.0", "a": "201.0"})]
@@ -844,3 +919,41 @@ def test_fills_supplied_from_outside_record_no_fill_model(tmp_path) -> None:
 
     assert payload["inputs"]["mode"] == "fills"
     assert payload["inputs"]["fill_model"] is None
+
+
+def test_a_snapshot_with_no_book_in_it_does_not_clear_the_ladder() -> None:
+    """A malformed absolute snapshot must not destroy a book that was working.
+
+    ``set`` replaced the ladder before applying the payload, so
+    ``{"lastUpdateId": 1}`` -- right keys, no levels -- wiped both sides and left
+    the capture with no mid and nothing in the report saying so. A diff stream
+    that is one-sided for a while is indistinguishable from a quiet market, which
+    is the failure this whole file keeps having to relearn.
+    """
+    book = TopOfBook()
+    book.set([["100.0", "1.0"]], [["100.5", "1.0"]])
+    assert book.mid == pytest.approx(100.25)
+
+    assert book.set("ab", "cd") is False          # strings, not level lists
+    assert book.set([], []) is False                 # an empty book
+    assert book.mid == pytest.approx(100.25)         # the ladder survived
+
+    assert book.set([["99.0", "1.0"]], [["101.0", "1.0"]]) is True
+    assert book.mid == pytest.approx(100.0)
+
+
+def test_a_malformed_snapshot_frame_is_ignored_and_keeps_the_mid() -> None:
+    """The same guarantee one level up: the timeline keeps its mid."""
+    lines = [
+        json.dumps({"lastUpdateId": 1, "E": BASE_MS + 1,
+                    "bids": [["100.0", "1.0"]], "asks": [["100.5", "1.0"]]}),
+        json.dumps({"lastUpdateId": 2, "E": BASE_MS + 2}),      # no levels at all
+        json.dumps({"lastUpdateId": 3, "E": BASE_MS + 3,
+                    "bids": [], "asks": []}),                   # empty levels
+    ]
+    timeline = build_timeline(lines)
+    assert len(timeline) == 1                       # only the usable seed sampled
+    assert timeline.ignored == 2
+    # E is in ms; the sample lands at (BASE_MS + 1) ms in ns.
+    assert timeline.at_or_before((BASE_MS + 3) * 1_000_000)[1] == pytest.approx(
+        100.25)
