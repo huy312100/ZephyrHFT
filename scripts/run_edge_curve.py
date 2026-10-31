@@ -98,6 +98,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--horizons",
                         default=",".join(f"{value:g}" for value in DEFAULT_HORIZONS_S),
                         help="markout horizons in seconds")
+    parser.add_argument("--primary-horizon", type=float, default=None,
+                        help="horizon the verdict and the round-trip economics are "
+                             "decided on (default: the first positive one); must be "
+                             "one of --horizons")
     parser.add_argument("--tolerance-ms", type=float, default=2000.0,
                         help="max distance between a horizon target and the "
                              "sample used; past it the horizon is dropped")
@@ -135,6 +139,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                        else DEFAULT_MAKER_BPS),
             tick_size=float(args.tick_size),
             min_samples=int(args.min_samples),
+            primary_horizon_s=args.primary_horizon,
         )
     except (ValueError, argparse.ArgumentTypeError) as exc:
         # ``ArgumentTypeError`` is not a ``ValueError``, and a bare traceback
@@ -195,13 +200,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
           f"{', '.join(f'{value:g}' for value in config.distances_bps)} bps"
           + (f" | tick {config.tick_size:g}" if config.tick_size > 0 else ""))
     label = verdict["primary_horizon"]
-    print(f"| distance bps | fills | fills/min | {label} n | {label} mean | net of fee |")
-    print("| --- | --- | --- | --- | --- | --- |")
+    print(f"| distance bps | fills | fills/min | {label} n | coverage | {label} mean "
+          f"| net of fee | round trip net | fee ceiling |")
+    print("| --- | --- | --- | --- | --- | --- | --- | --- | --- |")
     for row in summary["rows"]:
         block = row["horizons"][label]
+        trip = row["round_trip"]
         print(f"| {row['distance_bps']:g} | {row['fills']} | "
               f"{row['fills_per_min']:.2f} | {block['samples']} | "
-              f"{block['mean_bps']:+.2f} | {block['net_bps']:+.2f} |")
+              f"{trip['coverage_pct']:.1f}% | "
+              f"{block['mean_bps']:+.2f} | {block['net_bps']:+.2f} | "
+              f"{trip['net_bps']:+.2f} | {trip['breakeven_maker_bps']:+.3f} |")
     dropped = sum(row["horizons"][label]["truncated"] for row in summary["rows"])
     if dropped:
         print(f"note: {dropped} fill(s) had no mid inside the "
