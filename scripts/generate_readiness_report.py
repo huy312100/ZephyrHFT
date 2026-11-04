@@ -53,6 +53,7 @@ from python_analytics.backtesting.walk_forward import (  # noqa: E402
     ParameterLockError,
     WalkForwardError,
     WalkForwardRunner,
+    read_lock_file,
     utc_timestamp,
 )
 from python_analytics.bridge import build_paper_engine, ingest_batch  # noqa: E402
@@ -94,6 +95,21 @@ ALPHA_PHASE = "alpha"
 EVIDENCE_MID = 100.0
 EVIDENCE_TICK = 0.5
 EVIDENCE_EPOCH_MS = 1_700_000_000_000
+#: Per-frame price amplitude of the evidence book, in bps of the mid.
+#
+#: The generator walks ``(-3..3) * tick`` per frame, while the strategy quotes an
+#: *absolute* distance -- ``(1/gamma) * ln(1 + gamma/k)`` is in price units, so
+#: ~0.2 USDT whatever the venue -- and that distance is snapped outward onto the
+#: venue grid. Expressing the book's movement purely in venue ticks therefore
+#: stops describing a market the engine can trade: at tick 0.1 the same 3-tick
+#: walk is 0.3 USDT, a resting quote has to be reached across the book's own
+#: 0.4 USDT spread, and nothing ever crosses -- ``phase2.fill_activity`` then
+#: reports a dead fill path that is not dead. 0.5 bps is the amplitude this world
+#: has always had (3 ticks of 0.5 at a 30,000 mid), so the default profile is
+#: bit-for-bit the evidence book the committed numbers came from.
+EVIDENCE_STEP_BPS = 0.5
+#: ``synthetic_depth_messages`` steps in units of the tick it is handed.
+EVIDENCE_STEP_TICKS = 3
 
 
 @dataclass
@@ -321,8 +337,21 @@ def synthetic_evidence(events: int, *, seed: int = 7,
     makes walk-forward windows look simultaneous. The frames are re-stamped here
     with a fixed 250 ms grid so chronology checks are meaningful and the whole
     evidence set is bit-reproducible.
+
+    The book is generated on a price *quantum* derived from ``mid``, not on
+    ``tick`` alone: a venue's tick says how prices are represented, not how
+    loudly that market moves. Deriving the quantum keeps the evidence a tradable
+    book at a 0.1 tick on an 80,000 mid, and lands on exactly ``tick`` for the
+    synthetic profile it was derived from.
     """
-    frames = synthetic_depth_messages(mid=mid, tick=tick, spread_ticks=2, seed=seed)
+    venue_tick = float(tick)
+    # A whole number of venue ticks, so every generated price stays representable
+    # on the ladder the engine is built with. ``max(1, ...)`` keeps the venue's own
+    # grid whenever the target amplitude is finer than one tick of it.
+    ticks_per_step = max(1, round(mid * EVIDENCE_STEP_BPS / 1e4
+                                  / (EVIDENCE_STEP_TICKS * venue_tick)))
+    frames = synthetic_depth_messages(mid=mid, tick=ticks_per_step * venue_tick,
+                                      spread_ticks=2, seed=seed)
     lines: List[str] = []
     for index, line in enumerate(frames):
         if index >= events:
@@ -705,8 +734,17 @@ def measure_settings(settings: Any) -> tuple[List[Check], Dict[str, Any]]:
 # Report assembly
 # --------------------------------------------------------------------------- #
 def build_parameters(args: argparse.Namespace, settings: Any) -> LockedParameters:
-    """One frozen parameter set drives every measurement."""
-    return LockedParameters(
+    """One frozen parameter set drives every measurement.
+
+    ``--from-lock`` mirrors :mod:`scripts/run_walk_forward.py`: certifying the
+    venue a study actually ran on means adopting that lock verbatim, not
+    restating sixteen flags and hoping they agree with it.
+    """
+    if getattr(args, "from_lock", False):
+        if not args.lock_file:
+            raise ValueError("--from-lock requires --lock-file")
+        return read_lock_file(args.lock_file)
+    parameters = LockedParameters(
         gamma=args.gamma,
         sigma=args.sigma,
         k=args.k,
@@ -724,6 +762,12 @@ def build_parameters(args: argparse.Namespace, settings: Any) -> LockedParameter
         initial_cash=args.initial_cash,
         order_quantity=args.order_quantity,
     )
+    if args.lock_file:
+        # Without ``--from-lock`` the lock only grades the CLI, exactly as
+        # ``run_walk_forward.py`` reads it: nothing may be widened by the caller.
+        parameters.assert_matches(read_lock_file(args.lock_file),
+                                  context=f"--lock-file {args.lock_file}")
+    return parameters
 
 
 #: Locked fields stored as decimal *strings* so a grid is never silently
@@ -867,7 +911,11 @@ def build_report(args: argparse.Namespace) -> ReadinessReport:
     evidence: Dict[str, Any] = {}
     inputs: Dict[str, Any] = {
         "source": args.source,
-        "evidence": f"synthetic book, {args.evidence_events} frames, seed {args.seed}",
+        # Name the world the build was measured in: an evidence book generated at
+        # another price grid is not evidence about *this* venue.
+        "evidence": f"synthetic book, {args.evidence_events} frames, "
+                    f"seed {args.seed}, "
+                    f"mid {parameters.center} / tick {parameters.tick_size}",
         "parameters": parameters.fingerprint,
         "walk_forward_origin": "n/a",
     }
@@ -1116,6 +1164,12 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
                         help="defaults to the value in config/settings.yaml")
     parser.add_argument("--center", default=None,
                         help="defaults to the value in config/settings.yaml")
+    parser.add_argument("--lock-file", default=None,
+                        help="persisted parameter lock the run is checked against "
+                             "(default: none, so the command line is the lock)")
+    parser.add_argument("--from-lock", action="store_true",
+                        help="adopt the parameters stored in --lock-file instead of "
+                             "restating the whole venue set on the command line")
     parser.add_argument("--maker-bps", type=float, default=DEFAULT_MAKER_BPS,
                         help="maker fee in fractional basis points "
                              "(default: 2.0 = retail VIP 0; negative = rebate)")
