@@ -144,6 +144,9 @@ refuses to call an archive healthy when the venue skipped updates.
 A rejected order is a **configuration error, not bad luck**: the strategy quoted
 outside its own risk limits. Fill activity exists to prove the evidence book
 actually trades — a book that cannot fill would make every PnL figure vacuous.
+That makes it a statement about the *evidence world* as much as the engine: the
+book has to move far enough to reach a resting quote at whatever grid is under
+test, which is what the price quantum in §5.2 guarantees.
 
 The evidence replay never leaves the window it was seeded on, so its p99 covers
 `apply_depth` but never `recenter`. `phase2.reanchor_latency_p99` closes that
@@ -429,6 +432,16 @@ python3 scripts/generate_readiness_report.py \
 #    exit 0 a distance clears, 1 none does, 2 usage, 3 no priced print
 python3 scripts/run_edge_curve.py \
   --source data/raw_l2/*.ndjson.gz --tick-size 0.1
+
+# 8. Certify the venue a real study actually ran on (§9)
+#    The lock carries the grid, the fees and the strategy; the artefact carries
+#    the PnL. Adopting both measures alpha on real tape instead of on the
+#    synthetic evidence book.
+python3 scripts/generate_readiness_report.py \
+  --from-lock --lock-file config/venue_binance_futures_btcusdt.json \
+  --source data/raw_l2/<first seeded roll>.ndjson.gz \
+  --walk-forward-json reports/real/<real study>.json \
+  --require-positive-alpha
 ```
 
 ### 5.2 How the evidence is produced
@@ -442,11 +455,26 @@ python3 scripts/run_edge_curve.py \
 | `--walk-forward-json` (default `reports/walk_forward.json`) | Phase 4 evidence, reused when present |
 | `--recompute-walk-forward` | Ignores that artefact and runs a fresh study in-process (sliced by `--window-events`; `0` = ¼ of `--evidence-events`) |
 | `--min-windows` (default 2) | Minimum OOS window count for `phase4.window_coverage` |
+| `--lock-file` (default none) | A persisted parameter lock **including its fee tier** — the adopted `maker_bps`/`taker_bps` price the engine, the alpha checks and every report label. A missing path is a usage error (`2`), not a failed build |
+| `--from-lock` (default off) | Adopt that lock verbatim instead of restating the venue, costs and strategy set — the same contract `run_walk_forward.py` offers. Without it the lock only *grades* the CLI |
 
 The synthetic book is re-stamped onto a fixed 250 ms grid rather than the wall
 clock, so walk-forward windows look sequential and chronology checks are
 meaningful. Without that, every frame would share a timestamp and the look-ahead
 proof would be vacuous.
+
+The book walks on a price **quantum** derived from `--center`, not from
+`--tick-size` alone: 0.5 bps of the mid per frame, rounded to a whole number of
+venue ticks. A tick says how prices are *represented*, not how loudly a market
+*moves*, and the strategy's quote distance is absolute — `(1/gamma)·ln(1+gamma/k)`
+is in price units, so ~0.2 USDT at any venue. Expressed purely in venue ticks the
+evidence stopped being tradable once the tick got fine: at `0.1` on an `80000` mid
+the 3-tick move could not cross a quote resting across the book's own spread, so
+`phase2.fill_activity` failed a healthy build and **no real venue profile could be
+certified at all** — which is exactly why alpha stayed measured on synthetic data.
+The default profile (tick `0.5`, mid `30,000`) lands on exactly one venue tick, so
+its evidence is bit-for-bit unchanged: 570 fills on the 2,000-frame book, before
+and after.
 
 ### 5.3 Flag reference
 
@@ -454,6 +482,7 @@ proof would be vacuous.
 | --- | --- | --- |
 | Evidence | `--source`, `--evidence-events`, `--seed`, `--chaos-frames`, `--window-events`, `--min-windows` | `data/sample_events.ndjson`, `2000`, `7`, `200`, `0`, `2` |
 | Frozen parameters | `--gamma`, `--sigma`, `--k`, `--time-horizon`, `--inventory-limit`, `--ofi-sensitivity`, `--ofi-decay`, `--ofi-cap` | `0.1`, `0.02`, `5.0`, `60.0`, `5.0`, `0.0`, `0.95`, `3.0` |
+| Parameter lock | `--lock-file`, `--from-lock` | none, off |
 | Venue / costs | `--market-type`, `--tick-size`, `--center`, `--maker-bps`, `--taker-bps`, `--initial-cash`, `--order-quantity` | `CRYPTO`, settings, settings, `2.0`, `5.0`, `100000.0`, `0.01` |
 | Gates | `--max-engine-p99-us`, `--max-engine-p999-us`, `--max-reanchor-p99-us`, `--reanchor-frames`, `--min-throughput-fps`, `--ledger-tolerance`, `--min-oos-sharpe`, `--require-positive-alpha` | `50.0`, `500.0`, `200.0`, `1000`, `1000`, `1e-2`, `None`, off |
 | Walk-forward evidence | `--walk-forward-json`, `--recompute-walk-forward` | `reports/walk_forward.json`, off |
@@ -609,7 +638,7 @@ Map the ID to the action:
 | `phase2.replay_throughput` | Archive on a slow filesystem, or an interpreter running with tracing enabled | Move the archive to local disk; check `PYTHONPROFILEIMPORTTIME`/debuggers are off |
 | `phase2.ledger_residual` | Accounting defect: a fill or a mark that does not reconcile | Reproduce with `run_walk_forward.py --window-events 0`, compare realized vs equity change |
 | `phase2.order_rejections` | Strategy quoting outside its own risk limits (`NOTIONAL_LIMIT`, `PRICE_BAND`, …) | Align `inventory_limit` / `initial_cash` / `order_quantity` with the risk config; rejects are configuration errors |
-| `phase2.fill_activity` | Evidence book cannot trade (price outside the ladder band) | Check `--center` / `--tick-size`; a book with no fills makes every PnL number vacuous |
+| `phase2.fill_activity` | Evidence book cannot trade: prices fell outside the ladder band, or the world has no liquidity to cross | Check that `--center` / `--tick-size` describe the market the evidence is generated for (§5.2 price quantum); a book with no fills makes every PnL number vacuous |
 | `phase3.disconnect_storm` | Injector fired no outage, or frames were lost/duplicated | Inspect `evidence.chaos.disconnect_storm`; a missing outage means the schedule is shorter than the run |
 | `phase3.latency_injection` | No spikes, or a spike exceeded the configured ceiling | Same: read the counters in the JSON evidence |
 | `phase3.deadman_switch` | Switch released without an explicit reset, or failed to re-trip | Treat as a **safety defect**: do not trade until it is fixed and the gate is green |
@@ -619,13 +648,14 @@ Map the ID to the action:
 | `phase4.window_coverage` | Fewer windows than `--min-windows` | Lower `--window-events`, add archives, or lower `--min-windows` deliberately |
 | `phase4.oos_sharpe` | Opt-in profitability gate not met | This is the alpha talking, not the machinery: do not weaken the threshold to ship |
 | `alpha.net_pnl` (alpha block, never build-blocking) | The frozen parameter set loses money after modelled fees | Read `evidence.alpha.pnl_before_fees`: if it is also negative the quoting logic does not earn and the signal needs work; if it is positive, the spread is merely smaller than the fee — widen it or stop quoting that book. Never fix this by assuming a rebate |
-| `alpha.fee_assumption` | `--maker-bps` is negative (a rebate tier) | Pass the retail rate (`2.0`) or the account's real `commissionRate`; a negative maker fee flatters every passive fill |
+| `alpha.fee_assumption` | `--maker-bps` is negative (a rebate tier) — or the lock adopted under `--from-lock` carries one | Pass the retail rate (`2.0`) or the account's real `commissionRate`; a negative maker fee flatters every passive fill. The check reads the **adopted** fees, so a lock cannot hold a rebate the report then labels as retail |
 
 Other failure shapes:
 
 | Output | Exit | Meaning |
 | --- | --- | --- |
 | `error: source archive not found: …` | `2` | `--source` path is wrong — no partial verdict is produced |
+| `error: lock file not found: …` | `2` | `--lock-file` path is wrong. A missing input is a configuration refusal, never a NO-GO build: exit `1` is reserved for a real parameter mismatch |
 | `validation failure: …` | `1` | The Phase 4 study itself raised (`ParameterLockError` / `LookAheadError`); the gate refuses to grade an invalid study |
 | `ALPHA NO-GO: the machinery is ready but this parameter set does not make money…` | `0` (or `3` with `--require-positive-alpha`) | Build is fine, strategy is not. Expected at retail fees; do not promote the parameter set |
 | `ModuleNotFoundError: hft_native` | — | Build the extension first (`cmake -S cpp_engine -B build -DHFT_BUILD_PYTHON=ON && cmake --build build`) |
@@ -636,7 +666,7 @@ Other failure shapes:
 
 | Limitation | Consequence |
 | --- | --- |
-| Engine, chaos and OOS evidence come from a **synthetic book** | The verdict proves the machinery, not a market edge. `--source` only drives the Phase 1 integrity check, so judging alpha requires a Phase 4 study over a real capture (`run_walk_forward.py --source <capture> ...`) passed explicitly with `--walk-forward-json <path>` — do not rely on the default `reports/walk_forward.json` — plus an explicit `--min-oos-sharpe` |
+| Engine, chaos and OOS evidence come from a **synthetic book** by default | The default verdict proves the machinery, not a market edge. Judging alpha needs a Phase 4 study over a real capture (`run_walk_forward.py --source <capture> ...`) passed with `--walk-forward-json <path>` — do not rely on the default `reports/walk_forward.json` — plus `--require-positive-alpha`. Since §5.2 that combination works at a real venue grid: certify the venue with `--from-lock --lock-file <venue lock>` and the gate reports the real study's PnL (it refused `−90.87 USDT` / gross `-1.241 bps` on a 197k-event BTCUSDT capture while still printing BUILD `GO`) |
 | The synthetic book is a zero-drift random walk | Expect Sharpe ≈ 0 with a fee drag; the committed sample reports `-3.987` (negative because it is charged 2 bps of maker fees on both sides), which is a cost-model statement, not a market verdict |
 | Engine p99 is host-sensitive | Two runs on the same machine, differing only in background load, move p99 from `1.4 µs` to `11.3 µs` and p999 from `8 µs` to `724 µs` (§3.3). The 5.0 µs budget is only meaningful with the cores and the load characterised |
 | Chaos runs on a fake monotonic clock | Deterministic and fast, but it does not exercise the socket, the TLS stack or the kernel's retransmit timers |

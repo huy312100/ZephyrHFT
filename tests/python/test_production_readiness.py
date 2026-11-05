@@ -9,10 +9,13 @@ from __future__ import annotations
 import importlib.util
 import json
 import sys
+from dataclasses import replace
+from decimal import Decimal
 from pathlib import Path
 
 import pytest
 
+from python_analytics.backtesting.walk_forward import write_lock_file
 from python_analytics.simulator.paper_engine import synthetic_depth_messages
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -459,3 +462,149 @@ def test_measure_alpha_omits_the_fee_wall_when_nothing_was_traded(gate) -> None:
     checks, evidence = gate.measure_alpha(payload, maker_bps=2.0, taker_bps=5.0)
     assert "alpha.fee_wall" not in {check.id for check in checks}
     assert "breakeven_maker_bps" not in evidence
+
+
+# --------------------------------------------------------------------------- #
+# The evidence book has to be a market the engine can trade on ANY venue grid
+# --------------------------------------------------------------------------- #
+def _measure_engine(gate, tick: str, center: str, events: int = 2000):
+    """Phase 2 measured on the evidence world of one venue profile."""
+    args = gate.parse_args(["--tick-size", tick, "--center", center])
+    parameters = gate.build_parameters(args, gate.load_settings())
+    lines = gate.synthetic_evidence(events, seed=7, mid=float(center),
+                                    tick=float(tick))
+    return gate.measure_engine(parameters, lines, max_p99_us=50.0,
+                               max_p999_us=500.0, min_throughput=1000,
+                               ledger_tolerance=0.01)
+
+
+def test_a_fine_venue_tick_does_not_read_as_a_dead_fill_path(gate) -> None:
+    """A 0.1 tick on an 80k mid is a real perp grid, and it has to trade.
+
+    The strategy's quote distance is absolute (price units, so ~0.2 USDT at any
+    venue) while the generator walked in *venue ticks*: at a 0.1 tick the 3-tick
+    move could not reach a quote resting across the book's own spread, so
+    ``phase2.fill_activity`` failed a build that was fine and the gate could not
+    certify a real venue at all -- which is how a red study stayed measured on
+    synthetic data.
+    """
+    for tick, center in (("0.1", "80000"), ("0.01", "77624.90")):
+        checks, evidence = _measure_engine(gate, tick, center)
+        activity = next(check for check in checks
+                        if check.id == "phase2.fill_activity")
+        assert evidence["fills"] > 0, (tick, center, evidence)
+        assert activity.passed, (tick, center, activity.measured)
+
+
+def test_generated_prices_stay_on_the_venue_grid(gate) -> None:
+    """The amplitude is scaled, the *grid* is not: every price stays quotable.
+
+    A generated price the ladder cannot represent is reported as an unpriced
+    frame rather than guessed around, so a quantum that was not a whole number of
+    venue ticks would turn the evidence book into the blind ladder this exists to
+    prevent.
+    """
+    lines = gate.synthetic_evidence(200, seed=7, mid=80000.0, tick=0.1)
+    venue_tick = Decimal("0.1")
+    for line in lines[1:]:
+        frame = json.loads(line)
+        for level in list(frame["b"]) + list(frame["a"]):
+            price = Decimal(level[0])
+            assert price % venue_tick == 0, level[0]
+
+
+def test_the_default_evidence_world_is_untouched(gate) -> None:
+    """Scale-invariance must not re-price the synthetic baseline it came from.
+
+    0.5 bps of a 30,000 mid across the generator's 3 steps is exactly one 0.5
+    tick, so the committed profile keeps the book the reported numbers were
+    measured on; only profiles that could never trade change.
+    """
+    line = json.loads(gate.synthetic_evidence(4, seed=7, mid=30000.0,
+                                              tick=0.5)[1])
+    bid, ask = Decimal(line["b"][0][0]), Decimal(line["a"][0][0])
+    assert (ask - bid) == Decimal("2.0")  # 4 ticks of 0.5, as committed
+    assert bid % Decimal("0.5") == 0
+
+
+def test_the_report_names_the_world_it_measured(gate, green) -> None:
+    """An auditor must be able to see the evidence book was the venue's own."""
+    evidence = green[1].inputs["evidence"]
+    assert "mid" in evidence and "tick" in evidence
+
+
+# --------------------------------------------------------------------------- #
+# Adopting a persisted lock, so a venue is certified rather than restated
+# --------------------------------------------------------------------------- #
+def test_from_lock_adopts_the_venue_verbatim(gate) -> None:
+    """The venue lock is the study's own; the CLI must not re-describe it."""
+    lock = ROOT / "config" / "venue_binance_futures_btcusdt.json"
+    args = gate.parse_args(["--from-lock", "--lock-file", str(lock)])
+    parameters = gate.build_parameters(args, gate.load_settings())
+    assert parameters.fingerprint == json.loads(
+        lock.read_text(encoding="utf-8"))["fingerprint"]
+    assert str(parameters.tick_size) == "0.1"
+    assert str(parameters.center) == "80000"
+
+
+def test_a_lock_file_the_cli_disagrees_with_is_refused(gate) -> None:
+    """Without ``--from-lock`` the lock only grades the command line."""
+    lock = ROOT / "config" / "venue_binance_futures_btcusdt.json"
+    args = gate.parse_args(["--lock-file", str(lock), "--maker-bps", "0.0"])
+    with pytest.raises(gate.ParameterLockError):
+        gate.build_parameters(args, gate.load_settings())
+
+
+def test_from_lock_without_a_lock_file_is_a_usage_error(gate, source) -> None:
+    assert gate.main(["--source", str(source), "--from-lock",
+                      "--no-report"]) == gate.EXIT_USAGE
+
+
+def test_a_missing_lock_file_is_refused_before_it_fails_the_build(
+    gate, source, tmp_path
+) -> None:
+    """A typo in ``--lock-file`` is a configuration refusal, not a NO-GO release.
+
+    ``read_lock_file`` reports a lost input as a ``ParameterLockError``, and the
+    gate's documented exit contract reserves ``1`` for a genuine parameter
+    mismatch. Both loading branches have to refuse the missing path as usage (2),
+    or a wrong path reads to a release engineer like a build that failed review.
+    """
+    missing = str(tmp_path / "no-such-lock.json")
+    with pytest.raises(FileNotFoundError):
+        gate.build_parameters(gate.parse_args(["--lock-file", missing]),
+                              gate.load_settings())
+    for extra in ([], ["--from-lock"]):
+        assert gate.main(["--source", str(source), "--lock-file", missing,
+                          *extra, "--no-report"]) == gate.EXIT_USAGE
+
+
+def test_alpha_is_priced_at_the_fees_the_lock_adopted(gate, source, tmp_path) -> None:
+    """``--from-lock`` carries a fee tier, so the alpha check reads *that* rate.
+
+    The engine replayed at the locked fees while ``measure_alpha``, the thresholds
+    and the report labels used the CLI defaults: a lock holding a maker rebate was
+    graded as if it paid retail, and ``alpha.fee_assumption`` -- the check whose
+    whole job is to refuse a rebate assumption -- stayed green. A gate that
+    prices its money at one rate and labels it at another is not a gate.
+    """
+    retail = gate.build_parameters(gate.parse_args(["--source", str(source)]),
+                                   gate.load_settings())
+    rebate = replace(retail, maker_bps=-0.5, taker_bps=2.5)
+    lock = write_lock_file(rebate, tmp_path / "rebate.json")
+    args = gate.parse_args([
+        "--source", str(source), "--from-lock", "--lock-file", str(lock),
+        "--evidence-events", "400", "--chaos-frames", "100",
+        "--recompute-walk-forward",
+        "--walk-forward-json", str(tmp_path / "missing.json"),
+    ])
+    report = gate.build_report(args)
+
+    assert report.thresholds["maker_bps"] == -0.5
+    assert report.thresholds["taker_bps"] == 2.5
+    assert report.inputs["costs"] == {"maker_bps": -0.5, "taker_bps": 2.5}
+    fee_check = next(check for check in report.checks
+                     if check.id == "alpha.fee_assumption")
+    assert fee_check.passed is False, fee_check.measured
+    assert "-0.5 bps maker" in "\n".join(report.summary_lines())
+    assert "-0.5 bps maker" in report.to_markdown_text()
