@@ -9,11 +9,13 @@ from __future__ import annotations
 import importlib.util
 import json
 import sys
+from dataclasses import replace
 from decimal import Decimal
 from pathlib import Path
 
 import pytest
 
+from python_analytics.backtesting.walk_forward import write_lock_file
 from python_analytics.simulator.paper_engine import synthetic_depth_messages
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -556,3 +558,53 @@ def test_a_lock_file_the_cli_disagrees_with_is_refused(gate) -> None:
 def test_from_lock_without_a_lock_file_is_a_usage_error(gate, source) -> None:
     assert gate.main(["--source", str(source), "--from-lock",
                       "--no-report"]) == gate.EXIT_USAGE
+
+
+def test_a_missing_lock_file_is_refused_before_it_fails_the_build(
+    gate, source, tmp_path
+) -> None:
+    """A typo in ``--lock-file`` is a configuration refusal, not a NO-GO release.
+
+    ``read_lock_file`` reports a lost input as a ``ParameterLockError``, and the
+    gate's documented exit contract reserves ``1`` for a genuine parameter
+    mismatch. Both loading branches have to refuse the missing path as usage (2),
+    or a wrong path reads to a release engineer like a build that failed review.
+    """
+    missing = str(tmp_path / "no-such-lock.json")
+    with pytest.raises(FileNotFoundError):
+        gate.build_parameters(gate.parse_args(["--lock-file", missing]),
+                              gate.load_settings())
+    for extra in ([], ["--from-lock"]):
+        assert gate.main(["--source", str(source), "--lock-file", missing,
+                          *extra, "--no-report"]) == gate.EXIT_USAGE
+
+
+def test_alpha_is_priced_at_the_fees_the_lock_adopted(gate, source, tmp_path) -> None:
+    """``--from-lock`` carries a fee tier, so the alpha check reads *that* rate.
+
+    The engine replayed at the locked fees while ``measure_alpha``, the thresholds
+    and the report labels used the CLI defaults: a lock holding a maker rebate was
+    graded as if it paid retail, and ``alpha.fee_assumption`` -- the check whose
+    whole job is to refuse a rebate assumption -- stayed green. A gate that
+    prices its money at one rate and labels it at another is not a gate.
+    """
+    retail = gate.build_parameters(gate.parse_args(["--source", str(source)]),
+                                   gate.load_settings())
+    rebate = replace(retail, maker_bps=-0.5, taker_bps=2.5)
+    lock = write_lock_file(rebate, tmp_path / "rebate.json")
+    args = gate.parse_args([
+        "--source", str(source), "--from-lock", "--lock-file", str(lock),
+        "--evidence-events", "400", "--chaos-frames", "100",
+        "--recompute-walk-forward",
+        "--walk-forward-json", str(tmp_path / "missing.json"),
+    ])
+    report = gate.build_report(args)
+
+    assert report.thresholds["maker_bps"] == -0.5
+    assert report.thresholds["taker_bps"] == 2.5
+    assert report.inputs["costs"] == {"maker_bps": -0.5, "taker_bps": 2.5}
+    fee_check = next(check for check in report.checks
+                     if check.id == "alpha.fee_assumption")
+    assert fee_check.passed is False, fee_check.measured
+    assert "-0.5 bps maker" in "\n".join(report.summary_lines())
+    assert "-0.5 bps maker" in report.to_markdown_text()

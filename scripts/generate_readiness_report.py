@@ -733,6 +733,21 @@ def measure_settings(settings: Any) -> tuple[List[Check], Dict[str, Any]]:
 # --------------------------------------------------------------------------- #
 # Report assembly
 # --------------------------------------------------------------------------- #
+def _load_lock(path: Any) -> LockedParameters:
+    """Read a lock, refusing a missing file as the configuration error it is.
+
+    ``read_lock_file`` reports a lost input as a :class:`ParameterLockError`, and
+    the gate's documented exit contract reserves ``1`` for a genuine parameter
+    mismatch (a drift or an unresolved order). A path that simply does not exist
+    is a usage error: it must exit ``2`` and never be reported as a NO-GO build,
+    or a typo looks like a failed release.
+    """
+    source = Path(path)
+    if not source.is_file():
+        raise FileNotFoundError(f"lock file not found: {source}")
+    return read_lock_file(source)
+
+
 def build_parameters(args: argparse.Namespace, settings: Any) -> LockedParameters:
     """One frozen parameter set drives every measurement.
 
@@ -743,7 +758,7 @@ def build_parameters(args: argparse.Namespace, settings: Any) -> LockedParameter
     if getattr(args, "from_lock", False):
         if not args.lock_file:
             raise ValueError("--from-lock requires --lock-file")
-        return read_lock_file(args.lock_file)
+        return _load_lock(args.lock_file)
     parameters = LockedParameters(
         gamma=args.gamma,
         sigma=args.sigma,
@@ -765,7 +780,7 @@ def build_parameters(args: argparse.Namespace, settings: Any) -> LockedParameter
     if args.lock_file:
         # Without ``--from-lock`` the lock only grades the CLI, exactly as
         # ``run_walk_forward.py`` reads it: nothing may be widened by the caller.
-        parameters.assert_matches(read_lock_file(args.lock_file),
+        parameters.assert_matches(_load_lock(args.lock_file),
                                   context=f"--lock-file {args.lock_file}")
     return parameters
 
@@ -989,8 +1004,8 @@ def build_report(args: argparse.Namespace) -> ReadinessReport:
     checks += found
     evidence["walk_forward"] = measured
 
-    found, measured = measure_alpha(payload, maker_bps=args.maker_bps,
-                                    taker_bps=args.taker_bps)
+    found, measured = measure_alpha(payload, maker_bps=parameters.maker_bps,
+                                    taker_bps=parameters.taker_bps)
     checks += found
     evidence["alpha"] = measured
 
@@ -1005,12 +1020,17 @@ def build_report(args: argparse.Namespace) -> ReadinessReport:
         "min_chaos_outages": 1,
         "min_oos_windows": args.min_windows,
         "min_oos_sharpe": args.min_oos_sharpe,
-        "maker_bps": args.maker_bps,
-        "taker_bps": args.taker_bps,
-        "round_trip_cost_bps": round_trip_cost_bps(args.maker_bps),
+        # The fees that were *adopted*, not the ones the command line defaulted
+        # to: ``--from-lock`` can carry a different tier, and grading a study run
+        # at one rate against another is how a rebate assumption slips through
+        # ``alpha.fee_assumption`` while the report labels the result retail.
+        "maker_bps": parameters.maker_bps,
+        "taker_bps": parameters.taker_bps,
+        "round_trip_cost_bps": round_trip_cost_bps(parameters.maker_bps),
         "require_positive_alpha": bool(args.require_positive_alpha),
     }
-    inputs["costs"] = {"maker_bps": args.maker_bps, "taker_bps": args.taker_bps}
+    inputs["costs"] = {"maker_bps": parameters.maker_bps,
+                       "taker_bps": parameters.taker_bps}
     return ReadinessReport(checks=checks, evidence=evidence,
                            thresholds=thresholds, inputs=inputs)
 

@@ -455,8 +455,8 @@ python3 scripts/generate_readiness_report.py \
 | `--walk-forward-json` (default `reports/walk_forward.json`) | Phase 4 evidence, reused when present |
 | `--recompute-walk-forward` | Ignores that artefact and runs a fresh study in-process (sliced by `--window-events`; `0` = ¼ of `--evidence-events`) |
 | `--min-windows` (default 2) | Minimum OOS window count for `phase4.window_coverage` |
-| `--lock-file` (default none) | A persisted parameter lock. Without `--from-lock` it only *grades* the command line: any disagreement refuses the run |
-| `--from-lock` (default off) | Adopt that lock verbatim instead of restating the venue, costs and strategy set — the same contract `run_walk_forward.py` offers |
+| `--lock-file` (default none) | A persisted parameter lock **including its fee tier** — the adopted `maker_bps`/`taker_bps` price the engine, the alpha checks and every report label. A missing path is a usage error (`2`), not a failed build |
+| `--from-lock` (default off) | Adopt that lock verbatim instead of restating the venue, costs and strategy set — the same contract `run_walk_forward.py` offers. Without it the lock only *grades* the CLI |
 
 The synthetic book is re-stamped onto a fixed 250 ms grid rather than the wall
 clock, so walk-forward windows look sequential and chronology checks are
@@ -648,13 +648,14 @@ Map the ID to the action:
 | `phase4.window_coverage` | Fewer windows than `--min-windows` | Lower `--window-events`, add archives, or lower `--min-windows` deliberately |
 | `phase4.oos_sharpe` | Opt-in profitability gate not met | This is the alpha talking, not the machinery: do not weaken the threshold to ship |
 | `alpha.net_pnl` (alpha block, never build-blocking) | The frozen parameter set loses money after modelled fees | Read `evidence.alpha.pnl_before_fees`: if it is also negative the quoting logic does not earn and the signal needs work; if it is positive, the spread is merely smaller than the fee — widen it or stop quoting that book. Never fix this by assuming a rebate |
-| `alpha.fee_assumption` | `--maker-bps` is negative (a rebate tier) | Pass the retail rate (`2.0`) or the account's real `commissionRate`; a negative maker fee flatters every passive fill |
+| `alpha.fee_assumption` | `--maker-bps` is negative (a rebate tier) — or the lock adopted under `--from-lock` carries one | Pass the retail rate (`2.0`) or the account's real `commissionRate`; a negative maker fee flatters every passive fill. The check reads the **adopted** fees, so a lock cannot hold a rebate the report then labels as retail |
 
 Other failure shapes:
 
 | Output | Exit | Meaning |
 | --- | --- | --- |
 | `error: source archive not found: …` | `2` | `--source` path is wrong — no partial verdict is produced |
+| `error: lock file not found: …` | `2` | `--lock-file` path is wrong. A missing input is a configuration refusal, never a NO-GO build: exit `1` is reserved for a real parameter mismatch |
 | `validation failure: …` | `1` | The Phase 4 study itself raised (`ParameterLockError` / `LookAheadError`); the gate refuses to grade an invalid study |
 | `ALPHA NO-GO: the machinery is ready but this parameter set does not make money…` | `0` (or `3` with `--require-positive-alpha`) | Build is fine, strategy is not. Expected at retail fees; do not promote the parameter set |
 | `ModuleNotFoundError: hft_native` | — | Build the extension first (`cmake -S cpp_engine -B build -DHFT_BUILD_PYTHON=ON && cmake --build build`) |
