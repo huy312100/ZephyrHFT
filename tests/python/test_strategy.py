@@ -259,3 +259,49 @@ def test_the_cap_refuses_a_width_the_grid_cannot_hold() -> None:
     """Below one tick per side the band and a valid two-sided book disagree."""
     with pytest.raises(ValueError, match="max_quote_ticks"):
         MarketConfig(**ADA, max_quote_ticks=0.5)
+
+
+def test_the_cap_refuses_values_that_compare_valid_but_are_not() -> None:
+    """``nan`` and ``inf`` both pass a bare ``< 1.0`` check.
+
+    An infinite cap silently means "uncapped" while the artefact still reports
+    "quotes capped at inf tick(s)", and a nan cap makes every clamp depend on
+    comparison order. Neither is a configuration a re-run can reproduce.
+    """
+    for bad in (float("nan"), float("inf"), -float("inf")):
+        with pytest.raises(ValueError, match="max_quote_ticks"):
+            MarketConfig(**ADA, max_quote_ticks=bad)
+
+
+def test_a_cap_holds_after_snapping_when_the_micro_is_off_grid() -> None:
+    """The submitted quote is the capped one, not just the raw one.
+
+    Snapping rounds each leg *away* from the micro, so a raw pair sitting exactly
+    on a 1-tick cap lands 1.5 ticks out once it is representable -- and the study
+    would report a cap the venue never saw. A micro half a tick off the grid is
+    the case that exposes it; 0.2001 (on grid) hides it completely.
+    """
+    tick = ADA["tick_size"]
+    micro = 0.20015  # 1.5 ticks above the 0.2000 grid point
+    strategy = AvellanedaStoikovStrategy(MarketConfig(**ADA, max_quote_ticks=1.0))
+
+    bid, ask = strategy.adjusted_quotes(micro, 0.0, 60.0)
+    assert (micro - bid) / tick <= 1.0 + 1e-9, (bid, (micro - bid) / tick)
+    assert (ask - micro) / tick <= 1.0 + 1e-9, (ask, (ask - micro) / tick)
+    assert bid < ask, (bid, ask)
+    # And the legs are still prices the venue can represent.
+    for price in (bid, ask):
+        assert price == strategy.snap_to_tick(price, round_down=True)
+
+
+def test_a_capped_quote_stays_valid_across_off_grid_micros() -> None:
+    """The band is at least two ticks wide, so it always holds two grid prices."""
+    tick = ADA["tick_size"]
+    for micro in (0.20005, 0.20013, 0.20015, 0.20018, 0.19999):
+        for inventory in (-5.0, 0.0, 5.0):
+            strategy = AvellanedaStoikovStrategy(
+                MarketConfig(**ADA, max_quote_ticks=1.0))
+            bid, ask = strategy.adjusted_quotes(micro, inventory, 60.0)
+            assert bid < ask, (micro, inventory, bid, ask)
+            assert (micro - bid) / tick <= 1.0 + 1e-9, (micro, bid)
+            assert (ask - micro) / tick <= 1.0 + 1e-9, (micro, ask)

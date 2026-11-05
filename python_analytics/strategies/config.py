@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
+from math import isfinite
 from typing import Optional, Union
 
 
@@ -78,10 +79,17 @@ class MarketConfig:
             raise ValueError("time_horizon must be positive")
         if self.order_quantity <= 0.0:
             raise ValueError("order_quantity must be positive")
-        if self.max_quote_ticks is not None and self.max_quote_ticks < 1.0:
-            # One tick per side is the smallest quote that survives snapping;
-            # below it the cap and the grid cannot both be honoured, and a
-            # degenerate one-tick-wide book would be sent as a real quote.
-            raise ValueError("max_quote_ticks must be >= 1 tick, or None")
+        if self.max_quote_ticks is not None:
+            # ``< 1.0`` alone lets nan and inf through, because both compare
+            # false against a number. An inf cap silently means "no cap" while
+            # still being printed as "quotes capped", and a nan cap poisons
+            # every min/max it touches -- the quote then depends on comparison
+            # order, which is not a configuration, it is a coincidence.
+            if not isfinite(self.max_quote_ticks) or self.max_quote_ticks < 1.0:
+                # One tick per side is the smallest quote that survives snapping;
+                # below it the cap and the grid cannot both be honoured, and a
+                # degenerate one-tick-wide book would be sent as a real quote.
+                raise ValueError("max_quote_ticks must be a finite number "
+                                 "of ticks >= 1, or None")
         if self.session_end <= self.session_start:
             raise ValueError("session_end must be after session_start")
