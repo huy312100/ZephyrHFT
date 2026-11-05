@@ -307,6 +307,45 @@ The lock freezes **strategy and venue configuration**, not the world:
   parameters were fitted without leakage upstream; that must be excluded where
   the Phase 3 study is designed.
 
+### 4.6 `--max-quote-ticks`: quoting that survives a change of price scale
+
+Every Avellaneda-Stoikov term is in **price units**, while a venue's meaningful
+unit is its tick. `(1/gamma)·ln(1+gamma/k)` at the committed fit is ≈ 0.65 USDT,
+and that same number means completely different things per venue:
+
+| venue | tick | mid | 0.65 USDT in ticks | in bps of mid |
+| --- | --- | --- | --- | --- |
+| BTCUSDT | `0.1` | 80,240 | 6.5 | 0.08 |
+| ADAUSDT | `0.0001` | 0.2001 | **6,466** | **32,313** |
+
+On ADAUSDT the uncapped strategy published an ask at three times the asset's own
+price. The replay filled nothing across 772,948 events and reported 0.00% hit
+rate, which reads as a dead venue but is a mis-scaled parameter set. A study of
+any market more than ~10× away from the one the fit came from must cap the quote
+distance:
+
+```bash
+python3 scripts/run_walk_forward.py --source "$TAPE" \
+  --tick-size 0.0001 --center 0.2 --order-quantity 30 \
+  --fill-model trade --max-quote-ticks 1
+```
+
+The cap bounds each leg to N ticks from the **micro price**, clamping the centre
+before the width: clamping only the width lets an inventory-skewed reservation
+walk both legs out of the band together (that case is its own test). N < 1 is
+refused, because below one tick per side the band and a valid two-sided book
+cannot both hold, and snapping would emit a degenerate quote.
+
+`None` (the default) is exactly the previous behaviour, which is what keeps the
+committed evidence intact: both locked fingerprints still verify, and the BTCUSDT
+study still reproduces its net `-90.87` on `-1.241` bps gross with 1,110 fills.
+
+Like `--fill-model`, the cap is deliberately **not** hashed into the lock —
+adding a field would change the schema and invalidate every committed
+fingerprint. It is recorded in `aggregate.max_quote_ticks` and printed on the
+fill line (`quotes capped at 1 tick(s) from the micro` vs `uncapped quotes`),
+because "0 fills" means something different in each.
+
 ---
 
 ## 5. Look-ahead prevention
@@ -479,6 +518,7 @@ mistaken for *"the measurement is broken"*.
 | `--ofi-decay` | `0.95` | OFI EMA decay |
 | `--ofi-cap` | `3.0` | OFI z-score clamp |
 | `--no-time-spread` | off | Disables the `γσ²(T−t)` spread term |
+| `--max-quote-ticks` | none (uncapped) | Bounds each quote to N ticks from the micro price. The A-S terms are in **price units**, so a profile fitted on a five-digit market quotes a sub-dollar one out of existence (§4.6) |
 | `--market-type` | `CRYPTO` | `CRYPTO` / `STOCK` / `COMMODITIES` |
 | `--tick-size`, `--center` | from `config/settings.yaml` | Venue grid |
 | `--maker-bps`, `--taker-bps` | `2.0`, `5.0` | Fractional bps; retail VIP 0 (negative maker = rebate tier) |
