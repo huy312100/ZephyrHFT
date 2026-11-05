@@ -97,6 +97,12 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
                              "legacy book-crossing, queue = depth-depletion with "
                              "queue priority, trade = aggregated tape (needs trade "
                              "prints in the archive; default: touch)")
+    parser.add_argument("--max-quote-ticks", type=float, default=None,
+                        help="cap each quote this many ticks from the micro price. "
+                             "The Avellaneda-Stoikov terms are in price units, so a "
+                             "profile fitted on a five-digit market puts a sub-dollar "
+                             "venue's ask above the asset's own price and the study "
+                             "fills nothing (default: no cap, today's behaviour)")
     parser.add_argument("--periods-per-year", type=float, default=252.0,
                         help="annualisation factor for Sharpe/Sortino")
     parser.add_argument("--ledger-tolerance", type=float, default=1e-2,
@@ -180,6 +186,7 @@ def run(args: argparse.Namespace) -> int:
         periods_per_year=args.periods_per_year,
         ledger_tolerance=args.ledger_tolerance,
         fill_model=args.fill_model,
+        max_quote_ticks=args.max_quote_ticks,
         lock_source=lock_source,
     )
 

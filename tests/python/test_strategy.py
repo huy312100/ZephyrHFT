@@ -198,3 +198,64 @@ def test_crypto_quote_never_collapses_into_a_crossed_market() -> None:
     bid, ask = strategy.adjusted_quotes(30001.0, 0.0, 59.9)
     assert ask - bid >= config.tick_size
     assert ask > bid
+
+
+# --------------------------------------------------------------------------- #
+# max_quote_ticks: quoting that survives a change of price scale
+# --------------------------------------------------------------------------- #
+# The BTCUSDT fit (gamma 0.1, k 1.5) quotes ~0.65 USDT from the micro. That is
+# 6.5 ticks on a 0.1 tick / 80,240 market and 6,466 ticks on a 0.0001 tick /
+# 0.2001 one -- an ask at three times the asset's own price, which fills nothing
+# and looks like a dead venue rather than a mis-scaled parameter set.
+ADA = dict(tick_size=0.0001, market_type="CRYPTO", gamma=0.1, sigma=0.02,
+           k=1.5, time_horizon=60.0, inventory_limit=5.0, order_quantity=30.0)
+
+
+def test_no_cap_leaves_the_fitted_quotes_untouched() -> None:
+    """The default must be today's behaviour exactly, not an approximation."""
+    micro = 0.2001
+    uncapped = AvellanedaStoikovStrategy(MarketConfig(**ADA))
+    capped_off = AvellanedaStoikovStrategy(MarketConfig(
+        **ADA, max_quote_ticks=None))
+    assert (capped_off.raw_quotes(micro, 0.0, 60.0)
+            == uncapped.raw_quotes(micro, 0.0, 60.0))
+    # And the runaway distance the cap exists to bound is really there.
+    bid, ask = uncapped.raw_quotes(micro, 0.0, 60.0)
+    assert (ask - micro) / ADA["tick_size"] > 6000
+
+
+def test_a_cap_keeps_both_legs_inside_the_venue_grid() -> None:
+    """With a 2-tick cap, neither quote sits further than 2 ticks from the micro."""
+    micro = 0.2001
+    tick = ADA["tick_size"]
+    strategy = AvellanedaStoikovStrategy(MarketConfig(**ADA, max_quote_ticks=2.0))
+
+    bid, ask = strategy.raw_quotes(micro, 0.0, 60.0)
+    assert micro - 2 * tick - 1e-12 <= bid < micro
+    assert micro < ask <= micro + 2 * tick + 1e-12
+    snapped_bid, snapped_ask = strategy.adjusted_quotes(micro, 0.0, 60.0)
+    assert snapped_ask > snapped_bid  # the cap cannot produce a crossed book
+    assert (snapped_ask - micro) / tick <= 2.0 + 1e-9
+
+
+def test_inventory_skew_cannot_walk_a_quote_past_the_cap() -> None:
+    """Clamping only the width would let a skewed centre escape with both legs.
+
+    This is the failure that matters: the reservation price moves with inventory,
+    so a cap on the spread alone still allows a quote far off the market.
+    """
+    micro = 0.2001
+    tick = ADA["tick_size"]
+    strategy = AvellanedaStoikovStrategy(MarketConfig(**ADA, max_quote_ticks=1.0))
+
+    for inventory in (-5.0, -1.0, 0.0, 1.0, 5.0):
+        bid, ask = strategy.raw_quotes(micro, inventory, 60.0)
+        assert ask - micro <= tick + 1e-12, inventory
+        assert micro - bid <= tick + 1e-12, inventory
+        assert ask > bid, inventory
+
+
+def test_the_cap_refuses_a_width_the_grid_cannot_hold() -> None:
+    """Below one tick per side the band and a valid two-sided book disagree."""
+    with pytest.raises(ValueError, match="max_quote_ticks"):
+        MarketConfig(**ADA, max_quote_ticks=0.5)

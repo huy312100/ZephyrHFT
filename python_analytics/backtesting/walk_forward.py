@@ -270,8 +270,15 @@ class LockedParameters:
             raise ValueError("maker_bps must be >= -100 (100 bps rebate)")
 
     # ------------------------------------------------------------- building
-    def market_config(self) -> MarketConfig:
-        """Materialises the :class:`MarketConfig` used by every window."""
+    def market_config(self, *,
+                      max_quote_ticks: Optional[float] = None) -> MarketConfig:
+        """Materialises the :class:`MarketConfig` used by every window.
+
+        ``max_quote_ticks`` is passed through rather than locked, for the same
+        reason the fill model is: it is a measurement choice about *what the study
+        asks the strategy to do*, and folding it into the lock would change the
+        hash and invalidate every committed fingerprint.
+        """
         return MarketConfig(
             gamma=float(self.gamma),
             sigma=float(self.sigma),
@@ -281,12 +288,16 @@ class LockedParameters:
             tick_size=float(self.tick_size),
             market_type=MarketType(self.market_type),
             order_quantity=float(self.order_quantity),
+            max_quote_ticks=(None if max_quote_ticks is None
+                             else float(max_quote_ticks)),
         )
 
-    def build_strategy(self) -> AvellanedaStoikovStrategy:
+    def build_strategy(self, *,
+                       max_quote_ticks: Optional[float] = None
+                       ) -> AvellanedaStoikovStrategy:
         """Creates a fresh strategy instance carrying the locked parameters."""
         return AvellanedaStoikovStrategy(
-            self.market_config(),
+            self.market_config(max_quote_ticks=max_quote_ticks),
             ofi_sensitivity=float(self.ofi_sensitivity),
             ofi_decay=float(self.ofi_decay),
             ofi_cap=float(self.ofi_cap),
@@ -613,6 +624,7 @@ class WalkForwardRunner:
                  ledger_tolerance: float = 1e-2,
                  max_curve_points: int = 2000,
                  fill_model: str = "touch",
+                 max_quote_ticks: Optional[float] = None,
                  lock_source: str = "cli") -> None:
         if window_events < 0:
             raise ValueError("window_events must be >= 0")
@@ -636,6 +648,10 @@ class WalkForwardRunner:
         # committed lock for a model comparison.
         self._fill_model = str(fill_model).strip().lower()
         resolve_fill_model(self._fill_model)  # fail at construction, not mid-run
+        # Same category as the fill model: a study choice, recorded in the
+        # aggregate so a re-run without it cannot be confused with one with it.
+        self._max_quote_ticks = (None if max_quote_ticks is None
+                                 else float(max_quote_ticks))
 
     @property
     def parameters(self) -> LockedParameters:
@@ -685,7 +701,8 @@ class WalkForwardRunner:
         chronology_checks = 0
 
         for path, offset, lines in self.iter_slices(paths):
-            strategy = self._parameters.build_strategy()
+            strategy = self._parameters.build_strategy(
+                max_quote_ticks=self._max_quote_ticks)
             self._assert_locked(strategy, expected, f"{path.name}#{offset} (pre-window)")
             lock_checks += 1
 
@@ -762,6 +779,10 @@ class WalkForwardRunner:
         # Recorded with the evidence, because a net PnL is only interpretable
         # next to the model that produced its fills.
         aggregate["fill_model"] = self._fill_model
+        # ... and next to the quoting geometry that produced them. A capped study
+        # trades a market the uncapped one never reached, so an artefact without
+        # this line is a statement about a different experiment.
+        aggregate["max_quote_ticks"] = self._max_quote_ticks
         aggregate["trade_events"] = sum(
             int(window.stats.get("trade_events", 0) or 0) for window in windows)
         # Grid health travels with the PnL: a ladder that rejected the feed still
@@ -932,6 +953,12 @@ class WalkForwardReport:
         agg = self.aggregate
         wall = self.fee_wall()
         wall_line = [f"fee wall: {wall.describe()}"] if wall is not None else []
+        cap = agg.get("max_quote_ticks")
+        # Say so on the same line as the fill count: a capped study traded a
+        # market an uncapped one never reached, and "0 fills" means something
+        # completely different in each.
+        quoting = (f"quotes capped at {cap:g} tick(s) from the micro" if cap
+                   else "uncapped quotes")
         return [
             f"walk-forward: {agg['windows']} window(s) / {agg['events']} events / "
             f"{len(self.sources)} archive(s) in {self.elapsed_s:.2f}s",
@@ -948,7 +975,8 @@ class WalkForwardReport:
             f"trades {agg['trades']} (wins {agg['wins']} / losses {agg['losses']}, "
             f"win rate {_num(agg['win_rate_pct'], 2)}%, profit factor "
             f"{_num(agg['profit_factor'], 3)})",
-            f"fills {agg['fills']} under the {agg.get('fill_model', 'touch')} model | "
+            f"fills {agg['fills']} under the {agg.get('fill_model', 'touch')} model "
+            f"({quoting}) | "
             f"tape {agg.get('trade_events', 0)} print(s) | book: "
             f"{agg.get('unpriced_frames', 0)} unpriced frame(s), "
             f"{agg.get('book_recenters', 0)} re-anchor(s)",

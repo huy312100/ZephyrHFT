@@ -270,11 +270,31 @@ class AvellanedaStoikovStrategy(Strategy):
                    time_remaining: float,
                    sigma: Optional[float] = None,
                    ofi_z: float = 0.0) -> tuple[float, float]:
-        """Unrounded ``(bid, ask)`` around the (OFI-skewed) reservation price."""
+        """Unrounded ``(bid, ask)`` around the (OFI-skewed) reservation price.
+
+        With ``config.max_quote_ticks`` set, neither leg may sit further than
+        that many ticks from ``micro_price``. The centre is clamped first and the
+        width second, in that order, which is what keeps the guarantee provable:
+        clamping the width alone would let an inventory-skewed reservation walk
+        the pair off together and leave the ask outside the band anyway. Both are
+        clamped so that ``bid < ask`` still holds by construction -- the width
+        keeps at least half a tick per side, so snapping can never produce a
+        crossed or degenerate quote.
+        """
         reservation = self.reservation_price(
             micro_price, inventory, time_remaining, sigma=sigma, ofi_z=ofi_z
         )
         half = self.optimal_half_spread(time_remaining, sigma=sigma)
+        limit = self._config.max_quote_ticks
+        if limit is not None:
+            tick = self._config.tick_size
+            cap = float(limit) * tick
+            floor_half = 0.5 * tick
+            span = cap - floor_half
+            reservation = min(max(reservation, micro_price - span),
+                              micro_price + span)
+            half = min(half, max(cap - abs(reservation - micro_price),
+                                 floor_half))
         return reservation - half, reservation + half
 
     def adjusted_quotes(self, micro_price: float, inventory: float,
