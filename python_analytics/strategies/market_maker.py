@@ -266,15 +266,60 @@ class AvellanedaStoikovStrategy(Strategy):
             spread += 0.5 * gamma * (volatility ** 2) * time_remaining
         return spread
 
+    def _quote_band(self, micro_price: float) -> Optional[tuple[float, float]]:
+        """The ``(lo, hi)`` band ``max_quote_ticks`` allows around the micro.
+
+        ``None`` when no cap is set: that is every profile in the committed
+        locks, and the reason the uncapped path stays bit-identical.
+        """
+        cap = self._config.max_quote_ticks
+        if cap is None:
+            return None
+        limit = float(cap) * self._config.tick_size
+        return micro_price - limit, micro_price + limit
+
+    def _clamp_to_band(self, price: float, edge: float, *, is_bid: bool) -> float:
+        """Pull ``price`` back to the band edge, rounding **inward** onto the grid.
+
+        A bid below ``lo`` is snapped up to the lowest grid price that is still
+        inside, and an ask above ``hi`` is snapped down to the highest. Rounding
+        outward here would undo the clamp, which is how a snapped quote escapes
+        a cap that the raw quote honoured.
+        """
+        if is_bid:
+            return self.snap_to_tick(max(price, edge), round_down=False)
+        return self.snap_to_tick(min(price, edge), round_down=True)
+
     def raw_quotes(self, micro_price: float, inventory: float,
                    time_remaining: float,
                    sigma: Optional[float] = None,
                    ofi_z: float = 0.0) -> tuple[float, float]:
-        """Unrounded ``(bid, ask)`` around the (OFI-skewed) reservation price."""
+        """Unrounded ``(bid, ask)`` around the (OFI-skewed) reservation price.
+
+        With ``config.max_quote_ticks`` set, neither leg may sit further than
+        that many ticks from ``micro_price``. The centre is clamped first and the
+        width second, in that order, which is what keeps the guarantee provable:
+        clamping the width alone would let an inventory-skewed reservation walk
+        the pair off together and leave the ask outside the band anyway.
+
+        The scope of the guarantee is the *raw* pair. ``adjusted_quotes`` applies
+        the same band after snapping, because snapping rounds outward and would
+        otherwise submit a leg the cap says is illegal.
+        """
         reservation = self.reservation_price(
             micro_price, inventory, time_remaining, sigma=sigma, ofi_z=ofi_z
         )
         half = self.optimal_half_spread(time_remaining, sigma=sigma)
+        band = self._quote_band(micro_price)
+        if band is not None:
+            tick = self._config.tick_size
+            cap = band[1] - micro_price
+            floor_half = 0.5 * tick
+            span = cap - floor_half
+            reservation = min(max(reservation, micro_price - span),
+                              micro_price + span)
+            half = min(half, max(cap - abs(reservation - micro_price),
+                                 floor_half))
         return reservation - half, reservation + half
 
     def adjusted_quotes(self, micro_price: float, inventory: float,
@@ -299,6 +344,19 @@ class AvellanedaStoikovStrategy(Strategy):
         if tick > 0.0:
             bid = self.snap_to_tick(bid, round_down=True)
             ask = self.snap_to_tick(ask, round_down=False)
+        band = self._quote_band(micro_price)
+        if band is not None:
+            # Snapping moves each leg *away* from the micro, so a raw quote that
+            # honoured the cap can be snapped outside it: a 1-tick cap on a
+            # micro sitting half a tick off the grid puts the snapped legs 1.5
+            # ticks away, and the artefact would report a cap the venue never
+            # saw. Pull both legs back inward, rounding onto the grid toward the
+            # micro. A band is at least two ticks wide (``max_quote_ticks`` is
+            # validated to >= 1), and any closed interval of two ticks holds at
+            # least two grid prices, so the two legs cannot land on one price.
+            lo, hi = band
+            bid = self._clamp_to_band(bid, lo, is_bid=True)
+            ask = self._clamp_to_band(ask, hi, is_bid=False)
         return bid, ask
 
     def snap_to_tick(self, price: float, *, round_down: bool) -> float:

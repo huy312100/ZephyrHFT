@@ -8,7 +8,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
-from typing import Union
+from math import isfinite
+from typing import Optional, Union
 
 
 class MarketType(str, Enum):
@@ -42,6 +43,21 @@ class MarketConfig:
     time_horizon: float = 60.0
     # Base quantity (asset units) quoted on each side before risk scaling.
     order_quantity: float = 0.05
+    # Maximum distance of EACH quote from the micro price, in venue ticks.
+    #
+    # ``None`` leaves the Avellaneda-Stoikov maths untouched. A number caps it,
+    # and the reason it needs capping is that every A-S term is in *price units*
+    # while a venue's meaningful unit is its tick: the locked ``gamma``/``k``
+    # profile puts the half-spread at 0.65 USDT, which on BTCUSDT (tick 0.1,
+    # mid 80,240) is 6.5 ticks and 0.08 bps, but on ADAUSDT (tick 0.0001, mid
+    # 0.2001) is 6,466 ticks and 32,313 bps -- an ask at three times the asset's
+    # own price. Such a quote is not wide, it is a market that cannot exist, and
+    # the replay fills nothing at all while looking like a dead venue.
+    #
+    # Not a locked field: the parameter lock is a hash over its schema, so
+    # widening it would invalidate every committed fingerprint. Studies that set
+    # it record the value in their artefact instead.
+    max_quote_ticks: Optional[float] = None
     # Session bounds (seconds since midnight) enforced for STOCK markets.
     session_start: float = 9.0 * 3600.0
     session_end: float = 16.0 * 3600.0
@@ -63,5 +79,17 @@ class MarketConfig:
             raise ValueError("time_horizon must be positive")
         if self.order_quantity <= 0.0:
             raise ValueError("order_quantity must be positive")
+        if self.max_quote_ticks is not None:
+            # ``< 1.0`` alone lets nan and inf through, because both compare
+            # false against a number. An inf cap silently means "no cap" while
+            # still being printed as "quotes capped", and a nan cap poisons
+            # every min/max it touches -- the quote then depends on comparison
+            # order, which is not a configuration, it is a coincidence.
+            if not isfinite(self.max_quote_ticks) or self.max_quote_ticks < 1.0:
+                # One tick per side is the smallest quote that survives snapping;
+                # below it the cap and the grid cannot both be honoured, and a
+                # degenerate one-tick-wide book would be sent as a real quote.
+                raise ValueError("max_quote_ticks must be a finite number "
+                                 "of ticks >= 1, or None")
         if self.session_end <= self.session_start:
             raise ValueError("session_end must be after session_start")

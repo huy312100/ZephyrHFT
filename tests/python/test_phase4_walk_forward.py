@@ -184,11 +184,14 @@ def test_runner_aborts_when_a_window_silently_retunes(
     original = LockedParameters.build_strategy
     builds = {"count": 0}
 
-    def drifting(self: LockedParameters):
+    def drifting(self: LockedParameters, *, max_quote_ticks=None):
+        # Same signature as the method it replaces: the runner passes the study's
+        # quoting cap through, so a double that refused it would fail the runner
+        # instead of testing the drift it is here to inject.
         builds["count"] += 1
         if builds["count"] >= 2:
-            return original(replace(self, k=2.5))
-        return original(self)
+            return original(replace(self, k=2.5), max_quote_ticks=max_quote_ticks)
+        return original(self, max_quote_ticks=max_quote_ticks)
 
     monkeypatch.setattr(LockedParameters, "build_strategy", drifting)
 
