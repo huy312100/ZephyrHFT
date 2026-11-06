@@ -12,8 +12,11 @@ filled if the print traded at or through it; the fill is marked from the quote's
 own price at each horizon, and the fee is subtracted. The output is a curve of
 net edge against distance, and the fill rate still available out there.
 
-Exit codes: ``0`` a distance clears the fee, ``1`` none does, ``2`` usage or
-missing input, ``3`` no print could be priced (insufficient data for a verdict).
+Exit codes: ``0`` a distance clears the fee *and holds at the longest horizon
+measured*, ``1`` none does (``NO_CLEARING_DISTANCE``, or
+``REVERSES_WITHIN_HORIZON``: positive short-term and measured away later, which
+is the rebound of a swept book rather than an edge), ``2`` usage or missing
+input, ``3`` no print could be priced (insufficient data for a verdict).
 """
 from __future__ import annotations
 

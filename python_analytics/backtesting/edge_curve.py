@@ -521,6 +521,43 @@ def _samples_at(row: Mapping[str, Any], label: str) -> int:
     return int(((row.get("horizons") or {}).get(label) or {}).get("samples", 0) or 0)
 
 
+def _win_at(row: Mapping[str, Any], label: str) -> Optional[float]:
+    block = (row.get("horizons") or {}).get(label)
+    if not block or block.get("win_rate_pct") is None:
+        return None
+    return float(block["win_rate_pct"])
+
+
+def persistence_of(row: Mapping[str, Any],
+                   config: EdgeCurveConfig,
+                   primary_label: str) -> Tuple[str, Optional[str], int, float]:
+    """Does an edge measured at the primary horizon still exist once the book refills?
+
+    Returns ``(state, longest_label, samples, net_bps)`` where state is ``holds``,
+    ``reverses`` or ``unproven``.
+
+    The markout compares a fill against the **mid**, and seconds after a print
+    has swept several ticks through the book that mid is not a price anyone could
+    have traded: the touch it was computed from had just been emptied, and it
+    rebounds as the levels refill. A short horizon therefore books the rebound as
+    profit. Whether the maker actually earned is only visible once the book has
+    re-established, so a distance clears only while the edge still holds at the
+    LONGEST horizon the study measured. ``markouts`` already reports this as
+    horizon drift; the curve was deciding without looking at it.
+    """
+    horizons = sorted(float(value) for value in config.horizons_s)
+    longest_label = horizon_label(horizons[-1])
+    if longest_label == primary_label or len(horizons) < 2:
+        return "holds", longest_label, _samples_at(row, longest_label), _net_at(row, longest_label)
+    samples = _samples_at(row, longest_label)
+    if samples < config.min_samples:
+        # Not "no edge" -- no evidence either way, which must not be laundered
+        # into a clearing verdict by being called a hold.
+        return "unproven", longest_label, samples, _net_at(row, longest_label)
+    net = _net_at(row, longest_label)
+    return ("holds" if net > 0.0 else "reverses"), longest_label, samples, net
+
+
 def edge_curve_verdict(summary: Mapping[str, Any],
                        config: Optional[EdgeCurveConfig] = None) -> Dict[str, Any]:
     """Names the first distance that clears the fee, and what it would fill.
@@ -570,6 +607,27 @@ def edge_curve_verdict(summary: Mapping[str, Any],
     # where the violent moves -- and the far fills -- live.
     eligible = [row for row in eligible if row not in under_covered]
     clearing = [row for row in eligible if _net_at(row, label) > 0.0]
+    # A distance whose edge is *measured* away at the longest horizon was never a
+    # maker edge: it was the re-pricing of a book that had just been swept. Only
+    # that measured reversal blocks, because a short tape simply has no sample at
+    # the long end, and absence of evidence must not quietly become a verdict --
+    # it is reported as an unproven persistence instead.
+    fleeting: List[Tuple[Dict[str, Any], str, str, int, float]] = []
+    unproven: List[Tuple[Dict[str, Any], str, str, int]] = []
+    if clearing:
+        persistent: List[Dict[str, Any]] = []
+        for row in clearing:
+            state, longest_label, samples, longest_net = persistence_of(row, config, label)
+            if state == "holds":
+                persistent.append(row)
+            elif state == "unproven":
+                persistent.append(row)
+                unproven.append((row, longest_label, state, samples))
+            else:
+                fleeting.append((row, state, longest_label, samples, longest_net))
+        # A row that is both kept and reversed elsewhere must not hide the fact.
+        clearing = [row for row in persistent
+                    if row not in [item[0] for item in fleeting]]
     if clearing:
         best = min(clearing, key=lambda row: float(row["distance_bps"]))
         net = _net_at(best, label)
@@ -583,6 +641,30 @@ def edge_curve_verdict(summary: Mapping[str, Any],
             f"that distance was reached by {best['fills']} of {tape.get('matched')} "
             f"print(s) ({float(best['reach_pct']):.2f}%), "
             f"{float(best['fills_per_min']):.2f} fills/min on this tape")
+    elif fleeting:
+        verdict = "REVERSES_WITHIN_HORIZON"
+        # Name the worst offender: the widest net at the primary horizon is the
+        # one most likely to be shipped on.
+        row, state, longest_label, samples, longest_net = max(
+            fleeting, key=lambda item: _net_at(item[0], label))
+        flip = _win_at(row, label)
+        settle = _win_at(row, longest_label)
+        reasons.append(
+            f"no distance's edge survived the horizon it would have to be held "
+            f"in: {len(fleeting)} distance(s) cleared the "
+            f"{config.maker_bps:g} bps fee at {label} and were measured away at "
+            f"{longest_label}")
+        reasons.append(
+            f"at {float(row['distance_bps']):g} bps the edge is "
+            f"{_net_at(row, label):+.2f} bps net at {label} but "
+            f"{longest_net:+.2f} bps at {longest_label} on {samples} fill(s)"
+            + (f", win rate {flip:.1f}% -> {settle:.1f}%"
+               if flip is not None and settle is not None else "")
+            + ": the fill's reference mid had just been swept, and the rebound of "
+              "the levels refilling behind it is not money a maker can collect")
+        reasons.append(
+            "an edge that is positive only while the book is still missing its "
+            "touch is a measurement of the vacuum, not of a price")
     else:
         verdict = "NO_CLEARING_DISTANCE"
         if eligible:
@@ -627,6 +709,17 @@ def edge_curve_verdict(summary: Mapping[str, Any],
         "count is not an execution estimate, and those effects change both how "
         "often a quote fills and what the fills that remain are worth, so read "
         "the edge as conditional on the idealised fill rule")
+    if unproven and verdict == "CLEARS":
+        row, longest_label, _state, samples = unproven[0]
+        # Say what the reader cannot see, rather than implying it was checked:
+        # this is the one case where a clearing verdict could still be a sweep
+        # rebound, and the tape is too short to tell.
+        reasons.append(
+            f"persistence is UNPROVEN beyond {label} at "
+            f"{float(row['distance_bps']):g} bps: only {samples} fill(s) could be "
+            f"marked at {longest_label} (a verdict needs {config.min_samples}), so "
+            f"the shorter-horizon edge here has not been shown to survive the "
+            f"book refilling behind it")
 
     # One fill is not a business: a round trip pays the fee twice and earns the
     # markout twice, so the fee ceiling is the per-fill markout itself. This is
