@@ -225,6 +225,77 @@ def test_a_distance_needs_its_sample_count_before_it_can_clear() -> None:
     assert any("produced the 30 fills" in reason for reason in verdict["reasons"])
 
 
+# --------------------------------------------------------------------------- #
+# Persistence: an edge that only exists while the book is still empty is not one
+# --------------------------------------------------------------------------- #
+def _swept_then_refilled():
+    """A print sweeps through the quote, the mid jumps away, then levels refill.
+
+    The last frame sits *after* the 10 s target (fill at 1.1 s + 10 s = 11.1 s):
+    a horizon with no sample at or after its target is not measured, and the
+    curve must not be credited with having checked something it could not reach.
+    """
+    return [
+        _snapshot(1_000, 99.99, 100.01),
+        _print(1_100, 99.99),
+        _snapshot(2_200, 101.00, 101.02),   # +1 s: the vacuum, ~+100 bps
+        _snapshot(11_200, 99.90, 99.92),    # +10 s: refilled, below the fill mid
+    ]
+
+
+def test_an_edge_that_only_lives_in_the_sweep_does_not_clear() -> None:
+    """Positive at 1 s and negative at 10 s is a rebound, not a maker edge.
+
+    The reference mid is read seconds after the book was emptied, so the short
+    horizon books the refilling as profit. Before this gate the curve called that
+    CLEARS, which is exactly the mistake that ships a strategy.
+    """
+    summary, config = _curve(_swept_then_refilled(),
+                             _config(horizons_s=(1.0, 10.0), min_samples=1))
+    verdict = edge_curve_verdict(summary, config)
+    assert verdict["verdict"] == "REVERSES_WITHIN_HORIZON", verdict["reasons"]
+    assert verdict["distance_bps"] is None  # a transient is not a clearing distance
+    assert any("cleared the 2 bps fee at 1s and were measured away at 10s"
+               in reason for reason in verdict["reasons"])
+    flip = [reason for reason in verdict["reasons"] if "but" in reason and "10s" in reason]
+    assert flip and "not money a maker can collect" in flip[0]
+
+
+def test_an_edge_that_holds_after_the_book_refills_still_clears() -> None:
+    """The gate must not swallow a durable edge: the mid staying away is one."""
+    summary, config = _curve(
+        _swept_then_refilled()[:3] + [_snapshot(11_200, 101.10, 101.12)],
+        _config(horizons_s=(1.0, 10.0), min_samples=1))
+    verdict = edge_curve_verdict(summary, config)
+    assert verdict["verdict"] == "CLEARS", verdict["reasons"]
+
+
+def test_a_single_horizon_study_cannot_be_asked_about_persistence() -> None:
+    """With one horizon there is nothing to compare, so hold is the only answer."""
+    summary, config = _curve(_swept_then_refilled(),
+                             _config(horizons_s=(1.0,), min_samples=1))
+    assert edge_curve_verdict(summary, config)["verdict"] == "CLEARS"
+
+
+def test_a_short_tape_clears_but_says_its_persistence_is_unproven() -> None:
+    """No sample at the long end is absence of evidence, not evidence of reversal.
+
+    Refusing the verdict here would make the curve useless on short captures and
+    would silently rank ignorance above measurement. It clears *and* states what
+    was never checked, so a reader cannot mistake the two.
+    """
+    lines = [
+        _snapshot(1_000, 99.99, 100.01),
+        _print(1_100, 99.99),
+        _snapshot(2_200, 101.00, 101.02),
+    ]
+    summary, config = _curve(lines, _config(horizons_s=(1.0, 10.0), min_samples=1))
+    verdict = edge_curve_verdict(summary, config)
+    assert verdict["verdict"] == "CLEARS"
+    assert any("persistence is UNPROVEN beyond 1s" in reason
+               for reason in verdict["reasons"])
+
+
 def test_fill_rate_is_reported_per_minute_of_tape() -> None:
     """Two fills 60 s apart on a two-minute tape is one fill per minute."""
     lines = [
