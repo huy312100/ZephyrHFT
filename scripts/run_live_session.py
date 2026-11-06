@@ -230,31 +230,34 @@ def run(args: argparse.Namespace) -> int:
 
     interrupted = False
     try:
-        report = supervisor.run()
-    except (LiveExecutionError, BinanceError) as exc:
-        # A venue error escaping the loop must not leave quotes resting: the
-        # cleanup below runs for every exit path, not only the tidy ones.
-        logger.error("session failed: %s", exc)
-        report = SessionReport(halted=True, halt_reason=f"unhandled: {exc}")
-    except KeyboardInterrupt:
-        interrupted = True
-        report = SessionReport(halted=True, halt_reason="interrupted")
+        try:
+            report = supervisor.run()
+        except (LiveExecutionError, BinanceError) as exc:
+            # A venue error escaping the loop must not leave quotes resting: the
+            # cleanup below runs for every exit path, not only the tidy ones.
+            logger.error("session failed: %s", exc)
+            report = SessionReport(halted=True, halt_reason=f"unhandled: {exc}")
+        except KeyboardInterrupt:
+            interrupted = True
+            report = SessionReport(halted=True, halt_reason="interrupted")
+
+        # Cleanup runs whatever happened -- including a clean finish at the
+        # iteration limit, which is exactly when quotes are most likely to be left
+        # resting in a book nobody is watching any more.
+        if not supervisor.killed:
+            try:
+                supervisor.stop("session end", flatten=args.flatten_on_stop)
+            except (LiveExecutionError, BinanceError) as exc:
+                logger.error("cleanup failed: %s", exc)
+        store.close()
     finally:
-        # This process does not own the signal dispositions: a caller (or a test
-        # runner) that had its own handlers must get them back, or the session
-        # outlives its own process semantics.
+        # Restored only after cleanup, not before it. Putting this in the loop's
+        # own ``finally`` returned the process to ``SIG_DFL`` while orders were
+        # still being cancelled, so a Ctrl-C in that window raised KeyboardInterrupt
+        # inside the cleanup and exited 130 with the quotes left resting -- the
+        # exact state this function exists to prevent.
         for sig, handler in previous_handlers.items():
             signal.signal(sig, handler)
-
-    # Cleanup runs whatever happened -- including a clean finish at the
-    # iteration limit, which is exactly when quotes are most likely to be left
-    # resting in a book nobody is watching any more.
-    if not supervisor.killed:
-        try:
-            supervisor.stop("session end", flatten=args.flatten_on_stop)
-        except (LiveExecutionError, BinanceError) as exc:
-            logger.error("cleanup failed: %s", exc)
-    store.close()
 
     if interrupted or supervisor.stop_requested:
         return EXIT_INTERRUPTED

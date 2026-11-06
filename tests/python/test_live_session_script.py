@@ -125,6 +125,9 @@ class SessionVenue:
     def __init__(self) -> None:
         self.bid, self.ask = Decimal("100.00"), Decimal("100.02")
         self.resting: list = []
+        #: Every new_order the venue was actually asked for, including ones later
+        #: cancelled: counting these is how a test proves no work was performed.
+        self.placed: list = []
         self.cancelled: list = []
         self.cancel_all_calls = 0
         self.flatten_calls = 0
@@ -147,6 +150,7 @@ class SessionVenue:
     def new_order(self, **kwargs: Any) -> Dict[str, Any]:
         order_id = self._next
         self._next += 1
+        self.placed.append(dict(kwargs))
         self.resting.append({"clientOrderId": kwargs["client_order_id"],
                              "orderId": order_id, "side": kwargs["side"],
                              "price": Decimal(kwargs["price"]),
@@ -298,21 +302,92 @@ def test_the_run_reports_an_unresolved_order_instead_of_success(
         "an unresolved order must never report success"
 
 
-def test_signal_handling_sets_the_flag_and_never_the_loop(
+def test_the_signal_handler_only_raises_the_flag_and_places_nothing(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The handler may only raise a flag.
+    """Behaviour, not source text.
 
-    Calling ``stop()`` from inside a signal handler can land in the middle of a
-    step, whose remaining side would then be placed *after* the operator was
-    told the session had stopped, and whose store writes would nest inside
-    whatever transaction was open.
+    Asserting on the file would keep passing if registration were removed, or if
+    the handler moved its cleanup into a helper -- and the thing that actually
+    matters is that firing the handler performs no venue work and no store write,
+    because a handler that does can interrupt a step mid-flight and place the
+    remaining side after the operator asked the session to stop.
     """
-    import inspect
-    source = inspect.getsource(script.run)
-    handler_body = source.split("def on_signal")[1].split("previous_handlers")[0]
-    assert "stop_requested = True" in handler_body
-    assert ".stop(" not in handler_body, "no cleanup inside a signal handler"
+    import signal as signal_module
+    from python_analytics.live import LiveSupervisor
+
+    installed: Dict[int, Any] = {}
+    restored: Dict[int, Any] = {}
+    real_signal = signal_module.signal
+
+    def record(sig, handler) -> Any:
+        # The script installs its own handler and then restores the previous one,
+        # so a plain assignment here would end up holding the *restored* handler
+        # (in a test run, CPython's default_int_handler) and calling it would
+        # raise KeyboardInterrupt instead of exercising the session's handler.
+        target = installed if sig not in installed else restored
+        target[sig] = handler
+        return real_signal(sig, handler)
+
+    supervisors: List[Any] = []
+
+    class Spy(LiveSupervisor):
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            super().__init__(*args, **kwargs)
+            supervisors.append(self)
+
+    monkeypatch.setattr(signal_module, "signal", record)
+    monkeypatch.setattr(script, "LiveSupervisor", Spy)
+    venue = SessionVenue()
+    _drive(tmp_path, venue, ["--iterations", "1", "--interval-s", "0"], monkeypatch)
+
+    assert signal_module.SIGINT in installed, "no handler was ever installed"
+    handler = installed[signal_module.SIGINT]
+    # The script's own closure, not a restored default: this is the object the
+    # operator's Ctrl-C will actually reach.
+    assert getattr(handler, "__name__", "") == "on_signal", handler
+    supervisor = supervisors[-1]
+    placed, cancelled = len(venue.placed), len(venue.cancelled)
+
+    handler(signal_module.SIGINT, None)
+
+    assert supervisor.stop_requested is True
+    assert len(venue.placed) == placed, "the handler must not place a quote"
+    assert len(venue.cancelled) == cancelled, "nor cancel one from inside itself"
+    assert restored.get(signal_module.SIGINT) is not None, \
+        "the session never gave the process its handlers back"
+
+
+def test_handlers_stay_ours_until_the_cleanup_is_done(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The window this used to leave open: Ctrl-C *during* cancellation.
+
+    Restoring the previous dispositions as soon as the loop ended put
+    ``SIG_DFL`` back while quotes were still being cancelled, so a Ctrl-C in
+    that interval raised inside the cleanup and exited 130 with orders left
+    resting. Observed from inside the cleanup itself, which is the only place
+    that can prove the ordering.
+    """
+    import signal as signal_module
+
+    venue = SessionVenue()
+    original_cancel = venue.cancel_order
+    seen: Dict[str, Any] = {}
+
+    def probing_cancel(**kwargs: Any) -> Dict[str, Any]:
+        seen["during_cleanup"] = signal_module.getsignal(signal_module.SIGINT)
+        return original_cancel(**kwargs)
+
+    venue.cancel_order = probing_cancel  # type: ignore[assignment]
+    code = _drive(tmp_path, venue, ["--iterations", "1", "--interval-s", "0"],
+                  monkeypatch)
+
+    assert code == script.EXIT_CLEAN
+    assert seen, "cleanup never cancelled, so it proved nothing"
+    assert seen["during_cleanup"] is not signal_module.SIG_DFL, \
+        "the session was still cancellable but had given up its handler"
+    assert venue.resting == [], "and the cleanup still finished the job"
 
 
 def test_the_session_restores_the_signal_dispositions_it_borrowed(
@@ -322,19 +397,26 @@ def test_the_session_restores_the_signal_dispositions_it_borrowed(
 
     ``run()`` installs SIGINT/SIGTERM handlers; if it does not put back what was
     there before, every later caller in the same process -- including a test
-    runner -- silently inherits a closure over a finished session. That is the
-    kind of defect that shows up as an unrepeatable failure rather than a bug.
+    runner -- silently inherits a closure over a finished session.
     """
     import signal as signal_module
 
-    sentinels = {sig: (lambda *_a: None) for sig in
-                 (signal_module.SIGINT, signal_module.SIGTERM)}
-    for sig, handler in sentinels.items():
-        signal_module.signal(sig, handler)
+    # The sentinels themselves are borrowed state: restore whatever was here
+    # before, or this guard leaks the very defect it tests for.
+    previous = {sig: signal_module.getsignal(sig)
+                for sig in (signal_module.SIGINT, signal_module.SIGTERM)}
+    sentinels = {sig: (lambda *_a: None) for sig in previous}
+    try:
+        for sig, handler in sentinels.items():
+            signal_module.signal(sig, handler)
 
-    venue = SessionVenue()
-    _drive(tmp_path, venue, ["--iterations", "1", "--interval-s", "0"], monkeypatch)
+        venue = SessionVenue()
+        _drive(tmp_path, venue, ["--iterations", "1", "--interval-s", "0"],
+               monkeypatch)
 
-    for sig, handler in sentinels.items():
-        assert signal_module.getsignal(sig) is handler, \
-            f"{sig!r} handler was not restored after the session ended"
+        for sig, handler in sentinels.items():
+            assert signal_module.getsignal(sig) is handler, \
+                f"{sig!r} handler was not restored after the session ended"
+    finally:
+        for sig, handler in previous.items():
+            signal_module.signal(sig, handler)
