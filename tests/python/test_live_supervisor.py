@@ -478,10 +478,15 @@ def test_an_unknown_submit_stops_the_tick_before_the_other_side_is_placed(
     venue.query_error = BinanceTransportError("lookup unavailable")
     result = supervisor.step()
 
-    assert result.skipped and "UNKNOWN" in result.skipped
     assert len(venue.submits) == 1, \
         "SELL must not be placed over an unresolved BUY"
     assert supervisor.halted
+    # The reason has to say the venue's answer is unknown, not that the order
+    # was refused: "rejected" tells an operator nothing is live, and something
+    # may be. Halting for the right reason is the difference between chasing an
+    # order and going looking for a quote that was never placed.
+    assert result.skipped and "rejected" not in result.skipped, result.skipped
+    assert "UNKNOWN" in result.skipped
 
 
 def test_a_post_only_cross_is_tolerated_and_another_rejection_is_not(
