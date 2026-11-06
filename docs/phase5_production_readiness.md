@@ -755,6 +755,9 @@ python3 scripts/run_live_trader.py --store state/live_orders.sqlite3
 # testnet: one post-only quote, 5 bps from the mid
 python3 scripts/run_live_trader.py --submit --side BUY --quantity 0.002 --offset-bps 5
 
+# testnet: a bounded re-quoting SESSION (supervisor: inventory cap + loss cap)
+python3 scripts/run_live_session.py --symbol BTCUSDT --iterations 60 --interval-s 1
+
 # kill switch: cancel the symbol and flatten (works on any environment)
 python3 scripts/run_live_trader.py --cancel-all
 
@@ -772,22 +775,36 @@ venue before assuming the book is flat.
 
 ### 11.3 What is still missing before this is a business
 
-1. **An edge.** The committed study is `NO-GO`: `net_pnl = -15.78 USDT` over 229
-   fills with `2.0 bps` maker / `5.0 bps` taker charged. Nothing in this layer
-   changes that sign. Real capture + a re-run study is the work.
+1. **An edge.** The committed study is `NO-GO`, and the real-tape studies are
+   worse than the synthetic one ever showed: BTCUSDT nets `-90.87 USDT` over 14
+   OOS windows with a `-1.241 bps` **gross** edge (it loses before any fee), and
+   ADAUSDT's 141 round trips land at `-0.975 bps` gross. Nothing in this layer
+   changes that sign — real capture + a study that earns is the work.
 2. **~~Markout.~~** Shipped in §11.4. It answers the question item 1 cannot: the
    study's maker fills are marked at `-0.33 bps` one second after the trade, so
    the quote is being picked off and the fee is not the only problem.
 3. **Funding.** Perpetual funding is charged every 8h and is currently not in
-   the ledger; a carry-heavy session will drift from the paper model.
-4. **A loop.** `run_live_trader.py` places at most one quote. Re-quoting,
-   inventory limits and a per-session loss cap belong in a supervisor that
-   calls `LiveExecutor`, not in this script.
-5. **Alerting.** `panic()` returns failures; nothing pages a human yet.
+   the ledger; a carry-heavy session will drift from the paper model. The
+   supervisor's loss cap reads the venue's position `unrealizedPnl` against the
+   session's own baseline, so it is a runaway-position guard, not an accounting
+   statement — realised income and funding are still outside it.
+4. **~~A loop.~~** Shipped: `python_analytics/live/supervisor.py` +
+   `scripts/run_live_session.py`. It re-quotes only when a resting quote's
+   target has drifted past `--requote-tolerance-bps` (so queue position is not
+   thrown away every tick), suppresses and cancels the side that would push net
+   inventory past `--max-inventory`, and runs the existing kill path when the
+   session's own PnL breaches `--loss-cap`. Its first rule is the harshest: an
+   `UNKNOWN` order halts the loop *before* the book is read, because submitting
+   over an order the venue may already hold turns one intent into two.
+5. **Alerting.** Partly: the supervisor takes an `alerter` hook and fires it on
+   every halt and on a kill path that could not cancel everything, and each halt
+   is a durable `supervisor_halt` row in the order store. What still does not
+   exist is a pager binding — an alert that only logs is still item 5.
 
-Until 1, 3 and 4 exist, a production run is `--cancel-all` plus a manual smoke
-test under `--override-alpha`, and the override sentence is the audit record
-that says so.
+Until 1 and 3 exist, a production run is `--cancel-all` plus a manual smoke test
+under `--override-alpha`, and the override sentence is the audit record that says
+so. Item 4 no longer blocks it: the loop is there, it simply has nothing worth
+trading.
 
 ### 11.4 Markout: is the quote earning the spread or being run over?
 
