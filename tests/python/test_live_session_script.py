@@ -385,8 +385,12 @@ def test_handlers_stay_ours_until_the_cleanup_is_done(
 
     assert code == script.EXIT_CLEAN
     assert seen, "cleanup never cancelled, so it proved nothing"
-    assert seen["during_cleanup"] is not signal_module.SIG_DFL, \
-        "the session was still cancellable but had given up its handler"
+    # Asserting "not SIG_DFL" would pass even with the bug: restoring early puts
+    # back whatever the test runner had, which is a handler but not *this*
+    # session's. The invariant is that cleanup is still interruptible by the
+    # code that owns the orders, so the handler must be the session's own.
+    during = seen["during_cleanup"]
+    assert getattr(during, "__name__", "") == "on_signal", during
     assert venue.resting == [], "and the cleanup still finished the job"
 
 
