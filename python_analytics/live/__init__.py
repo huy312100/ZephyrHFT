@@ -24,6 +24,12 @@ from .store import (
     LiveStoreError,
     OrderStore,
 )
+from .supervisor import (
+    LiveSupervisor,
+    SessionReport,
+    StepResult,
+    SupervisorConfig,
+)
 
 __all__ = [
     "ACTIVE_STATUSES",
@@ -36,9 +42,13 @@ __all__ = [
     "LiveExecutionError",
     "LiveExecutor",
     "LiveStoreError",
+    "LiveSupervisor",
     "OrderStore",
     "ReconcileReport",
+    "SessionReport",
+    "StepResult",
     "SubmissionResult",
+    "SupervisorConfig",
     "alpha_gate_verdict",
     "require_alpha_go",
 ]
