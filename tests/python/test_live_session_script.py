@@ -310,6 +310,31 @@ def test_signal_handling_sets_the_flag_and_never_the_loop(
     """
     import inspect
     source = inspect.getsource(script.run)
-    handler_body = source.split("def on_signal")[1].split("signal.signal")[0]
+    handler_body = source.split("def on_signal")[1].split("previous_handlers")[0]
     assert "stop_requested = True" in handler_body
     assert ".stop(" not in handler_body, "no cleanup inside a signal handler"
+
+
+def test_the_session_restores_the_signal_dispositions_it_borrowed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A CLI must not leave the process with handlers pointing at its own corpse.
+
+    ``run()`` installs SIGINT/SIGTERM handlers; if it does not put back what was
+    there before, every later caller in the same process -- including a test
+    runner -- silently inherits a closure over a finished session. That is the
+    kind of defect that shows up as an unrepeatable failure rather than a bug.
+    """
+    import signal as signal_module
+
+    sentinels = {sig: (lambda *_a: None) for sig in
+                 (signal_module.SIGINT, signal_module.SIGTERM)}
+    for sig, handler in sentinels.items():
+        signal_module.signal(sig, handler)
+
+    venue = SessionVenue()
+    _drive(tmp_path, venue, ["--iterations", "1", "--interval-s", "0"], monkeypatch)
+
+    for sig, handler in sentinels.items():
+        assert signal_module.getsignal(sig) is handler, \
+            f"{sig!r} handler was not restored after the session ended"

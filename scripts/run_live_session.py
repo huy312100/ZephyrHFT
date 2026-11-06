@@ -222,6 +222,9 @@ def run(args: argparse.Namespace) -> int:
         logger.warning("signal %s received; finishing the current step then "
                        "cleaning up", sig)
 
+    previous_handlers = {
+        sig: signal.getsignal(sig)
+        for sig in (signal.SIGINT, signal.SIGTERM)}
     signal.signal(signal.SIGINT, on_signal)
     signal.signal(signal.SIGTERM, on_signal)
 
@@ -236,6 +239,12 @@ def run(args: argparse.Namespace) -> int:
     except KeyboardInterrupt:
         interrupted = True
         report = SessionReport(halted=True, halt_reason="interrupted")
+    finally:
+        # This process does not own the signal dispositions: a caller (or a test
+        # runner) that had its own handlers must get them back, or the session
+        # outlives its own process semantics.
+        for sig, handler in previous_handlers.items():
+            signal.signal(sig, handler)
 
     # Cleanup runs whatever happened -- including a clean finish at the
     # iteration limit, which is exactly when quotes are most likely to be left
