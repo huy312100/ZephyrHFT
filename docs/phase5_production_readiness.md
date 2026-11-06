@@ -1348,6 +1348,12 @@ Two boundaries matter, because they are what keep this from being a fantasy:
   that stays put is filled when the market walks to it, and those fills are the
   adverse ones; §11.6 already measured them. The curve measures the other half:
   what is available to a maker who keeps his distance.
+- **A fill in a swept book is marked against a mid that no longer exists.** The
+  reference mid is read moments after a print traded several ticks through the
+  ladder, so the touch it was measured from had just been emptied, and it
+  rebounds as the levels behind it refill. A short horizon therefore books the
+  refill as profit. This is why the verdict checks *persistence*, not one
+  horizon — see §11.8.8.
 - **Queue position, latency and our size are not modelled.** None of the three
   is neutral. A quote re-priced from a stale mid — what a real maker posts while
   it waits for its next update — can be reached by a print the idealised quote
@@ -1607,4 +1613,39 @@ python3 scripts/run_edge_curve.py \
   --tick-size 0.1 --distances-bps 0.0125,0.1,0.5,1,1.5,2,3
 # exit 0 a distance clears, 1 none does, 2 usage, 3 no priced print
 ```
+
+#### 11.8.8 Persistence: the verdict that said CLEARS about a vacuum
+
+The first venue-level use of the curve on ADAUSDT (45 h of seeded tape,
+857,238 prints, tick `0.0001` = 5.36 bps at a `0.187` mid) returned `CLEARS`:
+`+0.04 bps` net at 10 s for a quote 1 tick out, `+12.61 bps` at 20 bps and
+`+21.82 bps` at 30 bps. Every row positive, coverage 100 %, sample counts in the
+thousands. It was wrong, and the same artefact already contained the proof:
+
+| distance | fills | win % @1s | net @10s | net @60s | win % @60s |
+| --- | --- | --- | --- | --- | --- |
+| 5 bps | 28,235 | 52.3 | +0.04 | -4.57 | 44.7 |
+| 8 bps | 19,967 | 58.9 | +1.24 | -5.47 | 45.8 |
+| 12 bps | 9,125 | 64.8 | +1.22 | -11.69 | 37.0 |
+| 20 bps | 3,482 | 98.0 | +12.61 | -10.09 | 33.3 |
+| 30 bps | 1,909 | 100.0 | +21.82 | -10.30 | 35.5 |
+
+Two tells. A 100.0 % win rate over 1,909 fills is not an edge — nothing in a
+market wins every time; it is the signature of measuring against a reference
+price that no longer existed. And every row turns negative once the book has
+refilled: the profit lived entirely inside the sweep.
+
+**The rule.** A fill's markout is taken from the *mid*, and seconds after a print
+traded several ticks through the ladder that mid is the price of a book missing
+its touch. It rebounds as other makers refill it, and a short horizon books that
+rebound as our profit while the position is still open and the executable price
+is moving the other way. So a distance clears only while its edge is not
+*measured away* at the longest horizon the study ran — `REVERSES_WITHIN_HORIZON`,
+exit `1`. Absence of a long-horizon sample does not block: that would rank
+ignorance above evidence and leave every short capture permanently undecided, so
+such a row clears with persistence stated as `UNPROVEN` in its reasons instead.
+
+`markouts` already reported this shape as horizon drift (§11.6.3, and the
+BTCUSDT `-0.40 → -0.54 bps` from 1 s to 60 s in §11.6.4). The defect was not the
+maths: it was which number the verdict was allowed to look at.
 
