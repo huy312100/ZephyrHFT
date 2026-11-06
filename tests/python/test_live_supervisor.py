@@ -16,6 +16,7 @@ import pytest
 
 from python_analytics.exchange.binance_futures import (
     BinanceAPIError,
+    BinanceTransportError,
     OpenOrder,
     Position,
 )
@@ -123,7 +124,8 @@ class FakeVenue:
                          leverage=Decimal("1"))]
 
 
-def _supervisor(tmp_path: Path, venue: FakeVenue, **overrides: Any):
+def _supervisor(tmp_path: Path, venue: FakeVenue, *, name: str = "orders",
+                **overrides: Any):
     config_kwargs: Dict[str, Any] = dict(
         symbol=SYMBOL, quantity=Decimal("0.01"), offset_bps=Decimal("5"),
         tick_size=Decimal("0.01"), requote_tolerance_bps=Decimal("0.25"),
@@ -131,7 +133,7 @@ def _supervisor(tmp_path: Path, venue: FakeVenue, **overrides: Any):
         max_iterations=1, interval_s=0.0,
     )
     config_kwargs.update(overrides)
-    store = OrderStore(tmp_path / "orders.sqlite3")
+    store = OrderStore(tmp_path / f"{name}.sqlite3")
     clock = iter([float(n) for n in range(1, 200)]).__next__
     executor = LiveExecutor(venue, store, SYMBOL, clock=clock)
     alerts: List[tuple] = []
@@ -358,7 +360,8 @@ def test_stop_cancels_what_the_session_placed(tmp_path: Path) -> None:
 
     supervisor.stop("operator")
 
-    assert supervisor.halted
+    assert supervisor.finished and not supervisor.halted, \
+        "a clean stop is a finish, not an incident"
     assert len(venue.cancels) == 2, "each resting quote cancelled by id"
     assert venue.cancel_all_calls == 0
     assert venue.flatten_calls == 0, "a deliberate stop does not pay the taker fee"
@@ -366,19 +369,23 @@ def test_stop_cancels_what_the_session_placed(tmp_path: Path) -> None:
 
 def test_stop_flatten_uses_the_existing_kill_path(tmp_path: Path) -> None:
     """Flattening is the venue's decision too: only a position is closed."""
-    supervisor, _ex, venue, _store, _alerts = _supervisor(tmp_path, FakeVenue())
+    flat_venue = FakeVenue()
+    supervisor, _ex, flat_venue, _store, _alerts = _supervisor(
+        tmp_path, flat_venue, name="flat")
     supervisor.step()
 
     supervisor.stop("operator", flatten=True)
 
-    assert venue.cancel_all_calls == 1
-    assert venue.flatten_calls == 0, "nothing to flatten, no taker fee paid"
+    assert flat_venue.cancel_all_calls == 1
+    assert flat_venue.flatten_calls == 0, "nothing to flatten, no taker fee paid"
 
-    venue.position_qty = Decimal("0.4")
-    supervisor2, _e2, venue2, _s2, _a2 = _supervisor(tmp_path, venue)
-    venue2.position_qty = Decimal("0.4")
-    supervisor2.stop("operator", flatten=True)
-    assert venue2.flatten_calls == 1
+    held = FakeVenue()
+    held.position_qty = Decimal("0.4")
+    sup2, _e2, held, _s2, _a2 = _supervisor(tmp_path, held, name="held")
+
+    sup2.stop("operator", flatten=True)
+
+    assert held.flatten_calls == 1, "a position must not outlive the session"
 
 
 def test_a_stop_whose_cancel_fails_says_so(tmp_path: Path) -> None:
@@ -397,9 +404,30 @@ def test_a_stop_whose_cancel_fails_says_so(tmp_path: Path) -> None:
     assert [kind for kind, _m in alerts] == ["halt"], "a stuck quote pages"
 
 
-def test_a_halted_session_does_nothing_further(tmp_path: Path) -> None:
+def test_a_stopped_session_quotes_nothing_further(tmp_path: Path) -> None:
+    """Stopping is not pausing: a later step must not reach the venue.
+
+    A session that was stopped and then quoted again would place an order from a
+    process the operator already believes is finished.
+    """
     supervisor, _ex, venue, _store, _alerts = _supervisor(tmp_path, FakeVenue())
     supervisor.stop("operator")
+    assert supervisor.finished and not supervisor.halted
+    placed = len(venue.submits)
+
+    result = supervisor.step()
+
+    assert result.skipped == "stopped"
+    assert len(venue.submits) == placed
+
+
+def test_a_halted_session_quotes_nothing_further(tmp_path: Path) -> None:
+    supervisor, _ex, venue, _store, _alerts = _supervisor(tmp_path, FakeVenue())
+    supervisor.step()
+    venue.query_error = BinanceTransportError("venue unreachable")
+    venue.cancel_error = BinanceTransportError("venue unreachable")
+    # Force an incident: an order we cannot resolve.
+    supervisor._halt("test incident")
     placed = len(venue.submits)
 
     result = supervisor.step()
@@ -421,6 +449,201 @@ def test_the_report_names_what_happened(tmp_path: Path) -> None:
     report = supervisor.run()
     text = report.describe()
     assert "iterations=1" in text and "submitted=2" in text
+
+
+# --------------------------------------------------------------------------- #
+# Rule 1b: an unresolved or refused submit ends the tick, not just the session
+# --------------------------------------------------------------------------- #
+def test_an_unknown_submit_stops_the_tick_before_the_other_side_is_placed(
+    tmp_path: Path
+) -> None:
+    """Half a pair is not a quote; a submit the venue may still hold is worse.
+
+    An ``UNKNOWN`` answer means the request may have landed. Placing the other
+    side before that is resolved risks two live orders from one intent, so the
+    step has to stop at the first ambiguous submit rather than finish the loop.
+    """
+    venue = FakeVenue()
+    supervisor, _ex, venue, _store, _alerts = _supervisor(tmp_path, venue,
+                                                          name="unknown_submit")
+
+    def ambiguous(**kwargs: Any) -> Dict[str, Any]:
+        # The venue may have accepted it: the response never arrived.
+        venue.submits.append(dict(kwargs))
+        raise BinanceTransportError("connection reset after the venue read")
+
+    venue.new_order = ambiguous  # type: ignore[assignment]
+    # And the follow-up lookup cannot reach the venue either, so the honest
+    # answer is UNKNOWN rather than "probably rejected".
+    venue.query_error = BinanceTransportError("lookup unavailable")
+    result = supervisor.step()
+
+    assert result.skipped and "UNKNOWN" in result.skipped
+    assert len(venue.submits) == 1, \
+        "SELL must not be placed over an unresolved BUY"
+    assert supervisor.halted
+
+
+def test_a_post_only_cross_is_tolerated_and_another_rejection_is_not(
+    tmp_path: Path
+) -> None:
+    """-5022 is the expected answer when the book moved through the level.
+
+    A *different* rejection (tick size, min notional, precision) is a
+    configuration error, and retrying it every tick spends rate limit on a
+    mistake instead of surfacing it.
+    """
+    venue = FakeVenue()
+    supervisor, _ex, venue, _store, _alerts = _supervisor(tmp_path, venue)
+
+    # Quote so wide it can never cross the touch: the post-only order rests.
+    result = supervisor.step()
+    assert result.submitted == ["BUY", "SELL"]
+
+    venue2 = FakeVenue()
+    sup2, _e2, _v2, _s2, _a2 = _supervisor(tmp_path, venue2, name="filter")
+
+    def wrong_filter(**kwargs: Any) -> Dict[str, Any]:
+        raise BinanceAPIError("-1111 Precision is incorrect",
+                              status=400, code=-1111,
+                              endpoint="/fapi/v1/order")
+
+    venue2.new_order = wrong_filter  # type: ignore[assignment]
+    outcome = sup2.step()
+    assert outcome.skipped and "rejected" in outcome.skipped
+    assert sup2.halted, "a non-post-only rejection must not be retried every tick"
+
+
+# --------------------------------------------------------------------------- #
+# Ownership: an order we did not place is never ours to cancel
+# --------------------------------------------------------------------------- #
+def test_a_foreign_adopted_order_is_never_cancelled(tmp_path: Path) -> None:
+    """The live layer promises a manual order is adopted passively.
+
+    A supervisor that reads every active row would happily cancel a human's
+    order during re-quoting or at stop, which is exactly what adoption was added
+    to prevent -- so it halts instead of trading over it or destroying it.
+    """
+    venue = FakeVenue()
+    supervisor, _ex, venue, store, _alerts = _supervisor(tmp_path, venue)
+    # Something placed outside this session, adopted by reconcile().
+    store.record_intent(client_order_id="manual-1", symbol=SYMBOL, side="BUY",
+                        price=Decimal("99.5"), quantity=Decimal("0.5"))
+    store.mark_status("manual-1", "SUBMITTED")
+    venue.resting.append({"orderId": 99, "clientOrderId": "manual-1",
+                          "symbol": SYMBOL, "side": "BUY", "type": "LIMIT",
+                          "price": Decimal("99.5"), "origQty": Decimal("0.5"),
+                          "executedQty": Decimal("0"), "status": "NEW"})
+
+    result = supervisor.step()
+
+    assert result.skipped and "did not place" in result.skipped
+    assert venue.cancels == [], "we must never cancel a foreign order"
+    assert result.submitted == [], "and never quote over it either"
+
+
+def test_two_session_rows_on_one_side_halts_instead_of_adding_a_third(
+    tmp_path: Path
+) -> None:
+    venue = FakeVenue()
+    supervisor, _ex, venue, store, _alerts = _supervisor(tmp_path, venue,
+                                                         name="two_rows")
+    supervisor.step()                              # places BUY + SELL
+    first_buy = next(r for r in venue.submits if r["side"] == "BUY")
+    dup_cid = str(first_buy["clientOrderId"]) + "-dup"
+    # A second BUY row belonging to *this* session: the state a cancel that never
+    # landed leaves behind. Registered as ours so the duplicate-side guard is
+    # what runs, rather than the foreign-order guard.
+    venue.resting.append(dict(first_buy, orderId=555, clientOrderId=dup_cid))
+    store.record_intent(client_order_id=dup_cid, symbol=SYMBOL, side="BUY",
+                        price=first_buy["price"], quantity=first_buy["origQty"])
+    store.mark_status(dup_cid, "SUBMITTED")
+    supervisor._session_ids[dup_cid] = "BUY"
+
+    result = supervisor.step()
+
+    assert result.skipped and "two active" in result.skipped
+    assert supervisor.halted
+
+
+# --------------------------------------------------------------------------- #
+# A cancel that fails is resolved, not allowed to escape
+# --------------------------------------------------------------------------- #
+def test_a_cancel_that_the_venue_refuses_leaves_the_quote_alone(
+    tmp_path: Path
+) -> None:
+    """A refused cancel whose order is still live must not be replaced.
+
+    Letting ``-2011`` escape would abandon the loop with the other side
+    unmanaged; replacing a quote the venue never gave up would put **two** live
+    orders on one side. The correct answer is neither: leave it resting and
+    retry next tick, and say which sides were held over.
+    """
+    venue = FakeVenue()
+    supervisor, _ex, venue, _store, _alerts = _supervisor(tmp_path, venue,
+                                                          name="refused_cancel")
+    supervisor.step()
+    placed = len(venue.submits)
+    venue.set_book("101.00", "101.02")             # force both sides to move
+
+    def refuse_cancel(*, symbol: str, order_id: Any = None,
+                      client_order_id: Optional[str] = None) -> Dict[str, Any]:
+        raise BinanceAPIError("-2011 Unknown order sent", status=400,
+                              code=-2011, endpoint="/fapi/v1/order")
+
+    venue.cancel_order = refuse_cancel  # type: ignore[assignment]
+    result = supervisor.step()                      # must not raise
+
+    assert result.submitted == [], "no replacement over a still-live quote"
+    assert result.held_over == ["BUY", "SELL"], result
+    assert len(venue.submits) == placed
+    assert not supervisor.halted, "the venue answered, so the loop may continue"
+
+
+def test_a_cancel_that_fails_and_stays_unknown_halts(tmp_path: Path) -> None:
+    venue = FakeVenue()
+    supervisor, _ex, venue, _store, alerts = _supervisor(tmp_path, venue)
+    supervisor.step()
+    venue.set_book("101.00", "101.02")
+
+    venue.cancel_order = lambda **kw: (_ for _ in ()).throw(   # type: ignore
+        BinanceAPIError("-2011 Unknown order sent", status=400, code=-2011,
+                        endpoint="/fapi/v1/order"))
+    venue.query_error = BinanceAPIError("-1021 recvWindow", status=400,
+                                        code=-1021, endpoint="/fapi/v1/order")
+
+    supervisor.step()
+
+    assert supervisor.halted
+    assert any(kind == "halt" for kind, _m in alerts)
+
+
+# --------------------------------------------------------------------------- #
+# The stop flag is honoured between sides, not inside a handler
+# --------------------------------------------------------------------------- #
+def test_a_stop_requested_mid_step_places_no_further_quote(tmp_path: Path) -> None:
+    """A handler that ran ``stop()`` inline would let this step keep quoting.
+
+    The second side would then rest in the book after the operator was told the
+    session had stopped. Setting a flag and checking it per side removes the
+    race entirely.
+    """
+    venue = FakeVenue()
+    supervisor, _ex, venue, _store, _alerts = _supervisor(tmp_path, venue)
+
+    original = venue.new_order
+
+    def interrupt_after_buy(**kwargs: Any) -> Dict[str, Any]:
+        result = original(**kwargs)
+        supervisor.stop_requested = True            # as a signal handler would
+        return result
+
+    venue.new_order = interrupt_after_buy  # type: ignore[assignment]
+    step = supervisor.step()
+
+    assert step.submitted == ["BUY"]
+    assert step.skipped == "stop requested"
+    assert len(venue.submits) == 1, "the SELL must not be placed after a stop"
 
 
 # --------------------------------------------------------------------------- #

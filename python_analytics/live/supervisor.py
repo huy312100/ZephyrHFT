@@ -45,9 +45,21 @@ from typing import Any, Callable, Dict, List, Optional
 from .executor import LiveExecutionError, LiveExecutor
 from .store import LiveStoreError
 
+from python_analytics.exchange.binance_futures import BinanceError
+
 __all__ = ["SessionReport", "StepResult", "SupervisorConfig", "LiveSupervisor"]
 
 logger = logging.getLogger("zephyr.live.supervisor")
+
+# The venue codes that mean "nothing rested and nothing is owed", which is the
+# only rejection a post-only maker loop may treat as normal. ``-5022`` is
+# futures-only and self-proving; ``-2010`` is the generic new-order rejection and
+# has to be confirmed by its text (same rule ``run_live_trader.py`` applies).
+POST_ONLY_CROSS_CODES = (-5022,)
+POST_ONLY_GENERIC_CODE = -2010
+POST_ONLY_GENERIC_TEXT = "would immediately trigger"
+#: Statuses that mean the venue's answer is unknown, so the loop must stop.
+AMBIGUOUS_STATUSES = ("UNKNOWN", "LOST")
 
 BPS = Decimal(10_000)
 SIDES = ("BUY", "SELL")
@@ -118,6 +130,10 @@ class StepResult:
     cancelled: List[str] = field(default_factory=list)
     kept: List[str] = field(default_factory=list)
     suppressed: List[str] = field(default_factory=list)
+    rejected: List[str] = field(default_factory=list)
+    #: Sides whose stale quote could not be cancelled, left resting on purpose
+    #: rather than doubled. Reported so a quiet tick is not mistaken for a clean one.
+    held_over: List[str] = field(default_factory=list)
     mid: Optional[Decimal] = None
     inventory: Decimal = Decimal("0")
     session_pnl: Decimal = Decimal("0")
@@ -168,7 +184,23 @@ class LiveSupervisor:
         self._alerter = alerter or self._log_alert
         self._halted = False
         self._halt_reason = ""
+        self._finished = False
         self._started = False
+        #: True once the kill path has run. The caller needs this as a flag, not
+        #: as a substring of the reason: running ``panic()`` twice would flatten
+        #: a position that is already being closed and report it as a new failure.
+        self._killed = False
+        #: Client ids this session placed. ``reconcile`` adopts orders it did not
+        #: place, and those must never be cancelled by us: the live layer's
+        #: documented promise is that a manual order is adopted passively.
+        self._session_ids: Dict[str, str] = {}
+        #: Cancels that did not land. Distinct from ``halted`` because a stop is
+        #: halted either way, and only this says the venue may still hold a quote.
+        self.cleanup_failures: List[str] = []
+        #: Set by a signal handler; acted upon between steps, never inside one.
+        #: Handling a stop in the handler would let the interrupted step carry on
+        #: quoting after the operator was told the session had stopped.
+        self.stop_requested = False
         #: Position PnL when the session opened; the cap measures the *change*,
         #: because an account can inherit an open position from a prior session.
         self._baseline_pnl: Optional[Decimal] = None
@@ -176,7 +208,23 @@ class LiveSupervisor:
     # ------------------------------------------------------------------ public
     @property
     def halted(self) -> bool:
+        """True when something went wrong and the session needs attention."""
         return self._halted
+
+    @property
+    def finished(self) -> bool:
+        """True after a routine stop that left nothing behind.
+
+        Kept apart from ``halted`` on purpose: a session that ran to its
+        iteration limit and cancelled both quotes *finished*, and reporting that
+        as an incident would train the operator to ignore the exit code.
+        """
+        return self._finished
+
+    @property
+    def killed(self) -> bool:
+        """True when the kill path has already run for this session."""
+        return self._killed
 
     @property
     def halt_reason(self) -> str:
@@ -187,7 +235,7 @@ class LiveSupervisor:
 
         report = SessionReport()
         while True:
-            if self._halted:
+            if self._halted or self._finished or self.stop_requested:
                 break
             if (self._config.max_iterations
                     and report.iterations >= self._config.max_iterations):
@@ -203,42 +251,51 @@ class LiveSupervisor:
                 report.halted = True
                 report.halt_reason = self._halt_reason
                 break
+            if step.skipped == "stop requested":
+                report.halted = True
+                report.halt_reason = "stop requested"
+                break
             if step.skipped:
                 report.notes.append(f"iteration {report.iterations}: {step.skipped}")
             if self._config.interval_s > 0:
                 self._sleep(self._config.interval_s)
-        report.unresolved_orders = len(
-            self._executor.reconcile().unresolved) if self._started else 0
+        # The last word on what the venue holds, so a caller can refuse to call
+        # this run a success while an order is still out there.
+        if self._started:
+            try:
+                report.unresolved_orders = len(self._executor.reconcile().unresolved)
+            except BinanceError as exc:
+                report.notes.append(f"final reconcile unreadable: {exc}")
+                report.unresolved_orders = -1
         logger.info("session done: %s", report.describe())
         return report
 
     def stop(self, reason: str = "operator", *, flatten: bool = False) -> None:
-        """Ends the session leaving nothing held by a process that has exited.
+        """Ends the session leaving nothing of ours held by a dead process.
 
-        Resting quotes are cancelled first: a dead supervisor with two orders in
-        the book is an unmanaged position someone else has to discover. The
-        inventory is left alone unless ``flatten`` is asked for, because exiting
-        a position pays the taker fee and an operator may intend to resume --
-        the emergency path (``_trip_kill``) is the one that always flattens.
+        Only ids this session placed are cancelled. An order ``reconcile`` adopted
+        belongs to a human or to an earlier run, and the live layer's promise is
+        that such an order is never killed by us.
+
+        Inventory is left alone unless ``flatten`` is asked for, because exiting a
+        position pays the taker fee and an operator may intend to resume -- the
+        emergency path (``_trip_kill``) is the one that always flattens.
         """
         if flatten:
             self._trip_kill(f"stopped by {reason}")
             return
-        failures: List[str] = []
-        for row in self._executor.store.active_orders(self._config.symbol):
-            cid = str(row.get("client_order_id") or "")
-            try:
-                self._client.cancel_order(symbol=self._config.symbol,
-                                          client_order_id=cid)
-                self._executor.store.mark_status(cid, "CANCELLED")
-            except Exception as exc:
-                failures.append(f"{cid}: {exc}")
-        detail = f"stopped by {reason}"
-        if failures:
-            # The venue may still hold them. Saying "stopped" over a live quote
-            # is the exact failure mode this method exists to close.
-            detail += f"; {len(failures)} cancel(s) failed: {'; '.join(failures)}"
-        self._halt(detail, page=bool(failures))
+        self._cancel_session_orders()
+        if self._halted:
+            return                      # an incident during cleanup already halted
+        if self.cleanup_failures:
+            # Saying "stopped" over a quote the venue still holds is the exact
+            # failure this method exists to close.
+            self._halt(f"stopped by {reason} but "
+                       f"{len(self.cleanup_failures)} cancel(s) failed: "
+                       + "; ".join(self.cleanup_failures), page=True,
+                       incident=True)
+            return
+        self._halt(f"stopped by {reason}", page=False, incident=False)
 
     # ------------------------------------------------------------- one tick
     def step(self) -> StepResult:
@@ -247,6 +304,12 @@ class LiveSupervisor:
         result = StepResult()
         if self._halted:
             result.skipped = "halted"
+            return result
+        if self._finished or self.stop_requested:
+            # A session that was stopped has stopped: quoting after that would
+            # put an order in the book from a process the operator already
+            # believes is finished.
+            result.skipped = "stopped"
             return result
 
         # 1. Reconcile before deciding anything. An unresolved order means the
@@ -283,11 +346,20 @@ class LiveSupervisor:
             return result
         result.mid = mid
 
-        resting = self._resting_by_side()
+        resting = self._session_resting_by_side()
+        if resting is None:
+            result.skipped = self._halt_reason
+            return result
+
         targets = {side: self._target(side, mid) for side in SIDES}
         blocked = self._sides_blocked_by_inventory(quantity)
 
         for side in SIDES:
+            # The handler only sets a flag; acting here means an interrupted
+            # session never places a quote after the operator asked it to stop.
+            if self.stop_requested:
+                result.skipped = "stop requested"
+                return result
             current = resting.get(side)
             if side in blocked:
                 if current is not None:
@@ -301,17 +373,23 @@ class LiveSupervisor:
                 result.kept.append(side)
                 continue
             if current is not None:
-                self._cancel(current)
+                # A cancel the venue refused means the old quote is probably still
+                # live: replacing it now would put two orders on one side.
+                if not self._cancel(current):
+                    if self._halted:
+                        result.skipped = self._halt_reason
+                        return result
+                    result.held_over.append(side)
+                    continue
                 result.cancelled.append(side)
-            outcome = self._executor.submit_post_only(
-                side=side, quantity=self._config.quantity, price=wanted)
+            outcome = self._place(side, wanted)
+            if outcome is None:
+                result.skipped = self._halt_reason
+                return result
             if outcome.accepted:
                 result.submitted.append(side)
             else:
-                # A post-only cross (GTX / -5022) is the expected outcome when
-                # the book moved through the level: nothing rested and nothing
-                # is owed. Any other rejection is the executor's to raise.
-                logger.info("%s not rested: %s", side, outcome.describe())
+                result.rejected.append(f"{side}:{outcome.status}")
         return result
 
     # --------------------------------------------------------------- internals
@@ -343,14 +421,78 @@ class LiveSupervisor:
         steps = (raw / tick).to_integral_value(rounding=_ROUND[side])
         return steps * tick
 
-    def _resting_by_side(self) -> Dict[str, Dict[str, Any]]:
+    def _session_resting_by_side(self) -> Optional[Dict[str, Dict[str, Any]]]:
+        """This session's active rows, one per side, or None if we must not act.
+
+        Two rules are enforced here rather than assumed:
+
+        * An active order this process did not place is **never** cancelled by us
+          -- ``reconcile`` adopts it precisely so a human's manual order survives.
+          If it sits on a side we would quote, we cannot tell the venue's state
+          from ours, so the session halts instead of trading over it.
+        * Two session rows on one side mean an earlier cancel did not land.
+          Re-quoting that side would add a third; halting is the honest answer.
+        """
         out: Dict[str, Dict[str, Any]] = {}
+        foreign: List[str] = []
         for row in self._executor.store.active_orders(self._config.symbol):
             side = str(row.get("side", "")).upper()
-            # Keep the most recent row per side: an older row is a stale intent.
-            if side in SIDES:
-                out[side] = row
+            if side not in SIDES:
+                continue
+            cid = str(row.get("client_order_id") or "")
+            if cid not in self._session_ids:
+                foreign.append(f"{side}={cid or '?'}")
+                continue
+            if side in out:
+                self._halt(f"two active {side} rows for one session; the venue "
+                           "state is not knowable from here")
+                return None
+            out[side] = row
+        if foreign:
+            self._halt("refusing to quote over an order this session did not "
+                       f"place: {', '.join(foreign)}")
+            return None
         return out
+
+    def _place(self, side: str, price: Decimal) -> Optional[Any]:
+        """Submits one quote, registering its id *before* the request leaves.
+
+        The id is claimed first because an ambiguous submit may still have
+        landed: if we did not record it, the next reconcile would read the live
+        order as foreign and this session would halt on its own quote.
+        """
+        cid = self._executor.next_client_order_id()
+        self._session_ids[cid] = side
+        outcome = self._executor.submit_post_only(
+            side=side, quantity=self._config.quantity, price=price,
+            client_order_id=cid)
+        if outcome.accepted:
+            return outcome
+        if outcome.status in AMBIGUOUS_STATUSES:
+            # The venue may be holding it. Submitting the other side before that
+            # is resolved risks two live orders from one intent, so the tick ends.
+            self._halt(f"{side} submit is {outcome.status}: "
+                       f"{outcome.describe()}")
+            return None
+        if self._is_post_only_cross(outcome):
+            # Expected when the book moved through the level: nothing rested,
+            # nothing is owed, and the next tick re-evaluates the price.
+            logger.info("%s not rested (post-only cross): %s", side,
+                        outcome.describe())
+            return outcome
+        # Any other rejection is a filter/notional/pricing mistake: repeating it
+        # every tick spends rate limit on a configuration error.
+        self._halt(f"{side} rejected: {outcome.describe()}")
+        return None
+
+    @staticmethod
+    def _is_post_only_cross(outcome: Any) -> bool:
+        code = getattr(outcome, "code", None)
+        if code in POST_ONLY_CROSS_CODES:
+            return True
+        if code == POST_ONLY_GENERIC_CODE:
+            return POST_ONLY_GENERIC_TEXT in str(getattr(outcome, "note", "")).lower()
+        return False
 
     def _within_tolerance(self, current: Dict[str, Any], wanted: Decimal,
                           mid: Decimal) -> bool:
@@ -371,37 +513,100 @@ class LiveSupervisor:
             blocked.append("SELL")
         return blocked
 
-    def _cancel(self, row: Dict[str, Any]) -> None:
+    def _cancel(self, row: Dict[str, Any]) -> bool:
+        """Cancels one of this session's orders. True when it is safe to replace.
+
+        ``-2011`` ("Unknown order sent") is the ordinary race where the order
+        filled while we were deciding, and letting the exception escape would
+        abandon the loop with the other side unmanaged. So a refused cancel is
+        *resolved*, and the answer decides what happens next:
+
+        * gone (``FILLED`` / ``CANCELLED`` / ``REJECTED``) -- safe to replace;
+        * still live -- **not** safe. Placing a second order on that side is the
+          double-exposure failure rule 1 exists to prevent, so the caller leaves
+          the resting quote alone and retries on the next tick;
+        * unreadable -- halt, because the venue's state is unknown.
+        """
         cid = str(row.get("client_order_id") or "")
         if not cid:
             self._halt(f"active order row without a client order id: {row!r}")
-            return
-        self._client.cancel_order(symbol=self._config.symbol, client_order_id=cid)
+            return False
+        try:
+            self._client.cancel_order(symbol=self._config.symbol,
+                                      client_order_id=cid)
+        except BinanceError as exc:
+            try:
+                status = self._executor.resolve(cid)
+            except BinanceError as resolve_exc:
+                self._halt(f"cancel of {cid} failed ({exc}) and the venue "
+                           f"answer could not be read: {resolve_exc}")
+                return False
+            if status in AMBIGUOUS_STATUSES:
+                self._halt(f"cancel of {cid} failed and the order is still "
+                           f"{status}")
+                return False
+            logger.warning("cancel of %s refused (%s); resolved as %s, so it "
+                           "stays where it is until the next tick", cid, exc,
+                           status)
+            return False
+        self._session_ids.pop(cid, None)
         try:
             self._executor.store.mark_status(cid, "CANCELLED")
         except (LiveExecutionError, LiveStoreError) as exc:
             # The venue has moved on first in the common case -- the order filled
-            # while we were deciding -- and its own row is already terminal.
-            # Refusing to keep quoting over that would turn a normal race into an
-            # outage; the next reconcile is the authority either way.
+            # while we were deciding -- and its own row is already terminal. The
+            # cancel did land at the venue, so replacing it is still correct;
+            # the next reconcile settles the local row.
             logger.warning("cancel not recorded for %s: %s", cid, exc)
+        return True
+
+    def _cancel_session_orders(self) -> None:
+        """Cancels only what this session placed, and records what did not land.
+
+        A refused cancel whose order is still live is a cleanup failure: the
+        session is over but the venue holds a quote nobody is managing, which the
+        caller must not report as a clean exit.
+        """
+
+        for row in self._executor.store.active_orders(self._config.symbol):
+            cid = str(row.get("client_order_id") or "")
+            if cid not in self._session_ids:
+                # An adopted order outlives us by design: someone else owns it.
+                continue
+            if not self._cancel(row) and not self._halted:
+                self.cleanup_failures.append(
+                    f"{cid}: still resting after a refused cancel")
 
     def _trip_kill(self, reason: str) -> None:
         """Runs the existing kill path, then halts the loop."""
 
+        self._killed = True
         failures = self._executor.panic(f"session: {reason}")
         self._halt(reason, page=True)
         if failures:
             self._halt_reason += f"; kill path reported {len(failures)} failure(s)"
             self._alert("kill_incomplete", self._halt_reason)
 
-    def _halt(self, reason: str, *, page: bool = True) -> None:
-        self._halted = True
+    def _halt(self, reason: str, *, page: bool = True,
+              incident: bool = True) -> None:
+        """Records why the loop stopped.
+
+        ``incident=False`` is a routine finish: it stops the loop and says so,
+        but it does not make the session look broken to the caller's exit code.
+        """
         self._halt_reason = reason
-        self._executor.store.record_event("supervisor_halt", reason)
-        logger.error("supervisor halted: %s", reason)
-        if page:
-            self._alert("halt", reason)
+        if incident:
+            self._halted = True
+        else:
+            self._finished = True
+        self._executor.store.record_event(
+            "supervisor_halt" if incident else "supervisor_stop", reason)
+        if incident:
+            logger.error("supervisor halted: %s", reason)
+            if page:
+                self._alert("halt", reason)
+        else:
+            logger.info("supervisor stopped: %s", reason)
 
     def _alert(self, kind: str, message: str) -> None:
         try:
