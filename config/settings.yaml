@@ -102,15 +102,15 @@ strategy:
   # reservation-price shift; ``use_time_spread`` enables the gamma*sigma^2*(T-t)
   # term in the optimal spread.
   market_maker:
-    gamma: 0.1
-    sigma: 0.02
-    k: 1.5
-    time_horizon: 60.0
+    gamma: 0.05
+    sigma: 0.05
+    k: 0.5
+    time_horizon: 300.0
     inventory_limit: 5.0
-    ofi_sensitivity: 0.0
+    ofi_sensitivity: 1.0
     ofi_decay: 0.95
     ofi_cap: 3.0
-    use_time_spread: true
+    use_time_spread: false
 
 backtest:
   event_limit: 100000

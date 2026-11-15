@@ -1,5 +1,5 @@
 {
-  "fingerprint": "b29a62ed93caf69a",
+  "fingerprint": "cdee0dd0babf30cc",
   "kind": "walk_forward_parameter_lock",
   "metadata": {
     "source": [
@@ -17,15 +17,15 @@
       "order_quantity": "0.01"
     },
     "strategy": {
-      "gamma": 0.1,
+      "gamma": 0.022565,
       "inventory_limit": 5.0,
-      "k": 5.0,
+      "k": 1.860326,
       "ofi_cap": 3.0,
       "ofi_decay": 0.95,
-      "ofi_sensitivity": 0.0,
-      "sigma": 0.02,
-      "time_horizon": 60.0,
-      "use_time_spread": true
+      "ofi_sensitivity": 0.094239,
+      "sigma": 0.14186,
+      "time_horizon": 69.986292,
+      "use_time_spread": false
     },
     "venue": {
       "center": "30000",
